@@ -1,0 +1,8 @@
+# Separate environment/overlay: do not replace the historical environment.
+stable-baselines3==2.9.0
+sb3-contrib==2.9.0
+gymnasium==1.3.0
+cloudpickle==3.1.2
+farama-notifications==0.0.4
+numpy==2.5.1
+torch==2.13.0

@@ -1,0 +1,6 @@
+hypothesis==6.168.5
+numpy==2.5.1
+pytest==9.1.1
+ruff==0.15.12
+torch==2.13.0
+vulture==2.16

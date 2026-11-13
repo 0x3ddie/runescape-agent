@@ -1,0 +1,39 @@
+From 503d3bb03b09f535dc8d5f4b38878df581acc023 Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 22:26:31 -0700
+Subject: [PATCH] rl-patches(engine): lift the 20ms ::speed floor on
+ non-production worlds
+
+---
+ .../game/client/handler/ClientCheatHandler.ts        | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/server/engine/src/network/game/client/handler/ClientCheatHandler.ts b/server/engine/src/network/game/client/handler/ClientCheatHandler.ts
+index a1731eccc..5862f6403 100644
+--- a/server/engine/src/network/game/client/handler/ClientCheatHandler.ts
++++ b/server/engine/src/network/game/client/handler/ClientCheatHandler.ts
+@@ -164,10 +164,20 @@ export default class ClientCheatHandler extends ClientGameMessageHandler<ClientC
+                 }
+ 
+                 const speed: number = tryParseInt(args.shift(), 20);
+-                if (speed < 20) {
++                // rl-patches: the floor was 20ms, which caps the world at 50 ticks/s
++                // and therefore caps RL throughput at 25 decisions/s per agent at
++                // k=2. Measured: ::speed 10 and ::speed 5 both still delivered
++                // exactly 50 ticks/s, because this branch rejected them. Training
++                // worlds are headless and non-production, so let the tick loop run
++                // as fast as the cycle computes. 1ms keeps setTimeout arithmetic sane.
++                if (speed < 1) {
+                     player.messageGame('::speed input was too low.');
+                     return false;
+                 }
++                if (speed < 20 && Environment.node.production) {
++                    player.messageGame('::speed below 20ms is not allowed in production.');
++                    return false;
++                }
+ 
+                 player.messageGame(`World speed was changed to ${speed}ms`);
+                 World.tickRate = speed;
+-- 
+2.50.1 (Apple Git-155)
+

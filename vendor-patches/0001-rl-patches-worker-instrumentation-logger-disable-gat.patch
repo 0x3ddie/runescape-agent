@@ -1,0 +1,142 @@
+From 04426aace4726d55722e52411afe276348b2a2be Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 03:01:57 -0700
+Subject: [PATCH 1/7] rl-patches: worker instrumentation; logger-disable gate;
+ staffmodlevel=4 non-prod; debugproc target=player+protected+forced; IFB/ARB
+ debug logs
+
+- World.ts: instrumentWorker() on login/friend/logger threads (surfaces real Bun worker errors)
+- LoggerClient: connect() no-op when logger.enabled=false (fixes world crash: refused ws -> unhandled error -> worker terminated -> cycle postMessage throw)
+- LoginThread: staffmodlevel 4 on non-production (chest commands for RL harness)
+- ClientCheatHandler: debugprocs via executeScript(state, true, true) with target=player (chat-triggered procs need self as uid target or p_finduid guards abort)
+- IfButtonHandler/PlayerOps: temporary ARB/IFB debug logs for dialog-resume tracing
+
+Local-only (not committed): server/engine/.env NODE_TICKRATE=50
+---
+ server/engine/src/engine/World.ts                  | 14 +++++++++++---
+ .../engine/src/engine/script/handlers/PlayerOps.ts |  1 +
+ .../game/client/handler/ClientCheatHandler.ts      |  8 +++++++-
+ .../network/game/client/handler/IfButtonHandler.ts |  3 +++
+ server/engine/src/server/logger/LoggerClient.ts    | 11 +++++++++++
+ server/engine/src/server/login/LoginThread.ts      |  5 ++++-
+ 6 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/server/engine/src/engine/World.ts b/server/engine/src/engine/World.ts
+index 5b889d7b4..59e13225b 100644
+--- a/server/engine/src/engine/World.ts
++++ b/server/engine/src/engine/World.ts
+@@ -109,10 +109,18 @@ type LogoutRequest = {
+     lastAttempt: number;
+ };
+ 
++// rs-sdk-rl debug: surface real worker errors (Bun otherwise prints an opaque
++// ErrorEvent object and the world dies with "Worker has been terminated").
++function instrumentWorker(w: Worker, name: string): Worker {
++    w.on('error', (err: unknown) => console.error(`[worker:${name}] ERROR`, err));
++    w.on('exit', (code: number) => { if (code !== 0) console.error(`[worker:${name}] EXIT code=${code}`); });
++    return w;
++}
++
+ class World {
+-    private loginThread = new Worker(new URL('../server/login/LoginThread.ts', import.meta.url));
+-    private friendThread = new Worker(new URL('../server/friend/FriendThread.ts', import.meta.url));
+-    private loggerThread = new Worker(new URL('../server/logger/LoggerThread.ts', import.meta.url));
++    private loginThread = instrumentWorker(new Worker(new URL('../server/login/LoginThread.ts', import.meta.url)), 'login');
++    private friendThread = instrumentWorker(new Worker(new URL('../server/friend/FriendThread.ts', import.meta.url)), 'friend');
++    private loggerThread = instrumentWorker(new Worker(new URL('../server/logger/LoggerThread.ts', import.meta.url)), 'logger');
+     private devThread: Worker | null = null;
+ 
+     private static readonly PLAYERS: number = 2047;
+diff --git a/server/engine/src/engine/script/handlers/PlayerOps.ts b/server/engine/src/engine/script/handlers/PlayerOps.ts
+index 92b6c260f..7af5176a0 100644
+--- a/server/engine/src/engine/script/handlers/PlayerOps.ts
++++ b/server/engine/src/engine/script/handlers/PlayerOps.ts
+@@ -824,6 +824,7 @@ const PlayerOps: CommandHandlers = {
+         const comId = state.popInt();
+ 
+         state.activePlayer.resumeButtons.push(comId);
++        console.warn('[ARB-DBG] resumeButtons <-', comId, 'now', JSON.stringify(state.activePlayer.resumeButtons));
+     }),
+ 
+     [ScriptOpcode.TEXT_GENDER]: checkedHandler(ActivePlayer, state => {
+diff --git a/server/engine/src/network/game/client/handler/ClientCheatHandler.ts b/server/engine/src/network/game/client/handler/ClientCheatHandler.ts
+index e1debea59..a1731eccc 100644
+--- a/server/engine/src/network/game/client/handler/ClientCheatHandler.ts
++++ b/server/engine/src/network/game/client/handler/ClientCheatHandler.ts
+@@ -145,7 +145,13 @@ export default class ClientCheatHandler extends ClientGameMessageHandler<ClientC
+                     }
+                 }
+ 
+-                player.executeScript(ScriptRunner.init(script, player, null, params), false);
++                // rs-sdk-rl: run debugprocs protected+forced, with the player as
++                // BOTH self and target. Chat-invoked procs otherwise get a null
++                // target, their implicit `uid` is 0, and the standard
++                // `p_finduid(uid)` guard in nearly every cheat proc aborts them.
++                // (executeScript, not runScript: delayed cheats suspend and need
++                // the resume bookkeeping executeScript performs.)
++                player.executeScript(ScriptRunner.init(script, player, player, params), true, true);
+             } else if (cmd === 'reload') {
+                 World.reload();
+             } else if (cmd === 'rebuild') {
+diff --git a/server/engine/src/network/game/client/handler/IfButtonHandler.ts b/server/engine/src/network/game/client/handler/IfButtonHandler.ts
+index 25a9b90e7..d0855d476 100644
+--- a/server/engine/src/network/game/client/handler/IfButtonHandler.ts
++++ b/server/engine/src/network/game/client/handler/IfButtonHandler.ts
+@@ -15,13 +15,16 @@ export default class IfButtonHandler extends ClientGameMessageHandler<IfButton>
+         const com = Component.get(comId);
+         if (typeof com === 'undefined' || com.buttonType === Component.NO_BUTTON) {
+             // bad client: component is not acceptable for this packet
++            console.warn(`[IFB-DBG] reject A: com=${comId} found=${typeof com !== 'undefined'} buttonType=${com?.buttonType} resumeButtons=${player.resumeButtons}`);
+             return false;
+         } else if (!player.isComponentVisible(com)) {
+             // bad client or lag: component is not visible
++            console.warn(`[IFB-DBG] reject B: com=${comId} not visible, resumeButtons=${player.resumeButtons}`);
+             return false;
+         }
+ 
+         player.lastCom = comId;
++        console.warn(`[IFB-DBG] pass: com=${comId} resumeButtons=${JSON.stringify(player.resumeButtons)} activeScript=${player.activeScript?.script?.name ?? 'null'} exec=${player.activeScript?.execution ?? -1}`);
+ 
+         if (player.resumeButtons.indexOf(player.lastCom) !== -1) {
+             if (player.activeScript && player.activeScript.execution === ScriptState.PAUSEBUTTON) {
+diff --git a/server/engine/src/server/logger/LoggerClient.ts b/server/engine/src/server/logger/LoggerClient.ts
+index 62be17695..99cd0a0b9 100644
+--- a/server/engine/src/server/logger/LoggerClient.ts
++++ b/server/engine/src/server/logger/LoggerClient.ts
+@@ -6,6 +6,17 @@ export default class LoggerClient extends InternalClient {
+         super(Environment.logger.host, Environment.logger.port);
+     }
+ 
++    // rs-sdk-rl: the logger server is optional. When disabled (the default
++    // single-world config), never open sockets at all — under Bun a refused
++    // connection surfaced as an unhandled 'error' that terminated the logger
++    // worker and then the whole world on its next postMessage.
++    override async connect(): Promise<void> {
++        if (!Environment.logger.enabled) {
++            return;
++        }
++        await super.connect();
++    }
++
+     public async sessionLog(logs: string[]) {
+         await this.connect();
+ 
+diff --git a/server/engine/src/server/login/LoginThread.ts b/server/engine/src/server/login/LoginThread.ts
+index 0dfd44f62..6e53a11ab 100644
+--- a/server/engine/src/server/login/LoginThread.ts
++++ b/server/engine/src/server/login/LoginThread.ts
+@@ -57,7 +57,10 @@ async function handleRequests(parentPort: ParentPort, msg: any) {
+                 stopTimer();
+             } else {
+                 // rs-sdk: do not auto-grant dev staffmodlevel on non-production worlds (public server)
+-                const staffmodlevel = 0;
++                // rs-sdk-rl: grant staff level 4 on non-production worlds so the RL
++                // harness can drive ::speed / ::tele / ~reset for tickrate control and
++                // episode resets. Production servers still get 0 (rs-sdk safety rule).
++                const staffmodlevel = Environment.node.production ? 0 : 4;
+ 
+                 const profile = Environment.node.profile;
+                 if (!fs.existsSync(`data/players/${profile}`)) {
+-- 
+2.50.1 (Apple Git-155)
+

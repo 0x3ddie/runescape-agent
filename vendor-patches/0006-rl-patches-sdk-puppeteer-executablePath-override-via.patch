@@ -1,0 +1,35 @@
+From 7385070b2656393a670c969d96246262a1815c32 Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 19:17:51 -0700
+Subject: [PATCH 6/7] rl-patches(sdk): puppeteer executablePath override via
+ PUPPETEER_EXECUTABLE_PATH (container chrome-headless-shell)
+
+---
+ sdk/test/utils/browser.ts | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/sdk/test/utils/browser.ts b/sdk/test/utils/browser.ts
+index 3a07fb3db..ed1aaa290 100644
+--- a/sdk/test/utils/browser.ts
++++ b/sdk/test/utils/browser.ts
+@@ -135,6 +135,7 @@ export async function getSharedBrowser(headless: boolean = true, background: boo
+     sharedBrowser = await puppeteer.launch({
+         headless,
+         args: chromeArgs,
++        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+         protocolTimeout: 120000,  // 2 minutes for heavy load scenarios
+     });
+ 
+@@ -206,7 +207,8 @@ export async function launchBotBrowser(
+     } else {
+         browser = await puppeteer.launch({
+             headless,
+-            args: chromeArgs
++            args: chromeArgs,
++            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
+         });
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

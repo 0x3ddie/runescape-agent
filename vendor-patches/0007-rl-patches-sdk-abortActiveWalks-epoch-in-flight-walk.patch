@@ -1,0 +1,74 @@
+From bc053da55a46e3cf6ccadc9a35516a59c0ffebb4 Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Wed, 12 Aug 2026 17:40:40 -0700
+Subject: [PATCH 7/7] =?UTF-8?q?rl-patches(sdk):=20abortActiveWalks()=20epo?=
+ =?UTF-8?q?ch=20=E2=80=94=20in-flight=20walkTo=20loops=20become=20cancella?=
+ =?UTF-8?q?ble?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fire-and-forget callers (RL harness superseding one nav with another) leave
+walkTo loops running with no way to stop them; each re-pathfinds from the
+player's current position and re-issues clicks for up to MAX_ITERATIONS,
+dragging the player toward a stale target, which defeats teleport-based
+episode resets. abortActiveWalks() bumps an epoch checked at the top of the
+outer iteration and the per-waypoint loop.
+---
+ sdk/actions.ts | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/sdk/actions.ts b/sdk/actions.ts
+index 11729e1b3..8af98d873 100644
+--- a/sdk/actions.ts
++++ b/sdk/actions.ts
+@@ -75,6 +75,18 @@ const NEVER_AUTO_CLOSE = new Set([
+ export class BotActions {
+     private helpers: ActionHelpers;
+ 
++    // Fire-and-forget callers (RL harnesses superseding one nav with another)
++    // leave walkTo loops running with no way to stop them: each loop
++    // re-pathfinds from wherever the player now is and re-issues clicks for up
++    // to MAX_ITERATIONS, dragging the player toward a stale target. Bumping
++    // the epoch makes every in-flight walkTo return on its next iteration.
++    private walkAbortEpoch = 0;
++
++    /** Abort all in-flight walkTo loops (they return `aborted` on their next iteration). */
++    abortActiveWalks(): void {
++        this.walkAbortEpoch++;
++    }
++
+     constructor(private sdk: BotSDK) {
+         this.helpers = new ActionHelpers(sdk);
+     }
+@@ -841,6 +853,7 @@ export class BotActions {
+ 
+     /** Walk to coordinates using pathfinding, auto-opening doors. */
+     async walkTo(x: number, z: number, tolerance: number = 3): Promise<ActionResult> {
++        const epoch = this.walkAbortEpoch;
+         await this.dismissBlockingUI();
+ 
+         const state = this.sdk.getState();
+@@ -889,6 +902,9 @@ export class BotActions {
+         };
+ 
+         for (let i = 0; i < MAX_ITERATIONS; i++) {
++            if (this.walkAbortEpoch !== epoch) {
++                return { success: false, message: `Walk to (${x}, ${z}) aborted (abortActiveWalks)` };
++            }
+             // Try pathfinding (with one retry)
+             let path = await this.sdk.sendFindPath(x, z, 500);
+             if (!path.success || !path.waypoints?.length) {
+@@ -916,6 +932,9 @@ export class BotActions {
+             let consecutiveStuck = 0;
+ 
+             for (const wp of path.waypoints) {
++                if (this.walkAbortEpoch !== epoch) {
++                    return { success: false, message: `Walk to (${x}, ${z}) aborted (abortActiveWalks)` };
++                }
+                 // Proactively open doors the path requires — only when we're close enough to see them
+                 if (requiredDoorKeys.size > 0) {
+                     const wpDoorKey = `${wp.x},${wp.z}`;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,72 @@
+From 2dcd4ea8c2d2b79a4bd13d272dddf11da20b70da Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 03:35:32 -0700
+Subject: [PATCH 3/7] rl-patches(content): [debugproc,rlreset] single-shot
+ episode reset
+
+Reproduces tutorial_complete effects (spawn, 18-item kit, base stats, empty
+worn/bank, 25 bank coins, tutorial varp done) without the logout/relogin/
+skip-tutorial dance. Reset cost ~1 tick. Guarded-label pattern for varp write;
+engine cheat runner supplies self as target.
+---
+ .../_test/scripts/cheats/cheat_rlreset.rs2    | 48 +++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+ create mode 100644 server/content/scripts/_test/scripts/cheats/cheat_rlreset.rs2
+
+diff --git a/server/content/scripts/_test/scripts/cheats/cheat_rlreset.rs2 b/server/content/scripts/_test/scripts/cheats/cheat_rlreset.rs2
+new file mode 100644
+index 000000000..9c461caee
+--- /dev/null
++++ b/server/content/scripts/_test/scripts/cheats/cheat_rlreset.rs2
+@@ -0,0 +1,48 @@
++// rs-sdk-rl: single-shot episode reset for the RL harness.
++// ~rlreset reproduces [label,tutorial_complete]'s world-state effects inline:
++// fresh spawn position, starter kit, base stats, empty worn/bank, 25 bank coins,
++// tutorial varp marked complete — WITHOUT the logout/relogin/tutorial-dialog
++// round trip, so one episode reset costs ~1 game tick instead of ~20-60s.
++// Invoke from a bot page by typing ::~rlreset (staff level required, non-prod).
++// NOTE: varp writes require the active-player pointer, hence the p_finduid guard
++// label pattern (same as cheat_quest.rs2); the engine's patched cheat runner
++// passes the player as target so the guard succeeds.
++[debugproc,rlreset]
++tut_close();
++if_close;
++if (p_finduid(uid) = true) {
++    @do_rlreset;
++}
++
++[label,do_rlreset]
++%tutorial = ^tutorial_complete;
++p_telejump(0_50_50_22_22);
++
++inv_clear(inv);
++inv_add(inv, bronze_axe, 1);
++inv_add(inv, tinderbox, 1);
++inv_add(inv, net, 1);
++inv_add(inv, shrimp, 1);
++inv_add(inv, bucket_empty, 1);
++inv_add(inv, pot_empty, 1);
++inv_add(inv, bread, 1);
++inv_add(inv, bronze_pickaxe, 1);
++inv_add(inv, bronze_dagger, 1);
++inv_add(inv, bronze_sword, 1);
++inv_add(inv, wooden_shield, 1);
++inv_add(inv, shortbow, 1);
++inv_add(inv, bronze_arrow, 25);
++inv_add(inv, airrune, 25);
++inv_add(inv, mindrune, 15);
++inv_add(inv, waterrune, 6);
++inv_add(inv, earthrune, 4);
++inv_add(inv, bodyrune, 2);
++
++inv_clear(worn);
++inv_clear(bank);
++inv_add(bank, coins, 25);
++
++~stat_reset_all;
++
++~initalltabs;
++~update_all(inv_getobj(worn, ^wearpos_rhand));
+-- 
+2.50.1 (Apple Git-155)
+

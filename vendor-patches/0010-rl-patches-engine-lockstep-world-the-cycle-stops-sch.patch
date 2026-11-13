@@ -1,0 +1,52 @@
+From 1c39e6be2a1cb7ab01e8440360af70b67a0ee207 Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 03:08:58 -0700
+Subject: [PATCH] =?UTF-8?q?rl-patches(engine):=20lockstep=20world=20?=
+ =?UTF-8?q?=E2=80=94=20the=20cycle=20stops=20scheduling=20itself;=20advanc?=
+ =?UTF-8?q?e(n)=20runs=20ticks=20on=20demand?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ server/engine/src/engine/World.ts | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/server/engine/src/engine/World.ts b/server/engine/src/engine/World.ts
+index a574a55b3..99ff144b1 100644
+--- a/server/engine/src/engine/World.ts
++++ b/server/engine/src/engine/World.ts
+@@ -183,6 +183,9 @@ class World {
+     readonly cycleStats: Uint16Array = new Uint16Array(12);
+ 
+     tickRate: number = World.TICKRATE; // speeds up when we're processing server shutdown
++    // rs-sdk RL: with lockstep set the cycle stops scheduling itself, and the world
++    // advances only through advance(n), driven by the one agent it serves.
++    lockstep: boolean = false;
+     currentTick: number = 0; // the current tick of the game world.
+     nextTick: number = 0; // the next time the game world should tick.
+     shutdownTick: number = -1;
+@@ -360,6 +363,11 @@ class World {
+ 
+     // ----
+ 
++    /** rs-sdk RL: run n ticks now, synchronously (the lockstep world's only clock). */
++    advance(n: number): void {
++        for (let i = 0; i < n; i++) this.cycle();
++    }
++
+     cycle(): void {
+         try {
+             const start: number = Date.now();
+@@ -558,7 +566,7 @@ class World {
+ 
+             // ----
+ 
+-            setTimeout(this.cycle.bind(this), Math.max(0, this.tickRate - (Date.now() - start) - drift));
++            if (!this.lockstep) setTimeout(this.cycle.bind(this), Math.max(0, this.tickRate - (Date.now() - start) - drift));
+         } catch (err) {
+             if (err instanceof Error) {
+                 printError('eep eep cabbage! An unhandled error occurred during the cycle: ' + err.message);
+-- 
+2.39.5 (Apple Git-154)
+

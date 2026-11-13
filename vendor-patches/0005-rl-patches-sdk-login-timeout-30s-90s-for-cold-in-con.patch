@@ -1,0 +1,28 @@
+From 47d69f9ab6f821148b4926c23a36cbdac8aaf0e6 Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 19:02:47 -0700
+Subject: [PATCH 5/7] rl-patches(sdk): login timeout 30s -> 90s for cold
+ in-container boots
+
+---
+ sdk/test/utils/browser.ts | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/sdk/test/utils/browser.ts b/sdk/test/utils/browser.ts
+index 9d3f5bcb3..3a07fb3db 100644
+--- a/sdk/test/utils/browser.ts
++++ b/sdk/test/utils/browser.ts
+@@ -249,7 +249,9 @@ export async function launchBotBrowser(
+     while (!await page.evaluate(() => (window as any).gameClient?.ingame)) {
+         await sleep(200);
+         attempts++;
+-        if (attempts > 150) {  // 30 seconds
++        // rs-sdk-rl: cold-in-container boots (fresh pack download + 4-at-once
++        // puppeteer launches) can exceed 30s; give logins ~90s before failing.
++        if (attempts > 450) {  // 90 seconds
+             await browser.close();
+             throw new Error('Timeout waiting for login');
+         }
+-- 
+2.50.1 (Apple Git-155)
+

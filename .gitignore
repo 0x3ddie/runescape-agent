@@ -1,0 +1,13 @@
+# Local artifacts and dependency environments
+logs/
+.venv/
+.venv-sim/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# The engine checkout (vendor-patches/README.md) holds restricted game assets; do not redistribute.
+vendor/
+
+# macOS Finder files
+.DS_Store

@@ -1,0 +1,43 @@
+From 109c5ae5358b9eb2e608cef73b0403d9edb3d480 Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 16:29:32 -0700
+Subject: [PATCH] arena: copper, tin and iron rocks on Entrana for the
+ four-goal control test
+
+Six natural rock locs (shape 10, angle 0) appended to the level-0 LOC section
+of m44_52: copperrock1 2860,3348; tinrock1 2854,3337; ironrock1 2852,3340;
+copperrock2 2860,3351; tinrock2 2862,3351; ironrock2 2851,3338.
+
+Rule (runescape repo baseline/config.py START_SETS arena): from the start
+2859,3342 and its seven seeded jitter tiles, candidate tiles are 6-16
+walking steps from the start (baked SDK collision, doors open), have no loc
+of their own, have eight walkable neighbours with no npc or obj spawn, and
+lie within 32 tiles of every start. Candidates are taken in order of
+(steps, x, z), at least 2 tiles apart, and each is kept only if blocking it
+changes no walking distance from any start to the nearest tree, oak, net
+spot and chicken and cuts off no reachable tile within 60. Types alternate
+copper, tin, iron in pick order.
+---
+ server/content/maps/m44_52.jm2 | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/server/content/maps/m44_52.jm2 b/server/content/maps/m44_52.jm2
+index bce127161..ddc1e0765 100644
+--- a/server/content/maps/m44_52.jm2
++++ b/server/content/maps/m44_52.jm2
+@@ -8049,6 +8049,12 @@
+ 3 40 21: 1640 12
+ 3 40 22: 1640 16 3
+ 
++0 44 20: 2090 10
++0 38 9: 2094 10
++0 36 12: 2092 10
++0 44 23: 2091 10
++0 46 23: 2095 10
++0 35 10: 2093 10
+ ==== NPC ====
+ 0 6 46: 656
+ 0 14 7: 658
+-- 
+2.39.5 (Apple Git-154)
+

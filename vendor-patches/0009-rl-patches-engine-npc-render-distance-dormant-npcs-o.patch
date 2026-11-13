@@ -1,0 +1,163 @@
+From f20d1967e64d2091b60cb5dc8aa126454fdaeedf Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Wed, 19 Aug 2026 16:27:13 -0700
+Subject: [PATCH] =?UTF-8?q?rl-patches(engine):=20npc=20render=20distance?=
+ =?UTF-8?q?=20=E2=80=94=20dormant=20npcs=20outside=20RL=5FNPC=5FRADIUS?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An idle world spent 2.03 ms of a 2.88 ms cycle (71%) calling npc.turn() on
+7,321 static npcs, of which an agent inside its 52-tile scan can see roughly 50.
+Every world process paid it, so it set the ceiling on tick rate and therefore on
+honest throughput.
+
+processNpcs() now builds the set of 64x64 chunks holding a player, dilated by
+RL_NPC_RADIUS tiles (default 64, must stay >= the agent's 52-tile npc scan), and
+gives every npc outside it Npc.dormantTurn() instead of Npc.turn(). dormantTurn
+runs the respawn/revert/despawn countdown ONLY, so an npc killed before the agent
+walked away still comes back; everything whose effect nobody can observe (hunt,
+regen, timers, queues, movement, facing) is skipped. Set RL_NPC_RADIUS=0 for
+vanilla behaviour.
+
+Measured, one world, 24 agents, CHOP, A/B on the same build:
+  gate off  fastest honest 5ms -> 199.2 t/s, 1617 dec/s
+  gate on   fastest honest 3ms -> 325.5 t/s, 2607 dec/s   (4ms: 249.7 t/s, 2395)
+Machine-wide honest best moves from the recorded 1,075 dec/s (2 worlds x 12 @ 8ms)
+to 4,709 dec/s (3 worlds x 24 @ 5ms, 98.9% of asked).
+---
+ server/engine/src/engine/World.ts      | 49 ++++++++++++++++++++++++++
+ server/engine/src/engine/entity/Npc.ts | 46 +++++++++++++++++-------
+ 2 files changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/server/engine/src/engine/World.ts b/server/engine/src/engine/World.ts
+index 59e13225b..a574a55b3 100644
+--- a/server/engine/src/engine/World.ts
++++ b/server/engine/src/engine/World.ts
+@@ -715,10 +715,59 @@ class World {
+     // - queue
+     // - movement
+     // - modes
++    /**
++     * Render distance for npc simulation, in tiles. 0 disables the gate and the
++     * world behaves exactly as it did before (vanilla).
++     *
++     * Why this exists: a world cycles every static npc every tick whether or not
++     * anybody can see it. Measured idle, 2.03 ms of a 2.88 ms cycle — 71% — went
++     * to 7,321 npcs, of which an agent within its 52-tile scan can see roughly 50.
++     * That cost is paid by every world process, so it set the ceiling on how many
++     * honest worlds this machine could run.
++     *
++     * The radius MUST stay >= the agent's npc scan radius (env-ts/engine/observe.ts
++     * NPC_SCAN_TILES = 52) or agents would observe frozen npcs. Default 64 leaves
++     * a 12-tile margin so an npc still moves for a tick or two after it leaves the
++     * observation window.
++     */
++    private static readonly NPC_ACTIVE_RADIUS: number = parseInt(process.env.RL_NPC_RADIUS ?? '64', 10);
++
++    /**
++     * The 64x64 chunks that hold at least one player, dilated by NPC_ACTIVE_RADIUS.
++     * Returns null when the gate is off. Cost is O(players), against O(npcs) for
++     * the loop it guards, and each npc then pays one integer hash lookup.
++     */
++    private activeNpcChunks(): Set<number> | null {
++        const r: number = World.NPC_ACTIVE_RADIUS;
++        if (r <= 0) {
++            return null;
++        }
++        const active: Set<number> = new Set();
++        for (const player of this.playerLoop.all()) {
++            const cx0: number = (player.x - r) >> 6;
++            const cx1: number = (player.x + r) >> 6;
++            const cz0: number = (player.z - r) >> 6;
++            const cz1: number = (player.z + r) >> 6;
++            for (let cx: number = cx0; cx <= cx1; cx++) {
++                for (let cz: number = cz0; cz <= cz1; cz++) {
++                    active.add((player.level << 20) | (cx << 10) | cz);
++                }
++            }
++        }
++        return active;
++    }
++
+     private processNpcs(): void {
+         const start: number = Date.now();
++        const active: Set<number> | null = this.activeNpcChunks();
+         for (const npc of this.npcs) {
+             try {
++                if (active !== null && !active.has((npc.level << 20) | ((npc.x >> 6) << 10) | (npc.z >> 6))) {
++                    // Out of render distance: lifecycle only, so a killed npc still
++                    // respawns while nobody is there to watch it happen.
++                    npc.dormantTurn();
++                    continue;
++                }
+                 npc.turn();
+             } catch (err) {
+                 console.error(err);
+diff --git a/server/engine/src/engine/entity/Npc.ts b/server/engine/src/engine/entity/Npc.ts
+index 102e91751..bf41355ac 100644
+--- a/server/engine/src/engine/entity/Npc.ts
++++ b/server/engine/src/engine/entity/Npc.ts
+@@ -106,18 +106,12 @@ export default class Npc extends PathingEntity {
+     // Public methods
+     // ---
+ 
+-    turn(): void {
+-        // Continue npc_delay'd script
+-        if (this.isActive) {
+-            if (this.delayed && World.currentTick >= this.delayedUntil) this.delayed = false;
+-
+-            // Resume suspended script
+-            if (!this.delayed && this.activeScript && this.activeScript.execution === ScriptState.NPC_SUSPENDED) {
+-                this.executeScript(this.activeScript);
+-            }
+-        }
+-
+-        // Npc Events (Respawn, Revert, Despawn)
++    /**
++     * Respawn / revert / despawn countdowns. Split out of turn() so a DORMANT npc
++     * — one no agent can see — still comes back after it is killed. This is the
++     * only part of an npc's tick that must run when nobody is watching.
++     */
++    private processLifecycle(): void {
+         if (!this.delayed && --this.lifecycleTick === 0) {
+             try {
+                 if (this.lifecycle === EntityLifeCycle.RESPAWN) {
+@@ -148,6 +142,34 @@ export default class Npc extends PathingEntity {
+                 this.setLifeCycle(1);
+             }
+         }
++    }
++
++    /**
++     * The tick an npc gets when no player is inside World.npcActiveRadius of it.
++     *
++     * Skips hunt, regen, timers, queues, movement and facing — everything whose
++     * effect nobody can observe — and keeps only the lifecycle countdown. An npc
++     * outside render distance therefore FREEZES rather than disappearing: it is
++     * still in the list, still occupies its tile, and resumes mid-behaviour when
++     * an agent comes back. Measured on an idle world: npc time is 2.03 ms of a
++     * 2.88 ms cycle (71%), for 7,321 npcs of which an agent can see ~50.
++     */
++    dormantTurn(): void {
++        this.processLifecycle();
++    }
++
++    turn(): void {
++        // Continue npc_delay'd script
++        if (this.isActive) {
++            if (this.delayed && World.currentTick >= this.delayedUntil) this.delayed = false;
++
++            // Resume suspended script
++            if (!this.delayed && this.activeScript && this.activeScript.execution === ScriptState.NPC_SUSPENDED) {
++                this.executeScript(this.activeScript);
++            }
++        }
++
++        this.processLifecycle();
+ 
+         // Checks if Npc is alive and not delayed
+         if (!this.isValid()) {
+-- 
+2.50.1 (Apple Git-155)
+

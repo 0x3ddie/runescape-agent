@@ -1,0 +1,73 @@
+From cbe3dda7e2cfe2178f529459e84a54173a139dcb Mon Sep 17 00:00:00 2001
+From: Eddie Chen <23001726+0x3ddie@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 11:17:26 -0700
+Subject: [PATCH 4/7] rl-patches(cleanup): remove temporary
+ dialog/inventory/resume debug logs; keep worker-error instrumentation
+
+---
+ server/engine/src/engine/script/handlers/InvOps.ts             | 1 -
+ server/engine/src/engine/script/handlers/PlayerOps.ts          | 1 -
+ .../engine/src/network/game/client/handler/IfButtonHandler.ts  | 3 ---
+ .../network/game/client/handler/ResumePauseButtonHandler.ts    | 1 -
+ 4 files changed, 6 deletions(-)
+
+diff --git a/server/engine/src/engine/script/handlers/InvOps.ts b/server/engine/src/engine/script/handlers/InvOps.ts
+index 922a86307..9befb7550 100644
+--- a/server/engine/src/engine/script/handlers/InvOps.ts
++++ b/server/engine/src/engine/script/handlers/InvOps.ts
+@@ -116,7 +116,6 @@ const InvOps: CommandHandlers = {
+     [ScriptOpcode.INV_CLEAR]: checkedHandler(ActivePlayer, state => {
+         const invType: InvType = check(state.popInt(), InvTypeValid);
+ 
+-        console.warn(`[INV-DBG] inv_clear ${invType.debugname} protectedPtr=${state.pointerGet(ProtectedActivePlayer[state.intOperand])} script=${state.script?.name}`);
+         if (!state.pointerGet(ProtectedActivePlayer[state.intOperand]) && invType.protect && invType.scope !== InvType.SCOPE_SHARED) {
+             throw new Error(`$inv requires protected access: ${invType.debugname}`);
+         }
+diff --git a/server/engine/src/engine/script/handlers/PlayerOps.ts b/server/engine/src/engine/script/handlers/PlayerOps.ts
+index 7af5176a0..92b6c260f 100644
+--- a/server/engine/src/engine/script/handlers/PlayerOps.ts
++++ b/server/engine/src/engine/script/handlers/PlayerOps.ts
+@@ -824,7 +824,6 @@ const PlayerOps: CommandHandlers = {
+         const comId = state.popInt();
+ 
+         state.activePlayer.resumeButtons.push(comId);
+-        console.warn('[ARB-DBG] resumeButtons <-', comId, 'now', JSON.stringify(state.activePlayer.resumeButtons));
+     }),
+ 
+     [ScriptOpcode.TEXT_GENDER]: checkedHandler(ActivePlayer, state => {
+diff --git a/server/engine/src/network/game/client/handler/IfButtonHandler.ts b/server/engine/src/network/game/client/handler/IfButtonHandler.ts
+index d0855d476..25a9b90e7 100644
+--- a/server/engine/src/network/game/client/handler/IfButtonHandler.ts
++++ b/server/engine/src/network/game/client/handler/IfButtonHandler.ts
+@@ -15,16 +15,13 @@ export default class IfButtonHandler extends ClientGameMessageHandler<IfButton>
+         const com = Component.get(comId);
+         if (typeof com === 'undefined' || com.buttonType === Component.NO_BUTTON) {
+             // bad client: component is not acceptable for this packet
+-            console.warn(`[IFB-DBG] reject A: com=${comId} found=${typeof com !== 'undefined'} buttonType=${com?.buttonType} resumeButtons=${player.resumeButtons}`);
+             return false;
+         } else if (!player.isComponentVisible(com)) {
+             // bad client or lag: component is not visible
+-            console.warn(`[IFB-DBG] reject B: com=${comId} not visible, resumeButtons=${player.resumeButtons}`);
+             return false;
+         }
+ 
+         player.lastCom = comId;
+-        console.warn(`[IFB-DBG] pass: com=${comId} resumeButtons=${JSON.stringify(player.resumeButtons)} activeScript=${player.activeScript?.script?.name ?? 'null'} exec=${player.activeScript?.execution ?? -1}`);
+ 
+         if (player.resumeButtons.indexOf(player.lastCom) !== -1) {
+             if (player.activeScript && player.activeScript.execution === ScriptState.PAUSEBUTTON) {
+diff --git a/server/engine/src/network/game/client/handler/ResumePauseButtonHandler.ts b/server/engine/src/network/game/client/handler/ResumePauseButtonHandler.ts
+index 1aab21d71..6b64db52c 100644
+--- a/server/engine/src/network/game/client/handler/ResumePauseButtonHandler.ts
++++ b/server/engine/src/network/game/client/handler/ResumePauseButtonHandler.ts
+@@ -5,7 +5,6 @@ import ResumePauseButton from '#/network/game/client/model/ResumePauseButton.js'
+ 
+ export default class ResumePauseButtonHandler extends ClientGameMessageHandler<ResumePauseButton> {
+     handle(_message: ResumePauseButton, player: Player): boolean {
+-        console.warn(`[RPB-DBG] script=${player.activeScript?.script?.name ?? 'none'} exec=${player.activeScript?.execution ?? -1} resumeButtons=${JSON.stringify(player.resumeButtons)}`);
+         if (!player.activeScript || player.activeScript.execution !== ScriptState.PAUSEBUTTON) {
+             return false;
+         }
+-- 
+2.50.1 (Apple Git-155)
+

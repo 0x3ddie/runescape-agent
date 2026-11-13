@@ -1,0 +1,12 @@
+* text=auto eol=lf
+*.zip binary
+*.gz binary
+*.xz binary
+*.npz binary
+*.npy binary
+*.pt binary
+*.pth binary
+*.bundle binary
+*.png binary
+*.gif binary
+*.mp4 binary

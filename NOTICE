@@ -1,0 +1,46 @@
+runescape-agent (https://github.com/0x3ddie/runescape-agent)
+
+This repository builds on rs-sdk (https://github.com/MaxBittker/rs-sdk), which
+contains the Lost City engine and content:
+
+- The files in vendor-patches/ are patches to rs-sdk. They quote and change lines of
+  its source in sdk/, server/engine/ and server/content/.
+- sim/ (the Python reference simulator and its C port in sim/native/) reimplements
+  the engine's game rules, path finding and content scripts, following that source
+  rule by rule and quoting parts of it in comments.
+- env-ts/ and sim/extract.ts run inside the engine, call its code and adapt parts of
+  it (for example the client's routing and the engine's handlers).
+
+The parts that copy or adapt rs-sdk source stay under the rs-sdk licence, which
+follows:
+
+    MIT License
+
+    Copyright (c) 2025 Lost City (the rs-sdk repository and sdk/)
+    Copyright (c) 2023-2026 Lost City (server/engine/ and server/content/)
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+The game's assets (art, maps, cache data, and item, object and character names)
+are the property of Jagex Ltd. They are covered neither by the rs-sdk licence nor
+by this repository's licence. This repository does not include the engine or its
+game data. It does include the game art shown in the clips in docs/media/, and game
+names and message texts that appear in the code and tests.
+
+This project is not affiliated with or endorsed by Jagex Ltd.
