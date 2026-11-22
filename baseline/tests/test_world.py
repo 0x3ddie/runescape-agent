@@ -1,13 +1,21 @@
-"""Tick delivery decides which runs are comparable; run logs stay readable (baseline/world.py)."""
+"""Tick delivery decides which runs are comparable; run logs stay readable; a world's control calls keep one connection
+(baseline/world.py)."""
+from http.client import RemoteDisconnected
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import socket
+import threading
+import time
 from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from hypothesis import given, settings, strategies as st
 import pytest
 
 from baseline import world
-from baseline.world import JsonlEvidence, delivery_report, read_jsonl
+from baseline.world import JsonlEvidence, ResourceService, delivery_report, read_jsonl
 
 
 def sample(tick, ms, **extra):
@@ -77,3 +85,166 @@ def test_only_a_demo_worlds_declared_spectator_is_left_out_of_its_population(act
     if watching:
         row['demo']['spectator']['present'] = [dict(name='guest')]
         assert not accepted(spectator='viewer')
+
+
+class ControlServer:
+    """A world's control port on loopback, kept open between requests as the engine's Bun.serve keeps it (HTTP/1.1).
+    answer(method, path, body) gives (status, reply), or None to close the connection without a reply. A connection
+    is closed without notice after `drop_after` replies, as a server closes an idle one. `connections` counts the TCP
+    connections it accepted, `requests` the requests it read and `closed` the connections it closed: the server's
+    counts, not the client's."""
+
+    def __init__(self, answer, drop_after=None, delay=0.0):
+        self.answer, self.drop_after, self.delay = answer, drop_after, delay
+        self.connections = self.requests = self.closed = 0
+        lock, server = threading.Lock(), self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def setup(self):
+                super().setup()
+                self.replies = 0
+                with lock:
+                    server.connections += 1
+
+            def reply(self):
+                body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+                with lock:
+                    server.requests += 1
+                answer = server.answer(self.command, self.path, json.loads(body) if body else None)
+                if answer is None:
+                    self.close_connection = True
+                    return
+                time.sleep(server.delay)
+                data = json.dumps(answer[1]).encode()
+                self.send_response(answer[0])
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                self.replies += 1
+                if server.drop_after is not None and self.replies >= server.drop_after:
+                    self.close_connection = True  # no Connection: close header; the client finds out at its next call
+            do_GET = do_POST = reply
+
+            def log_message(self, *args):
+                pass
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def shutdown_request(self, request):
+                super().shutdown_request(request)
+                with lock:
+                    server.closed += 1
+
+        self.httpd = Server(('127.0.0.1', 0), Handler)
+        self.url = f'http://127.0.0.1:{self.httpd.server_address[1]}/status'
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def wait_closed(self, n):
+        """Until the server has closed n connections, and a moment more for its close to reach the client's end."""
+        end = time.monotonic() + 5
+        while self.closed < n:
+            assert time.monotonic() < end, 'the server did not close the connection'
+            time.sleep(0.01)
+        time.sleep(0.05)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+ID = dict(worldBootId='b', accountId='agent', accountEpoch=1, incarnationId='p1')
+STATUS = sample(7, 1.0, players=1, actors=1)
+
+
+def engine(method, path, body):
+    """The answers of demo-services as the client reads them: a status row, the control replies, and the 409 that a
+    refused operation gets (env-ts/core/resource-control.ts)."""
+    if method == 'GET':
+        return 200, STATUS
+    if body['operation'] == 'identity':
+        return 200, dict(type='resource_identity', identity=ID)
+    if body['operation'] == 'budget':
+        return 200, dict(type='resource_budget', identity=ID, budget=dict(remainingTicks=40, status='active'))
+    if body['operation'] == 'retire':
+        return 200, dict(type='resource_budget', identity=ID)  # the wrong type: the client refuses it
+    return 409, dict(error='resource incarnation mismatch')
+
+
+def service(url):
+    return ResourceService(url, 'b', 'agent', lambda kind, **data: None, speed_ms=48, xp_rate=25)
+
+
+def before(url, operation):
+    """The control call as baseline/world.py made it before it kept its connection: a new urlopen connection a call."""
+    payload = dict(operation=operation, bootId='b', accountName='agent', **({} if operation == 'identity' else dict(identity=ID)))
+    request = Request(url.replace('/status', '/resource-capture'), data=json.dumps(payload).encode(),
+                      headers={'Content-Type': 'application/json'}, method='POST')
+    with urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+
+def test_the_control_calls_share_one_kept_connection_and_answer_as_the_urlopen_calls_did():
+    with ControlServer(engine) as server, ControlServer(engine) as reference:
+        control = service(server.url)
+        assert control('identity') == before(reference.url, 'identity')
+        for _ in range(300):
+            assert control('budget', identity=ID) == before(reference.url, 'budget')
+        with urlopen(reference.url, timeout=5) as response:
+            assert control.status() == json.load(response)
+        with pytest.raises(HTTPError) as new:
+            control('read', identity=ID)
+        with pytest.raises(HTTPError) as old:
+            before(reference.url, 'read')
+        assert (new.value.code, str(new.value), new.value.read()) == (old.value.code, str(old.value), old.value.read())
+        with pytest.raises(ValueError, match='reply mismatch'):
+            control('retire', identity=ID)
+        control('budget', identity=ID)
+        assert server.connections == 1 and server.requests >= 304  # the error replies kept the connection too
+        assert reference.connections == reference.requests == 303  # a new connection a call, as before
+
+
+def test_a_kept_connection_the_server_closed_is_replaced_before_sending_and_a_sent_call_is_never_sent_again():
+    with ControlServer(engine, drop_after=3) as server:
+        control = service(server.url)
+        control('identity')  # a status row and the identity: two replies on the first connection
+        control('budget', identity=ID)  # the third reply, after which the server closes it
+        server.wait_closed(1)
+        assert control('budget', identity=ID) == engine('POST', '', dict(operation='budget'))[1]
+        assert server.connections == 2 and server.requests == 4  # a new connection; nothing went into the closed one
+        server.answer = lambda *request: None  # from now on the server reads each request and closes without a reply
+        with pytest.raises(RemoteDisconnected):
+            control('budget', identity=ID)
+        assert server.connections == 2 and server.requests == 5  # read once and not sent again
+        with pytest.raises(RemoteDisconnected):
+            before(server.url, 'budget')  # the error the urlopen call raised
+    with ControlServer(lambda *request: None) as server:  # a new connection that drops is not opened again
+        with pytest.raises(RemoteDisconnected):
+            service(server.url)('identity')
+        assert server.connections == server.requests == 1
+    closed = socket.socket()
+    closed.bind(('127.0.0.1', 0))
+    url = f'http://127.0.0.1:{closed.getsockname()[1]}/status'
+    closed.close()
+    with pytest.raises(URLError) as new:
+        service(url)('identity')
+    with pytest.raises(URLError) as old:
+        before(url, 'identity')
+    assert type(new.value.reason) is type(old.value.reason) is ConnectionRefusedError
+
+
+def test_a_reply_that_does_not_come_in_time_raises_without_a_new_connection(monkeypatch):
+    monkeypatch.setattr(ResourceService, 'TIMEOUT', 0.2)
+    with ControlServer(engine) as server:
+        control = service(server.url)
+        control('identity')
+        server.delay = 1.0
+        with pytest.raises(TimeoutError) as error:
+            control('budget', identity=ID)
+        assert not isinstance(error.value, URLError) and server.connections == 1

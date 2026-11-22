@@ -27,40 +27,67 @@ decisions and decisions per 1,000 ticks, refusals, interface loops (A-B-A altern
         --sampled --seed 606001 --output OUT [--part I N]
     .venv-sim/bin/python -m sim.hour merge OUT
 
-native-hour-v1 plays the phase 1 finals for one native
-game hour each, with fixed weights: one freshly booted world per hour from a scripts/stack.py world service, the wood goal
-at Barbarian Village on NATIVE's records, hour-v1's window clock, one audit of the whole hour and certified production per
-1,200-tick window from the audited trace. One pass per stack (B0: --b0):
+native-hour-v1 (the combined-skill hour, Part B, frozen 31 October 2026) keeps only its start records here
+(native_records); its native replay is not in this tree.
 
-    NODE_RANDOM_EVENTS=false PYTHONPATH=.:rl .venv/bin/python scripts/stack.py --bun BUN --output OUT/stack \
-        --timeout-seconds S --lockstep --xp-rate 25 --worlds 0 --engine pinned=vendor/rs-sdk --blocks 1 -- \
-        .venv/bin/python -m sim.hour native --output OUT/PASS --pass PASS [--b0]
-    .venv/bin/python -m sim.hour native-summary OUT/PASS ...
+free-play-v1's evaluation plays one record set of the named world (--world:
+village-world-v1 Stage A or village-world-v2, sim/combat.py VILLAGES; no default) over that world's archive (sim/free.py
+world_tables), record r the split's layout first + r of the world's layouts with the draw_village start (key, slot 0,
+episode r) in a fresh world and one life of --ticks (sim/free.py Life, the soak's record), with a read of the same life
+at --read-ticks (FreeRead). A policy that
+sim.train train --task free-play-v1 saved (load_free_policy: obs-v6 only) plays sampled in two passes with their own
+seeds and greedy; its saved initialization plays sampled in both passes; each control of sim/free.py plays once with the
+control seed, shared by every pass and every policy seed. One JSONL row a life (free_life) and a manifest; parts run as
+separate processes, one process a part (a lock on its lives file), and a part resumes where it stopped. The checkpoint
+is its training run's latest.zip or one of its checkpoints/, beside the run's initial.zip and summary.json (policy_run):
+the run's seed, status and batch in effect go in the manifest, and the run must have trained in the evaluation's world
+over that world's archive (trained_world: the batch's recorded world; a summary written before the batch recorded one
+is village-world-v1's only when it trained over that world's archive).
+sim.gate free reads these outputs alone, and no other file of its checkout: the rows for the statistics, and the
+manifests' settings and run records against its frozen plans for the verdict. The muggers, the XP rate, the record
+range and key, the seeds and the rotation's period have no default: nothing is frozen. --plan NAME refuses an output that plan
+NAME would not read before any life is played.
+
+--change NAME plays a changed world of the scorecard (sim/changed.py; adopted as
+descriptions): only the records whose base holds the change's fact, each built by sim/changed.py life from the base
+record, with the base row's seeds (the same pass seeds, policy seed, control seed and record), so that the base
+evaluation's row of the same actor, pass and record is the base half of each pair. The policy plays the sampled passes
+of --change-passes (pass 1 alone by default), with no greedy pass and no initialization; the controls are those the
+change's reads need (its candidate scripts, random legal play and WAIT: by default all of them, never another). Each row
+carries the change's name. village-world-v2 without muggers only, and never with --plan: a changed world is a
+description, and sim.gate free refuses its rows (sim/gate.py free_outputs). It is read beside the base
+evaluation.
+
+    .venv-sim/bin/python -m sim.hour free --output OUT --world village-world-v1 --first 4000 --records 64 --key 223 \
+        --muggers 0 --xp-rate 1 \
+        --checkpoint RUN/latest.zip --initial RUN/initial.zip --policy-seed 101 --seeds S1 S2 \
+        --controls wait random wood fish mine melee chickens once eat rotation --period P --control-seed C --part I N
+    .venv-sim/bin/python -m sim.hour free --change only-wood --output OUT --world village-world-v2 ... (as the base
+        evaluation, without --plan and --controls)
 """
 import argparse
-import bisect
 from collections import Counter
+import functools
 import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import time
 
 import numpy as np
 
 from baseline import config
-from baseline.resource_task import GOAL_FAMILIES, GOALS, ResourceEpisode
+from baseline.resource_task import GOALS
 from baseline.telemetry import sha256
 from obs import MAX_DECISIONS
 from sim.agent import A_ACT0, A_HELD0, HELD_CONTRACT, family
 from sim.audit import kill_ticks
-from sim.combat import COMBAT, ControlActor, PolicyActor, combat_npcs, draw_combat, kit
+from sim.combat import COMBAT, VILLAGE, VILLAGES, ControlActor, PolicyActor, combat_npcs, draw_combat, kit
 from sim.engine import RETALIATE_CONTRACT, SKILLS, Unsupported, World
 from sim.search import SUPPLY, measures, supply_layouts, supply_sites, draw_supply
 from sim.spec import HORIZON_TICKS
-from sim.task import FAMILIES, WORLD_START_TICK, GoalEpisode, draw_start, object_families
+from sim.task import FAMILIES, FREE_PLAY, WORLD_START_TICK, GoalEpisode, draw_start, free_play_cfg, object_families
 from sim.world import ORIGIN, LayoutTables, generate, split_seeds
 
 HOUR = dict(
@@ -405,118 +432,19 @@ def merge(output):
     return result
 
 
-# ---- native-hour-v1: the native hour with fixed weights ----
-
+# ---- native-hour-v1's start records (the combined-skill hour, Part B, frozen 31 October) ---------------------------
+# sim/gate.py's final2 draw is disjoint from them. Part B's native replay (the commands native and native-summary, with
+# its episode, log, scores and summary) is not in this tree.
 NATIVE = dict(
-    version='native-hour-v1',
-    ticks=HOUR['ticks'],
-    goal='wood',
-    report_window=1200,            # reporting windows; the policy's clock restarts every HOUR['windows'][goal] ticks
-    decision_limit=6000,           # run_trial's cap: a native decision takes at least 2 ticks, so the hour ends first
-    engine='pinned',
     site='barbarian', start=(3096, 3432),
-    record_seed=20261031, records=8, b0_record=8,
+    record_seed=20261031, records=8,
     records_sha256='b74acaaf5f886f9864bd92807d77bee864ac3c8b4893799b58db2db3494e5a1d',
-    passes=dict(sampled1=(True, 3101001), sampled2=(True, 3202001), greedy=(False, 3101001)),  # trial seed = base + record
-    seeds=(101, 202, 303, 404, 505),
-    policies=('S_wood', 'SH', 'initial'),
-    b0=dict(events=0.75 * 20000, read_seconds=2.5, release_seconds=2.5),
-    near=64,                       # tiles from a drop-in point or test village: such steps are reported apart
-    acquire_timeout=300.0,
-    statistics=dict(resamples=10000, seed=17017),
 )
-ROOT = Path(__file__).resolve().parents[1]
-# A native decision row: tick from arm of the observation it was made from, action, option and target name of an ACT or
-# HELD row, x, z, plane, the ended option's reason, refused, the engine's note, hitpoints, free inventory slots and the
-# woodcutting base level after it, and the tick of the observation after it. Columns 0, 1, 4, 5, 7 and 8 are hour-v1's,
-# so sim/search.py's measures() reads these rows too.
-NATIVE_ROW_FIELDS = ('tick', 'action', 'option', 'target', 'x', 'z', 'plane', 'ended', 'refused', 'note', 'hp', 'free',
-                     'woodcutting', 'seen')
-INVENTORY_SLOTS = 28
-
-
-class NativeHourEpisode(ResourceEpisode):
-    """A built native episode (baseline.world.make_episode) over the hour: armed for NATIVE['ticks'] ticks, its task clock
-    shown as hour-v1's window clock. Its own settlement is logged and never read; the audit gives the outcomes."""
-
-    def __init__(self, episode):
-        super().__init__(episode.transport, episode.control, episode.cfg, NATIVE['ticks'], episode.scale, episode.record,
-                         episode.prepare, goal=episode.goal)
-        self.window_clock, self.armed_clock = WindowClock(HOUR['windows'][episode.goal]), None
-
-    def _budget(self):
-        result = super()._budget()
-        decision = int(self.raw.get('decision', 0))
-        if self.clock is not self.armed_clock:  # the first observation of a new arm
-            self.armed_clock = self.clock
-            self.window_clock.arm(decision)
-        result['budget_vec'], result['task_vec'][0] = self.window_clock(self.clock.last_tick - self.clock.start, decision)
-        return result
-
-
-class Timed:
-    """The resource control with each operation's wall time: (operation, start, seconds)."""
-
-    def __init__(self, control):
-        self.control, self.calls = control, []
-
-    def __call__(self, operation, **kwargs):
-        start = time.monotonic()
-        try:
-            return self.control(operation, **kwargs)
-        finally:
-            self.calls.append((operation, start, time.monotonic() - start))
-
-
-class NativeLog:
-    """One native hour's evidence as it is recorded: decision rows (NATIVE_ROW_FIELDS), the arm observation's summary,
-    the clock's latest tick, the first tick each inventory item was seen and the trace the audit read."""
-
-    def __init__(self):
-        self.rows, self.trace, self.start, self.tick, self.raw, self.arm, self.pending = [], None, None, None, None, None, None
-        self.items = {}  # item id: tick from arm of the first observation that showed it in the inventory
-
-    @staticmethod
-    def observed(raw):
-        p, ended = raw['player'], raw['feedback'].get('ended')
-        skills = {s['name']: s for s in raw.get('skills', [])}
-        return [p['x'], p['z'], p['level'], ended and ended['reason'], bool(ended and ended['refused']), raw.get('actionNote'),
-                p['hp'], INVENTORY_SLOTS - len(raw['inventory']), skills['Woodcutting']['baseLevel']]
-
-    def __call__(self, kind, data):
-        if kind == 'resource_control':
-            response = data['response']
-            if data['operation'] == 'arm':
-                self.start = response['audit']['startTick']
-            elif data['operation'] == 'budget':
-                self.tick = response['budget']['observedTick']
-            elif data['operation'] == 'read':
-                self.trace = response['audit']
-        elif kind == 'episode_start':
-            self.raw = data['observation']
-            skills = {s['name']: s for s in self.raw.get('skills', [])}
-            self.arm = dict(free=INVENTORY_SLOTS - len(self.raw['inventory']), items=sorted({i['id'] for i in self.raw['inventory']}),
-                            woodcutting=[skills['Woodcutting']['baseLevel'], skills['Woodcutting']['xp']])
-        elif self.start is None:
-            return  # setup before arm: the declared start's style step records a request and an observation too
-        elif kind == 'requested':
-            action, raw = data['action'], self.raw
-            entry = raw['actSel'][action - A_ACT0] if family(action) == 'act' and action - A_ACT0 < len(raw['actSel']) else \
-                raw['heldSel'][action - A_HELD0] if family(action) == 'held' and action - A_HELD0 < len(raw['heldSel']) else {}
-            self.pending = [self.tick - self.start, action, entry.get('option'), entry.get('name')]
-        elif kind == 'observed':
-            self.raw = data['observation']
-            self.rows.append(self.pending + self.observed(self.raw))
-        elif kind == 'task_transition' and data['executed_action'] is not None:
-            seen = data['native_tick'] - self.start  # the observation's tick, from the clock read after the step
-            self.rows[-1].append(seen)
-            for item in self.raw['inventory']:
-                self.items.setdefault(item['id'], seen)
 
 
 def native_records(count=NATIVE['records'] + 1):
-    """Part B's start records, in their frozen order: B1 plays the first NATIVE['records'], B0 the
-    next. Raises ValueError if B1's differ from their frozen sha256."""
+    """Part B's start records, in their frozen order: B1's first NATIVE['records'], then B0's one.
+    Raises ValueError if B1's differ from their frozen sha256."""
     earlier = config.earlier_native_draws()
     check = [{k: r[k] for k in ('set_stats', 'seed_items', 'reset_seed')} for r in config.check_records('entrana')]
     x, z = NATIVE['start']
@@ -528,335 +456,521 @@ def native_records(count=NATIVE['records'] + 1):
     return out
 
 
-def native_fixture(record, goal=NATIVE['goal']):
-    """A declared-start goal fixture of one record over the hour, as baseline/config.py's start-set fixtures are."""
-    return dict(id=f"native-hour-{record['start']}", kind='goal', horizon=NATIVE['ticks'], capacity='declared', goal=goal,
-                final=False, **record)
+# ---- free-play-v1's evaluation in the Python reference ---------------------------------------------------------------
+FREE = dict(
+    task=FREE_PLAY['version'],
+    rows=2,                        # the row form's revision (free_life); 2: a policy life's seed is a 64-bit word
+    ticks=36000,                   # a life: the trial's length
+    read=6000,                     # the read beside it: the same life at 6,000 ticks from arm (FreeRead)
+    passes=('sampled1', 'sampled2', 'greedy'),
+    torch_threads=1,               # one intra-op thread a process, so a row does not depend on how many processes play
+    # The training run's facts that sim.gate free's plans pin (policy_run copies them from summary.json): its decisions
+    # and worlds, its learner settings as summary.json's 'learner' holds them, its batch's muggers and life-length
+    # distribution, its layout pool's sha256 and the sha256 of the tables it trained on (summary 'tables': the Python
+    # reference's archive, or on the C engine the archive its pack's recorded input was held equal to; None on the fake
+    # environment and in a C-engine summary written before 'tables' held that archive), and whether it made the
+    # --validate checks (summary 'validate'; None for a summary written before that key).
+    run_facts=('decisions', 'worlds', 'n_steps', 'batch_size', 'n_epochs', 'learning_rate', 'gae_lambda', 'clip_range',
+               'ent_coef', 'vf_coef', 'max_grad_norm', 'lstm_hidden_size', 'half_life_ticks', 'value_norm', 'muggers',
+               'life', 'pool', 'tables', 'validate'),
+    # The engine facts beside them (engine_facts): the engine the run collected on (summary 'engine': 'cpu', the Python
+    # reference, or 'native', the C engine) and its pack's sha256 (None on the Python reference). A plan's run pins them
+    # beside the run facts, or holds the run facts alone and pins the Python reference (reference_engine): the pilot's
+    # plan, frozen before the C engine could train free play, is of that form.
+    engine_facts=('engine', 'pack'),
+    reference_engine=dict(engine='cpu', pack=None),
+    # The world of a record written before the world was a recorded setting of a run and a plan. A plan that names none
+    # (sim/gate.py free_plan_world; the pilot's) is this world's, since none other existed when such a plan was frozen.
+    # A training summary whose batch in effect records no world (trained_world) is this world's only when it trained
+    # over this world's archive: earlier code trained village-world-v2 pools without recording the world. A record
+    # that names a world is held to it.
+    first_world=VILLAGE['version'],
+    # That archive, pinned (trained_world): the sha256 of sim/build.py DATA at the pilot's freeze, which the frozen pilot
+    # plan pins as its tables (sim/gate.py FREE['plans']['pilot']), so that reading an old record never depends on this
+    # checkout's files.
+    first_world_archive='307b77a7a58327782bc25654127048968d12c9e88ef1a74c221ca60b3d6c5771',
+)
+POLICY_ACTORS = ('policy', 'initial')
 
 
-def window_counts(trace, width=NATIVE['report_window'], windows=NATIVE['ticks'] // NATIVE['report_window']):
-    """Certified production per item family and reporting window, from the audited trace's production events (native-op
-    with a production source; the item is the stack's second-last value, as baseline/evaluate.py counts completions):
-    {base id: [count in window 1, ...]}. The hour's last tick belongs to the last window."""
-    out = {}
-    for event in trace['events']:
-        tail = event.get('stackTail') or []
-        if event.get('kind') == 'native-op' and event.get('productionSource') is True and len(tail) >= 2:
-            k = min((event['tick'] - trace['startTick']) // width, windows - 1)
-            out.setdefault(tail[-2], [0] * windows)[k] += 1
-    return out
+@functools.lru_cache(maxsize=None)
+def world_archive(world):
+    """The sha256 of the archive `world` plays over (sim/free.py world_tables), hashed once a process; None when this
+    checkout has no such file."""
+    from sim import free
+    path = free.world_tables(world)
+    return sha256(path) if path.exists() else None
 
 
-def production_ticks(trace, families):
-    """Ticks from arm of every production event of the item families `families`."""
-    return [e['tick'] - trace['startTick'] for e in trace['events'] if e.get('kind') == 'native-op'
-            and e.get('productionSource') is True and len(e.get('stackTail') or []) >= 2 and e['stackTail'][-2] in families]
+def trained_world(batch, tables):
+    """The world a free-play training run played, from its batch in effect (summary.json free_play.batch_in_effect,
+    sim/workers.py BATCH_SETTINGS) and the sha256 of the archive it trained on (`tables`: summary.json's tables, or a
+    run record's facts; None in an older C-engine summary). A batch that records its `world` is held to it as it is
+    (None included). A batch that records none was written before the batch recorded its world: it is
+    FREE['first_world']'s only when it trained over that world's archive (FREE['first_world_archive'], a pinned value,
+    not this checkout's file), or records no archive (an older C-engine run, which could play that world only), as the
+    pilot's run of seed 77 did. Otherwise None: a record that names no world, which no evaluation and no plan reads."""
+    if 'world' in batch:
+        return batch['world']
+    return FREE['first_world'] if tables is None or tables == FREE['first_world_archive'] else None
 
 
-def native_full(rows, arm_free, end, window=HOUR['full_response_ticks']):
-    """Inventory-full events at decision boundaries (as FullInventory): each answered by the first decision after which a
-    slot is free, a drop, a deposit ('bank') or 'other', or a 'stall' when none came within `window` ticks; 'open' when the
-    hour ended first."""
-    events, current = [], dict(tick=0, decision=0) if arm_free == 0 else None
-    for k, row in enumerate(rows):
-        free, seen, kind = row[11], row[13], family(row[1])
-        if free == 0 and current is None:
-            current = dict(tick=seen, decision=k + 1)
-        elif free > 0 and current is not None:
-            delay = seen - current['tick']
-            response = dict(drop='drop', deposit='bank').get(kind, 'other') if delay <= window else 'stall'
-            events.append(dict(current, freed_by=kind, freed_after=delay, response=response))
-            current = None
-    if current is not None:
-        lasted = end - current['tick']
-        events.append(dict(current, freed_by=None, freed_after=None, response='stall' if lasted > window else 'open'))
-    return events
+def fingerprint_beside(path):
+    """The name table fingerprint written beside a published policy (scripts/export_policy.py: STEM.names.json beside
+    STEM.zip), or None when there is none."""
+    found = Path(path).with_name(Path(path).stem + '.names.json')
+    return json.loads(found.read_text()) if found.exists() else None
 
 
-def far_points():
-    """{name: (x, z)} of every drop-in point and test village (baseline/config.py DROP_IN, Seers', Catherby)."""
-    out = {}
-    for name, place in {**config.DROP_IN, **{v: config.VILLAGES[v] for v in ('seers', 'catherby')}}.items():
-        _, mx, mz, lx, lz = map(int, place['spawnTele'].split(','))
-        out[name] = (mx * 64 + lx, mz * 64 + lz)
-    return out
-
-
-def native_score(log, trial, timed, width=NATIVE['report_window']):
-    """A complete native hour's record. Raises EvidenceError if the windows do not sum to the
-    audit's production per family, so the hour is incomplete."""
-    from baseline.evidence import EvidenceError
-    report, trace, rows = trial['report'], log.trace, log.rows
-    windows = NATIVE['ticks'] // width
-    counts = window_counts(trace, width, windows)
-    audited = {int(base): f['produced'] for base, f in report['families'].items() if f['produced']}
-    if {b: sum(c) for b, c in counts.items()} != audited or sum(audited.values()) != report['produced']:
-        raise EvidenceError('window counts differ from the audit\'s production')
-    wood = GOAL_FAMILIES['wood']
-    logs = [sum(c[w] for b, c in counts.items() if b in wood) for w in range(windows)]
-    produced = production_ticks(trace, wood)
-    ticks = report['delivered_ticks']
-    window = lambda t: min(t // width, windows - 1)  # window_counts' rule
-    # the woodcutting level at each window's end: the last observation at or before it (the arm observation at tick 0)
-    seen = [(0, log.arm['woodcutting'][0])] + [(r[13], r[12]) for r in rows]
-    level_at = lambda t: [level for tick, level in seen if tick <= t][-1]
-    levels = [level_at(min((w + 1) * width, ticks)) for w in range(windows)]
-    chops = [(r[0], r[3]) for r in rows if r[2] == 'Chop down']
-    chop_ticks, trees = [c[0] for c in chops], Counter()
-    for t in produced:  # the kind of the latest chop requested before the production tick
-        k = bisect.bisect_left(chop_ticks, t)
-        trees[chops[k - 1][1] if k else 'unattributed'] += 1
-    near = far_points()
-    close = Counter(name for r in rows for name, (x, z) in near.items() if max(abs(r[4] - x), abs(r[5] - z)) <= NATIVE['near'])
-    declared = {t[k] for t in trace['targets'] for k in ('base', 'note') if t[k] is not None}
-    foreign = {str(i): t for i, t in sorted(log.items.items()) if i not in declared and i not in log.arm['items']}
-    by_window = [[r for r in rows if window(r[0]) == w] for w in range(windows)]
-    found = [measures(wr, [t for t in produced if window(t) == w], None, 0) for w, wr in enumerate(by_window)]
-    total = measures(rows, produced, None, 0)
-    full = native_full(rows, log.arm['free'], ticks)
-    calls = {}
-    for operation, _, seconds in timed.calls:
-        calls.setdefault(operation, []).append(seconds)
-    (_, read, read_seconds), = [c for c in timed.calls if c[0] == 'read']
-    (_, release, release_seconds), = [c for c in timed.calls if c[0] == 'release']
-    xs = [max(abs(r[4] - NATIVE['start'][0]), abs(r[5] - NATIVE['start'][1])) for r in rows]
-    return dict(
-        ticks=ticks, decisions=trial['decisions'], decisions_per_1000_ticks=1000 * trial['decisions'] / max(1, ticks),
-        survived=report['survived'], death_tick=None if report['survived'] else ticks,
-        attacker_at_end=log.raw.get('attacker'), hp_end=rows[-1][10] if rows else None,
-        produced=report['produced'], retained=[report['retained_lower'], report['retained_upper']],
-        families={str(b): dict(f) for b, f in report['families'].items()}, kills=report.get('kills', {}).get('lower'),
-        window_counts={str(b): c for b, c in counts.items()}, logs=sum(logs), logs_by_window=logs,
-        primary=[logs[w] - logs[0] for w in range(1, windows)], logs_by_tree=dict(trees),
-        woodcutting=dict(level=[log.arm['woodcutting'][0], levels[-1]], xp_start=log.arm['woodcutting'][1],
-                         level_at_window_end=levels,
-                         levels_gained_by_window=[levels[w] - (levels[w - 1] if w else log.arm['woodcutting'][0])
-                                                  for w in range(windows)]),
-        full_events=len(full), full_responses=dict(Counter(e['response'] for e in full)), full=full,
-        refusals=total['refused'], stalls=total['stalls'], stalled_ticks=total['stalled_ticks'],
-        interface_loops=total['interface_alternations'],
-        by_window=dict(decisions=[len(wr) for wr in by_window], refusals=[f['refused'] for f in found],
-                       stalls=[f['stalls'] for f in found], interface_loops=[f['interface_alternations'] for f in found]),
-        ended=total['ended'], families_of_actions=total['families'], path_tiles=total['path_tiles'],
-        farthest_from_start=max(xs, default=0), near_steps=dict(close), foreign_items=foreign,
-        capture_events=len(trace['events']),
-        control_seconds={op: dict(count=len(v), total=sum(v), max=max(v)) for op, v in calls.items()},
-        # each control call includes the status check the service makes at most once a second
-        read_seconds=read_seconds, release_seconds=release_seconds, audit_seconds=release - read - read_seconds)
-
-
-def git_state():
-    """The code commit and whether tracked files differ from it."""
-    git = lambda *args: subprocess.run(['git', '-C', str(ROOT), *args], capture_output=True, text=True, check=True).stdout
-    return dict(commit=git('rev-parse', 'HEAD').strip(), dirty=bool(git('status', '--porcelain', '--untracked-files=no').strip()))
-
-
-# Phase 1's frozen initializations: the file of each training seed and its tensor digest (sim/train.py policy_digest).
-PHASE1_INIT = dict(init='logs/phase1/init/s{seed}.zip',
-                   init_policy_sha256={'101': 'ea33d35a3240971f6b703eb299d3a981b270dc271f4da93259977be5aa98492c',
-                                       '202': '48b621f6ef212e51cb2f248cbb336daed5358d1c75e38154c953dcdf034f6f7c',
-                                       '303': 'f65295f1081391c809b66a33cdb29c4f938515950e6fa1c7ea4248aa4fad4159',
-                                       '404': 'e56e9635946fd8dc995e5264636bc608a017235d74cf7ed2333ebfab23c13ce3',
-                                       '505': 'ffe8ebcaa0963bf91d353b45e261a97d201dbad1cbf15a3611f88229d6d0f89b'})
-
-
-def load_policy(name, seed):
-    """(model, facts) of a Part B policy of `seed`: a final ('S_wood', 'SH') checked against its gate.json sha256, an
-    initialization ('initial') against PHASE1_INIT's frozen tensor digest; both must read goal_vec and the name table."""
+def load_free_policy(path, contract=None):
+    """(model, facts) of a free-play-v1 checkpoint (sim.train train --task free-play-v1: latest.zip, initial.zip or one of
+    checkpoints/), for sampled and greedy play. The standard RecurrentPPO zip is loaded into the network its own saved
+    settings build (obs-v6's table, PopArt's value head with its statistics or a plain one, both LSTMs), then checked as
+    saved (baseline/policy.py check_names: obs-v6, the act, mask and held contract, the name table) and its observation
+    space against obs-v6's table, before any step is played. A checkpoint of another observation version, one that reads
+    a goal or one of another table is refused: its weights are never played under another contract. The policy is put
+    in evaluation mode, as collection puts it (sim/learn.py). contract: the contract it must record (baseline/policy.py
+    run_contract; item-v2's CONTRACT by default; a real-engine checkpoint's own version's, sim/watch.py load_actor),
+    whose item contract names the observation version and table (sim/workers.py observation_table: obs-v7 under item-v4,
+    free-play-v11's; obs-v6 otherwise). A published copy (scripts/export_policy.py) holds no name vectors and carries its
+    table's fingerprint beside it (fingerprint_beside): a table rebuilt from other game files plays it when the
+    fingerprint holds; its saved mark (name_vectors 'removed') has its tables filled from the table in use, which must
+    all be zero. facts['names'] says how the table was taken (check_names) and where the vectors come from."""
     from sb3_contrib import RecurrentPPO
-    from baseline.policy import check_names
+    from baseline.policy import CONTRACT, NameEmbedding, check_names, load_name_vectors
+    from names import name_table
+    from item_contract import ITEM_V2
     from sim.train import policy_digest
-    if name == 'initial':
-        path = ROOT / PHASE1_INIT['init'].format(seed=seed)
-        frozen = None
-    else:
-        gate = json.loads((ROOT / f'logs/phase1/s{seed}/eval/gate-{name}-final/gate.json').read_text())['checkpoint']
-        path, frozen = ROOT / gate['path'], gate['sha256']
-    digest = sha256(path)
-    if frozen is not None and digest != frozen:
-        raise ValueError(f'{path} differs from its gate.json sha256')
+    from sim.workers import observation_table
+    contract = contract or CONTRACT
+    path, (observation, shapes) = Path(path), observation_table(contract.get('items', ITEM_V2))
     model = RecurrentPPO.load(str(path), device='cpu')
-    check_names(model.policy)
-    tensors = policy_digest(model.policy)
-    if name == 'initial' and tensors != PHASE1_INIT['init_policy_sha256'][str(seed)]:
-        raise ValueError(f'{path} is not seed {seed}\'s frozen initialization')
-    if 'goal_vec' not in model.observation_space.spaces:
-        raise ValueError(f'{path} does not read the goal')
-    return model, dict(path=str(path.relative_to(ROOT)), sha256=digest, policy_sha256=tensors)
+    model.policy.set_training_mode(False)
+    names = check_names(model.policy, observation=observation, contract=contract, fingerprint=fingerprint_beside(path))
+    if getattr(model, 'name_vectors', None) == 'removed':  # a public copy (scripts/export_policy.py)
+        if any(bool(m.table.any()) for m in model.policy.modules() if isinstance(m, NameEmbedding)):
+            raise ValueError(f'{path} is marked a public copy but holds name vectors')
+        load_name_vectors(model.policy, name_table().vectors)
+        names = dict(names, vectors='the table in use (a public copy holds none)')
+    else:
+        names = dict(names, vectors="the checkpoint's own")
+    spaces = {k: tuple(s.shape) for k, s in model.observation_space.spaces.items()}
+    if spaces != {k: tuple(v) for k, v in shapes.items()}:
+        raise ValueError(f'{path} reads another observation table than {observation}\'s')
+    return model, dict(path=str(path), sha256=sha256(path), policy_sha256=policy_digest(model.policy),
+                       observation=observation, contract=model.policy.contract, value_norm=model.policy.value_norm,
+                       free_play=getattr(model, 'free_play', None), half_life_ticks=getattr(model, 'half_life_ticks', None),
+                       lstm=model.policy.lstm_actor.hidden_size, names=names)
 
 
-def native_schedule(b0=False, seeds=NATIVE['seeds'], policies=NATIVE['policies'], records=range(NATIVE['records'])):
-    """[(policy, seed, record)] of a pass: B0 plays WAIT and S_wood seed 101 on the B0 record; B1 plays WAIT on every
-    record, then each seed's policies record by record."""
-    if b0:
-        return [('wait', None, NATIVE['b0_record']), ('S_wood', 101, NATIVE['b0_record'])]
-    return [('wait', None, k) for k in records] + [(p, s, k) for s in seeds for k in records for p in policies]
+class FreePolicyActor(PolicyActor):
+    """A loaded free-play policy (load_free_policy) as sim/combat.py PolicyActor plays it: MaskedRecurrentPolicy.forward
+    with both recurrent states, zeroed at the life's start (its one episode start), sampled with torch's generator seeded
+    by the life's seed, or greedy. It refuses an observation whose arrays are not the policy's own, where PolicyActor
+    would fill a missing one with zeros."""
+
+    def __init__(self, model, deterministic):
+        import torch
+        self.torch, self.model, self.deterministic = torch, model, deterministic
+        self.keys = set(model.observation_space.spaces)
+
+    def act(self, observation, task=None, trace=False):
+        if set(observation) != self.keys:
+            raise ValueError(f'an observation with {sorted(set(observation) ^ self.keys)} unlike the policy\'s own arrays')
+        return super().act(observation, task, trace)
 
 
-def native_hour(worlds, join, actor, fixture, trial_seed, path, engine=NATIVE['engine']):
-    """One native hour in a freshly booted world: its record, 'complete' or
-    'incomplete' with the cause, tick and decisions. A failed capture, release or audit leaves the hour incomplete; its
-    capture is retired and its world released. No world, or one of another build, raises: the pass stops before the
-    hour. A failed world release is reported as `service_error`: the pass stops after the hour."""
-    from baseline.evaluate import run_trial
-    from baseline.telemetry import EpisodeRecorder
-    from baseline.world import JsonlEvidence, make_episode
-    world = worlds.acquire(engine, timeout=NATIVE['acquire_timeout'])
-    if world['tree'] != config.ENGINE_TREES[engine]:
-        worlds.release(world['id'])
-        raise RuntimeError(f"world {world['id']} runs another engine build than {engine}")
-    hour = dict(world={k: world.get(k) for k in ('id', 'engine', 'tree', 'block', 'boot_id')}, evidence=path.name)
-    log, evidence, transport, task, started = NativeLog(), JsonlEvidence(path), None, None, time.monotonic()
-
-    def write(kind, **data):
-        evidence(kind, **data)
-        log(kind, data)
-    record = EpisodeRecorder(write)
-    try:
-        transport, service = join(world, record)
-        timed = Timed(service)
-        record('scheduled_episode', index=0, fixture=fixture, trial=fixture['start'], seed=trial_seed)
-        task = NativeHourEpisode(make_episode(transport, timed, fixture, record))
-        trial = run_trial(task, fixture, actor, trial_seed, record, NATIVE['decision_limit'])
-        hour.update(native_score(log, trial, timed), status='complete')
-    except Exception as error:
-        hour.update(status='incomplete', cause=f'{type(error).__name__}: {error}', decisions=len(log.rows),
-                    tick=None if log.tick is None or log.start is None else log.tick - log.start)
-    finally:
-        try:
-            if task is not None:
-                task.close()  # retires a capture still bound, then leaves the world
-            elif transport is not None:
-                transport.close()
-        finally:
-            evidence.close()
-            hour['seconds'] = time.monotonic() - started
-            try:
-                worlds.release(world['id'])
-            except Exception as error:
-                hour['service_error'] = f'{type(error).__name__}: {error}'
-    if hour['status'] == 'complete':
-        hour.update(seconds_per_decision=hour['seconds'] / max(1, hour['decisions']),
-                    seconds_per_tick=hour['seconds'] / max(1, hour['ticks']))
-    return hour
+def trial_seed(base, policy_seed, record):
+    """A policy life's torch seed: one 64-bit word of SeedSequence([pass seed, policy seed, record]). Two lives share a seed
+    only when two words collide (about 10^-10 for 40,960 lives); sim.gate free refuses a record whose sampled passes
+    share one."""
+    return int(np.random.SeedSequence([base, policy_seed, record]).generate_state(1, np.uint64)[0])
 
 
-def native_run(output, name, schedule, worlds=None, join=None, policies=load_policy):
-    """Play `schedule` (native_schedule) as pass `name` of NATIVE['passes'] inside a scripts/stack.py world service:
-    OUT/results.json (header and one row per hour, rewritten after each) and each hour's raw evidence in OUT/hours/. A
-    world that fails to boot or exits stops the pass; the hours left are reported as not played, never replaced."""
-    from baseline.evaluate import Actor
-    from baseline.world import FreshWorlds, join as join_world
-    sampled, base = NATIVE['passes'][name]
-    if os.environ.get('NODE_RANDOM_EVENTS') != 'false':
-        raise ValueError('launch the stack with NODE_RANDOM_EVENTS=false (the native hour plays without random events)')
-    worlds, join = worlds or FreshWorlds(), join or join_world
-    output = Path(output)
-    (output / 'hours').mkdir(parents=True, exist_ok=False)
-    records = native_records()
-    result = dict(version=NATIVE['version'], native=NATIVE, hour_windows=HOUR['windows'], row_fields=NATIVE_ROW_FIELDS,
-                  pass_name=name, sampled=sampled, base=base, xp_rate=config.XP_RATE,
-                  random_events=os.environ['NODE_RANDOM_EVENTS'], code=git_state(), engines=worlds.identity().get('engines'),
-                  schedule=[list(s) for s in schedule], policies={}, status='running', hours=[])
+class FreeRead:
+    """The life's levels in S `ticks` from arm, read at the end of the world cycle in which a life of `ticks` would end
+    (sim/task.py _watch: a death, or the first cycle at or after its end). obs-v6 shows neither a life's length nor its
+    time, so the read equals a life of `ticks` played by the same actor with the same seed; None when the life stopped
+    at an unsupported site first."""
 
-    def save():
-        (output / 'results.tmp').write_text(json.dumps(result, indent=1, default=str) + '\n', encoding='utf-8')
-        os.replace(output / 'results.tmp', output / 'results.json')
-    loaded, started = {}, time.monotonic()
-    try:
-        for index, (policy, seed, k) in enumerate(schedule):
-            if policy == 'wait':
-                actor = Actor('wait')
+    def __init__(self, task, ticks):
+        self.task, self.ticks, self.read = task, ticks, None
+        world, cycle = task.world, task.world.cycle  # the episode's watcher; its close puts the world's own cycle back
+
+        def watched():
+            cycle()
+            if self.read is None and (task.terminal is not None or world.tick >= task.start_tick + ticks):
+                self.read = self.snapshot()
+        world.cycle = watched
+
+    def snapshot(self):
+        from sim.audit import fractional_level
+        t, p = self.task, self.task.agent.player
+        gain = {name: p.base_levels[s] - t.arm_levels[s] for name, s in zip(t.skill_names, t.skills)}
+        start, now = [fractional_level(t.arm_stats[s]) for s in t.skills], [fractional_level(p.stats[s]) for s in t.skills]
+        return dict(ticks=self.ticks, tick=t.world.tick - t.start_tick,
+                    died=t.terminal is not None and t.terminal['reason'] == 'death',
+                    gain={k: v for k, v in gain.items() if v}, gain_s=sum(gain.values()),
+                    fractional=sum(b - a for a, b in zip(start, now)))
+
+
+def free_reads(task):
+    """The unpaid reads of a played life from its events (none is paid, none has a bar):
+    production by family, the agent's kills by npc name, each eat as [tick from arm, hitpoints before it, hitpoints it
+    healed] (0 healed: an eat at full hitpoints, which writes no heal event), and the XP events in runs of one activity,
+    [activity, first tick, last tick, events]. An XP event's activity is its cause's: 'fight:<npc name>' for a hit
+    (chicken, goblin), else its skill (woodcutting, mining, fishing; cooking, prayer or firemaking outside S)."""
+    from sim.engine import SKILLS
+    w = task.world
+    name = lambda npc_type: w.t.npc_types[npc_type]['name'].lower()
+    npcs, events = {n.nid: name(n.base) for n in w.npcs}, w.events[task.event_start:]
+    kills = Counter(name(d['type']) for _, kind, d in events if kind == 'npc_defeated' and d['source'] == task.agent.name)
+    hp, eats, runs = task.arm_hp, [], []
+    for t, kind, d in events:
+        tick = t - task.start_tick
+        if kind == 'agent_hp':
+            if d['cause'] == 'eat' and eats and eats[-1][0] == tick and eats[-1][2] == 0:
+                eats[-1][1:] = [d['before'], d['after'] - d['before']]
+            hp = d['after']
+        elif kind == 'remove' and d['why'] == 'eat':
+            eats.append([tick, hp, 0])
+        elif kind == 'xp':
+            activity = f"fight:{npcs[d['npc']]}" if d.get('cause') == 'hit' else SKILLS[d['stat']]
+            if runs and runs[-1][0] == activity:
+                runs[-1][2:] = [tick, runs[-1][3] + 1]
             else:
-                if (policy, seed) not in loaded:
-                    loaded = {key: v for key, v in loaded.items() if key[1] == seed}  # one seed's policies in memory
-                    model, facts = policies(policy, seed)
-                    loaded[policy, seed] = model
-                    result['policies'].setdefault(str(seed), {})[policy] = facts
-                actor = Actor('checkpoint', loaded[policy, seed], deterministic=not sampled)
-            trial_seed = base + k
-            row = dict(index=index, policy=policy, seed=seed, record=k, trial_seed=trial_seed,
-                       start=records[k]['start'])
-            path = output / 'hours' / f'{index:03d}-{policy}-{seed or "none"}-r{k}.jsonl.gz'
-            rest = [dict(index=i, policy=p, seed=s, record=r, status='not_played')
-                    for i, (p, s, r) in enumerate(schedule) if i > index]
-            try:
-                row.update(native_hour(worlds, join, actor, native_fixture(records[k]), trial_seed, path))
-            except Exception as error:  # no world for this hour: the world service failed and the pass stops
-                result['hours'] += [dict(row, status='not_played', cause=f'{type(error).__name__}: {error}'), *rest]
-                result['status'] = 'stopped'
-                return result
-            result['hours'].append(row)
-            print(f"[native-hour {name}] {index + 1}/{len(schedule)} {policy} s{seed} r{k}: {row['status']}"
-                  + (f" logs {row['logs']} {row['logs_by_window']} wc {row['woodcutting']['level']} decisions "
-                     f"{row['decisions']} {row['seconds']:.0f}s" if row['status'] == 'complete' else f" {row.get('cause')}"),
-                  flush=True)
-            if 'service_error' in row:
-                result['hours'] += rest
-                result['status'] = 'stopped'
-                return result
-            save()
-        result['status'] = 'completed'
-        return result
+                runs.append([activity, tick, tick, 1])
+    return dict(made={f: int(c) for f, c in zip(FAMILIES, task.made) if c}, kills=dict(kills), eat_log=eats,
+                eats_full=sum(e[2] == 0 for e in eats), activity=runs)
+
+
+def free_jobs(records, policy, controls, change=None):
+    """Every life of a run as (actor, pass, record), record by record: the policy in each pass, its initialization in each
+    sampled pass, then each control, played once with the control seed and shared by every pass. `records`: a count, or
+    with `change` (a manifest's change: its records and the policy's passes) none, the change's records alone and the
+    policy in its passes only."""
+    sampled = [p for p in FREE['passes'] if p != 'greedy']
+    policy_jobs = [('policy', p) for p in change['passes']] if change else \
+        [('policy', p) for p in FREE['passes']] + [('initial', p) for p in sampled]
+    per = (policy_jobs if policy else []) + [(c, None) for c in controls]
+    return [(name, p, r) for r in (change['records'] if change else range(records)) for name, p in per]
+
+
+def free_life(job, run, tables, models):
+    """The row of one life (the soak's row, sim/free.py Life.row, and what identifies the actor, its pass and seed, the
+    6,000-tick read and the unpaid reads): `job` is (actor, pass, record), `run` the manifest's settings, `models` the
+    loaded policies by actor. A policy plays with trial_seed(pass seed, policy seed, record), a control with the soak's
+    actor seed [control seed, record]."""
+    from sim import free
+    name, pass_name, record = job
+    t0 = time.perf_counter()
+    change = (run.get('change') or {}).get('name')
+    if change is None:
+        life = free.Life(run['first'], run['key'], record, run['muggers'], run['xp_rate'], run['ticks'], tables, run['split'],
+                         world=run['world'])
+    else:  # the base record changed by sim/changed.py, its seeds the base row's
+        from sim import changed
+        life = changed.life(change, run['first'], run['key'], record, run['muggers'], run['xp_rate'], run['ticks'], tables,
+                            run['split'], world=run['world'])
+    if name in POLICY_ACTORS:
+        p = next(p for p in run['passes'] if p['name'] == pass_name)
+        actor, seed = FreePolicyActor(models[name], deterministic=not p['sampled']), trial_seed(p['seed'], run['policy']['seed'], record)
+        who = dict(policy_seed=run['policy']['seed'], checkpoint=run['policy'][name]['sha256'], deterministic=not p['sampled'])
+    else:
+        actor, seed = free.make(name, run['period']), [run['control_seed'], record]
+        who = dict(policy_seed=None, checkpoint=None, deterministic=None)
+    marks = free.PhaseMarks(actor) if isinstance(actor, free.Rotation) else None
+    reader = FreeRead(life.task, run['read'])
+    row = life.row(name, run['period'], actor, free.play(life.task, actor, seed, watch=marks), marks, t0)
+    row.update(rows=FREE['rows'], split=run['split'], first=run['first'], seed=seed, read=reader.read,
+               **{'pass': pass_name}, **who, **free_reads(life.task), **({'change': change} if change else {}))
+    return row
+
+
+def free_rows(path):
+    """(rows, whether a last line was cut) of a part's lives file: a line cut by a stopped process can only be the last."""
+    lines = Path(path).read_text().splitlines(keepends=True) if Path(path).exists() else []
+    rows = []
+    for k, line in enumerate(lines):
+        try:
+            if not line.endswith('\n'):
+                raise ValueError('no line end')
+            rows.append(json.loads(line))
+        except ValueError:
+            if k != len(lines) - 1:
+                raise ValueError(f'{path}: line {k + 1} is not a row')
+            return rows, True
+    return rows, False
+
+
+def run_facts(run):
+    """FREE's run facts of a training run's summary.json (None where the summary holds no such fact)."""
+    learner, batch = run.get('learner') or {}, (run.get('free_play') or {}).get('batch_in_effect') or {}
+    facts = dict(decisions=run.get('decisions'), worlds=run.get('worlds'), muggers=batch.get('muggers'),
+                 life=batch.get('life'), pool=(run.get('pool') or {}).get('sha256'),
+                 tables=(run.get('tables') or {}).get('sha256'), validate=run.get('validate'))
+    return {k: facts[k] if k in facts else learner.get(k) for k in FREE['run_facts']}
+
+
+def engine_facts(run):
+    """FREE's engine facts of a training run's summary.json, or of the run record that policy_run writes from it: its
+    engine and its pack's sha256 (None without a pack)."""
+    return dict(engine=run.get('engine'), pack=(run.get('pack') or {}).get('sha256'))
+
+
+def policy_run(checkpoint, initial, facts, policy_seed, muggers, xp_rate, unfinished=False, *, world):
+    """The training run that the checkpoint and its own saved initialization come from (a policy is checked against
+    its actual saved initialization), from the training command's summary.json beside the initialization: a
+    free-play-v1 run of `policy_seed` that did not resume, whose tensors at the start are the initialization's, and whose
+    folder holds the checkpoint as latest.zip or as one of its checkpoints/. When the summary records the final
+    checkpoint's tensor digest (policy_sha256_at_end) or the periodic ones' (checkpoint_digests, by file name), the
+    checkpoint's must be the recorded one. latest.zip needs a completed run; another checkpoint of a run that has not
+    completed only with `unfinished`, and every reading of it is then a description (sim/gate.py free_plan). A run with
+    no summary (one killed before sim/train.py wrote it) cannot be evaluated or described: `unfinished` serves a run
+    that failed and left its summary. The run's batch in effect must be the evaluation's world: the world `world` (a
+    name of sim/combat.py VILLAGES; the run's own, trained_world: a summary that names no world is refused), obs-v6, the
+    muggers and the agent settings of free_play_cfg, and the XP rate, or 1 when the evaluation is the declared 25x read.
+    The archive the run trained on (summary 'tables') must be the evaluation world's (world_archive), the one its lives
+    play over; a summary that records none (an older C-engine run) is not compared. Returns the
+    run's facts for the manifest: FREE's run facts, its start (environment seed, the --weights and --init records) and
+    the source it trained from (summary 'source', baseline/telemetry.py source(); None for an older summary)."""
+    folder = Path(initial).resolve().parent
+    summary = folder / 'summary.json'
+    if not summary.exists():
+        raise ValueError(f'{initial} has no run summary beside it ({summary}): only a run that left its summary.json '
+                         '(completed, or failed with one) is evaluated or described')
+    run = json.loads(summary.read_text())
+    if 'resume' in run:
+        raise ValueError(f'the run {summary} resumed from a recovery state: a resumed run is not evaluated')
+    if run.get('task') != FREE['task'] or run.get('seed') != policy_seed or \
+            run.get('policy_sha256_at_start') != facts['initial']['policy_sha256']:
+        raise ValueError(f'{initial} is not shown to be the initialization of a {FREE["task"]} run of seed {policy_seed}: '
+                         f'its run summary {summary} must record that task and seed and its tensors at the start')
+    where = Path(checkpoint).resolve()
+    name = 'latest.zip' if where == (folder / 'latest.zip').resolve() else \
+        f'checkpoints/{where.name}' if where.parent == (folder / 'checkpoints').resolve() else None
+    if name is None:
+        raise ValueError(f'{checkpoint} is not latest.zip or one of checkpoints/ of the run of {initial}')
+    final, periodic = run.get('policy_sha256_at_end'), run.get('checkpoint_digests')
+    if name == 'latest.zip':
+        checked, recorded = final is not None, final
+    else:
+        checked, recorded = periodic is not None, (periodic or {}).get(where.name)
+    if checked and recorded != facts['policy']['policy_sha256']:
+        raise ValueError(f'{checkpoint} holds other tensors than its run summary {summary} records for {name}')
+    status = run.get('status')
+    if status == 'completed' and unfinished:
+        raise ValueError(f'the run {summary} completed: unfinished names a run that has not')
+    if status != 'completed' and (name == 'latest.zip' or not unfinished):
+        raise ValueError(f'the run {summary} has status {status!r}: latest.zip needs a completed run, and another '
+                         'checkpoint of a run that has not completed needs unfinished (a description only)')
+    batch, tables = (run.get('free_play') or {}).get('batch_in_effect') or {}, (run.get('tables') or {}).get('sha256')
+    if 'world' not in batch and trained_world(batch, tables) is None:
+        raise ValueError(f"the run {summary} records no world and trained over another archive ({tables}) than "
+                         f"{FREE['first_world']}'s: a record that names no world is not evaluated")
+    seen = dict(batch, world=trained_world(batch, tables))
+    wanted = dict(world=world, observation=FREE_PLAY['observation'], muggers=muggers,
+                  cfg=json.loads(json.dumps(free_play_cfg())))
+    differ = sorted(k for k, v in wanted.items() if seen.get(k) != v)
+    trained = batch.get('xp_rate')
+    differ += [] if trained == xp_rate or (trained, xp_rate) == (1, 25) else ['xp_rate']
+    if differ:
+        raise ValueError(f'the run {summary} trained in another world than this evaluation: {", ".join(differ)} differ')
+    if tables is not None and tables != world_archive(world):
+        raise ValueError(f"the run {summary} trained over another archive ({tables}) than {world}'s "
+                         f'({world_archive(world)}), which its lives play over')
+    return dict(summary=str(summary), checkpoint=name, seed=run['seed'], policy_sha256_at_start=run['policy_sha256_at_start'],
+                policy_sha256_at_end=final, status=status, unfinished=unfinished, batch_in_effect=batch,
+                facts=run_facts(run), env_seed=run.get('env_seed'), weights=run.get('weights'), init=run.get('init'),
+                env=run.get('env'), engine=run.get('engine'), pack=run.get('pack'), source=run.get('source'))
+
+
+class FreeStop(RuntimeError):
+    """A life stopped at an unsupported site: its row holds the evidence and the part plays no further life."""
+
+
+def agree(path, manifest):
+    """Write a run's manifest, or check that the one there (another part's, or this part's before a resume) holds the same
+    settings; written by a link from a part's own file, so two parts that start together never both write it."""
+    text = json.dumps(manifest, indent=1, sort_keys=True, default=str) + '\n'
+    mine = path.with_name(f'.{path.name}.{os.getpid()}')
+    mine.write_text(text)
+    try:
+        os.link(mine, path)
+    except FileExistsError:
+        there, here = json.loads(path.read_text()), json.loads(text)
+        differ = sorted(k for k in set(there) | set(here) if there.get(k) != here.get(k))
+        if differ:
+            raise ValueError(f'{path} holds another run\'s settings: {", ".join(differ)} differ')
     finally:
-        result['seconds'] = time.monotonic() - started
-        save()
+        mine.unlink()
 
 
-def bootstrap(values, resamples=NATIVE['statistics']['resamples'], seed=NATIVE['statistics']['seed']):
-    """Mean and 95% percentile bootstrap interval of per-record values (records resampled)."""
-    values = np.asarray(values, float)
-    if not len(values):
-        return None
-    draws = np.random.default_rng(seed).integers(0, len(values), (resamples, len(values)))
-    means = values[draws].mean(axis=1)
-    return dict(n=len(values), mean=float(values.mean()), low=float(np.percentile(means, 2.5)),
-                high=float(np.percentile(means, 97.5)))
+def free_run(output, *, world, split, first, records, key, muggers, xp_rate, ticks=FREE['ticks'], read=FREE['read'],
+             checkpoint=None, initial=None, policy_seed=None, seeds=None, controls=(), period=None, control_seed=None,
+             unfinished=False, plan=None, part=(0, 1), final=False, tables=None, change=None, change_passes=('sampled1',)):
+    """Part `part[0]` of `part[1]` of a free-play evaluation (module docstring) of `world` (a name of sim/combat.py
+    VILLAGES; no default): every `part[1]`-th life of free_jobs from the part's index, each record a fresh world of its
+    layouts and one life of `ticks` at `xp_rate`, over the world's archive (sim/free.py world_tables, whose path and
+    sha256 the manifest and the plan check record; `tables`, a loaded archive, must be that file's), written to
+    lives-{part}.jsonl one row a life as it ends, by one process at a time (an exclusive lock on that file). Resumable:
+    the rows already in the
+    part's file are kept and not played again (a cut last line is dropped), and the run's manifest.json must hold the
+    same settings. Every setting is checked, the whole record range and the policy's run (policy_run) included, before
+    anything is written. With `plan` (a name of sim/gate.py FREE['plans']), the output is refused before any life is
+    played when that plan would not read it (sim/gate.py free_plan_check: a plan not frozen, other settings, a source
+    that is not one commit with no change, a run that does not fit); sim.gate free stays the judge. An unsupported site
+    writes its life's row with the evidence and raises FreeStop; a part that holds such a row refuses to go on. `change`:
+    a changed world of sim/changed.py (module docstring), its records those of the range whose base holds the fact, the
+    policy in `change_passes`; refused with `plan`, in another world, with muggers, or with a control its reads do not
+    need (the controls default to those they need)."""
+    import fcntl
+    from baseline.telemetry import source
+    from sim import free
+    from sim.combat import check_village
+    from sim.data import Tables
+    index, count = part
+    if world not in VILLAGES:
+        raise ValueError(f'free play is evaluated in a world of {sorted(VILLAGES)}, named with no default: not {world!r}')
+    if split not in ('development', 'final') or (split == 'final') != final:
+        raise ValueError('free play is evaluated on development or final records, and the final split needs final=True')
+    if type(first) is not int or first < 0 or type(records) is not int or records < 1:
+        raise ValueError(f'records from a first index of 0 or more: first {first!r}, records {records!r}')
+    split_seeds(split, records, first)  # refuses a range past the split's end, before anything is written
+    if type(muggers) is not bool or xp_rate not in FREE_PLAY['xp_rates']:
+        raise ValueError(f"name the muggers (True or False; no default) and an XP rate of {FREE_PLAY['xp_rates']}")
+    if not (type(ticks) is int and type(read) is int and 0 < read < ticks) or not 0 <= index < count:
+        raise ValueError(f'a read before the life\'s end ({read} of {ticks} ticks) and a part of the run')
+    if change is not None:
+        from sim import changed
+        if plan is not None:
+            raise ValueError('a changed world is a description of the scorecard, never a plan\'s evaluation: no --plan')
+        if change not in changed.CHANGES:
+            raise ValueError(f'change {change!r} is not one of {sorted(changed.CHANGES)}')
+        if world != changed.WORLD or muggers is not False:
+            raise ValueError(f'the changed worlds are {changed.WORLD}\'s without muggers (sim/changed.py): not {world!r}, '
+                             f'muggers {muggers!r}')
+        needs = (*changed.CHANGES[change].scripts, 'random', 'wait')
+        controls = tuple(c for c in free.CONTROLS if c in needs) if not controls else tuple(controls)
+        if set(controls) - set(needs):
+            raise ValueError(f'{change} reads the controls {sorted(needs)}: not {sorted(set(controls) - set(needs))}')
+        if not change_passes or len(set(change_passes)) != len(change_passes) or \
+                set(change_passes) - {p for p in FREE['passes'] if p != 'greedy'}:
+            raise ValueError(f'a changed world plays the policy in one or both sampled passes: not {list(change_passes)}')
+    unknown = sorted(set(controls) - set(free.CONTROLS))
+    if unknown or len(set(controls)) != len(controls) or (checkpoint is None and not controls):
+        raise ValueError(f'controls among {free.CONTROLS}, each once, and a checkpoint or a control to play: {list(controls)}')
+    if checkpoint is not None and (initial is None or policy_seed is None or seeds is None or len(seeds) != 2
+                                   or seeds[0] == seeds[1]):
+        raise ValueError('a policy plays with its own saved initialization, its seed and two sampled passes\' seeds')
+    if checkpoint is None and unfinished:
+        raise ValueError('unfinished names the run of a checkpoint: there is none')
+    if control_seed is None:
+        raise ValueError('the evaluation needs its control seed (random legal play\'s; the soak\'s actor seed), which every '
+                         'output of one evaluation shares')
+    if ('rotation' in controls) != (period is not None):
+        raise ValueError('the rotation needs its period and only the rotation takes one: the study declares none')
+    if period is not None:
+        free.Rotation(free.ROTATION_ORDER, period)  # refuses a period that is not a positive whole number of ticks
+    archive = free.world_tables(world)
+    if not archive.exists():
+        raise ValueError(f'{archive} is missing: {world} plays over it (sim/build.py says how each archive is made)')
+    archive_sha256 = world_archive(world)
+    models, facts = {}, {}
+    if checkpoint is not None:
+        missing = [str(p) for p in (checkpoint, initial) if not Path(p).exists()]
+        if missing:
+            summary = Path(initial).parent / 'summary.json'
+            begun = summary.exists() and json.loads(summary.read_text()).get('status') == 'initialized'
+            raise ValueError(f'{missing[0]} does not exist' + (': its run stopped at its start (status initialized, '
+                                                              'sim.train --initial-only) and saved no checkpoint to play'
+                                                              if begun else ''))
+        for name, path in (('policy', checkpoint), ('initial', initial)):
+            models[name], facts[name] = load_free_policy(path)
+        facts['run'] = policy_run(checkpoint, initial, facts, policy_seed, muggers, xp_rate, unfinished, world=world)
+    passes = [dict(name=name, seed=seeds[0] if name == 'greedy' else seeds[k], sampled=name != 'greedy')
+              for k, name in enumerate(FREE['passes'])] if checkpoint is not None else []
+    if plan is not None:
+        from sim.gate import free_plan_check
+        shown = dict(world=world, split=split, first=first, records=records, key=key, xp_rate=xp_rate, muggers=muggers,
+                     ticks=ticks, read=read, period=period, control_seed=control_seed, tables=archive_sha256)
+        policies = {} if checkpoint is None else {policy_seed: json.loads(json.dumps(
+            dict(policy=facts['policy'], initial=facts['initial'], run=facts['run'],
+                 passes={p['name']: p['seed'] for p in passes}), default=str))}
+        reasons = free_plan_check(plan, shown, policies, source())
+        if reasons:
+            raise ValueError(f'plan {plan} would not read this output: {"; ".join(reasons)}')
+    with np.load(archive) as data:  # the archive's own record of what it holds, beside the loaded one's
+        held = json.loads(data['meta'].tobytes())
+    if tables is None:
+        tables = Tables.load(archive)
+    elif tables.meta != held:
+        raise ValueError(f'the tables given are not {archive.name}, the archive {world} plays over')
+    check_village(VILLAGES[world], tables, muggers)
+    if change is not None:
+        held_records = changed.records(change, first, records, key, tables, split, world=world)
+        if not held_records:
+            raise ValueError(f'no record of {first} .. {first + records - 1} holds the fact of {change}')
+        change = dict(name=change, records=held_records,
+                      passes=[p for p in FREE['passes'] if p in change_passes] if checkpoint is not None else [])
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    run = dict(task=FREE['task'], rows=FREE['rows'], world=world, observation=FREE_PLAY['observation'],
+               source=source(output), tables=dict(path=str(archive), sha256=archive_sha256), split=split, first=first,
+               records=records, key=key, muggers=muggers, xp_rate=xp_rate, ticks=ticks, read=read, passes=passes,
+               policy=dict(seed=policy_seed, **facts) if checkpoint is not None else None, controls=list(controls),
+               period=period, control_seed=control_seed, plan=plan, parts=count, torch_threads=FREE['torch_threads'],
+               **({'change': change} if change is not None else {}))
+    agree(output / 'manifest.json', run)
+    run = json.loads(json.dumps(run, default=str))
+    path = output / f'lives-{index}.jsonl'
+    lock = path.open('a')  # held while this process plays the part: one process a part
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise ValueError(f'{path} is being played by another process: one process a part')
+    try:
+        return play_part(path, run, models, tables, records, checkpoint is not None, controls, part)
+    finally:
+        lock.close()
 
 
-def native_summary(outputs):
-    """Per pass, seed and policy: hours by status, the primary per window (windows 2-5 minus 1,
-    each hour its own control) with its bootstrap interval, logs, levels, deaths and the reported fields; and per seed and
-    pass the paired difference in hour logs from WAIT on the same records."""
-    out = {}
-    for output in outputs:
-        result = json.loads((Path(output) / 'results.json').read_text())
-        hours = result['hours']
-        cells = {}
-        for h in hours:
-            cells.setdefault(('wait' if h['policy'] == 'wait' else f"{h['policy']} s{h['seed']}"), []).append(h)
-        wait = {h['record']: h['logs'] for h in hours if h['policy'] == 'wait' and h['status'] == 'complete'}
-        summary = {}
-        for cell, rows in cells.items():
-            done = [h for h in rows if h['status'] == 'complete']
-            mean = lambda key: float(np.mean([h[key] for h in done])) if done else None
-            windows = len(done[0]['primary']) if done else 0
-            summary[cell] = dict(
-                hours=len(rows), complete=len(done), incomplete=[(h['record'], h.get('cause')) for h in rows
-                                                                 if h['status'] == 'incomplete'],
-                not_played=sum(h['status'] == 'not_played' for h in rows),
-                primary=[bootstrap([h['primary'][w] for h in done]) for w in range(windows)],
-                logs=bootstrap([h['logs'] for h in done]),
-                logs_by_window=np.mean([h['logs_by_window'] for h in done], axis=0).tolist() if done else None,
-                minus_wait=bootstrap([h['logs'] - wait[h['record']] for h in done if h['record'] in wait]),
-                woodcutting_start=[h['woodcutting']['level'][0] for h in done],
-                woodcutting_end=[h['woodcutting']['level'][1] for h in done],
-                levels_gained_by_window=np.mean([h['woodcutting']['levels_gained_by_window'] for h in done],
-                                                axis=0).tolist() if done else None,
-                deaths=sum(not h['survived'] for h in done), death_ticks=sorted(h['death_tick'] for h in done if not h['survived']),
-                logs_by_tree=dict(sum((Counter(h['logs_by_tree']) for h in done), Counter())),
-                full_responses=dict(sum((Counter(h['full_responses']) for h in done), Counter())),
-                **{f'mean_{k}': mean(k) for k in ('decisions', 'ticks', 'refusals', 'stalls', 'interface_loops',
-                                                  'decisions_per_1000_ticks', 'seconds')},
-                by_window={k: np.mean([h['by_window'][k] for h in done], axis=0).tolist() if done else None
-                           for k in ('decisions', 'refusals', 'stalls', 'interface_loops')},
-                near_steps=dict(sum((Counter(h['near_steps']) for h in done), Counter())),
-                foreign_items=sum(bool(h['foreign_items']) for h in done),
-                max_capture_events=max((h['capture_events'] for h in done), default=None),
-                max_read_seconds=max((h['read_seconds'] for h in done), default=None),
-                max_release_seconds=max((h['release_seconds'] for h in done), default=None))
-        out[result['pass_name']] = dict(status=result['status'], seconds=result.get('seconds'), cells=summary)
-    return out
+def play_part(path, run, models, tables, records, policy, controls, part):
+    """The lives of one part (free_run) that its lives file does not hold yet, played and written one row a life."""
+    index, count = part
+    rows, cut = free_rows(path)
+    if cut:
+        path.write_text(''.join(json.dumps(r, default=str) + '\n' for r in rows))
+    stopped = [r for r in rows if r['unsupported'] is not None]
+    if stopped:
+        r = stopped[0]
+        raise FreeStop(f"{path} stopped at an unsupported site ({r['actor']} {r['pass']} record {r['record']}: "
+                       f"{r['unsupported']['message']}); a part with such a row plays no further life")
+    mine = free_jobs(records, policy, controls, run.get('change'))[index::count]
+    done = {(r['actor'], r['pass'], r['record']) for r in rows}
+    if not done <= set(mine) or len(done) != len(rows):
+        raise ValueError(f'{path} holds rows that are not this part\'s, or a life twice')
+    import torch
+    threads, t0 = torch.get_num_threads(), time.perf_counter()
+    torch.set_num_threads(FREE['torch_threads'])
+    played = 0
+    try:
+        with path.open('a') as stream:
+            for job in mine:
+                if job in done:
+                    continue
+                row = free_life(job, run, tables, models)
+                stream.write(json.dumps(row, default=str) + '\n')
+                stream.flush()
+                played += 1
+                if row['unsupported'] is not None:
+                    raise FreeStop(f"{job}: unsupported site {row['unsupported']['file']}:{row['unsupported']['line']} "
+                                   f"({row['unsupported']['message']}); its row in {path} holds the evidence")
+    finally:
+        torch.set_num_threads(threads)
+    return dict(part=[index, count], lives=len(mine), played=played, kept=len(done), cut=cut,
+                seconds=round(time.perf_counter() - t0, 1))
 
 
 def main():
@@ -883,25 +997,56 @@ def main():
     play.add_argument('--output', type=Path, required=True)
     join = commands.add_parser('merge', help='merge the parts of one run into results.json')
     join.add_argument('output', type=Path)
-    native = commands.add_parser('native', help='Part B: one pass of native hours inside a scripts/stack.py world service')
-    native.add_argument('--output', type=Path, required=True)
-    native.add_argument('--pass', dest='pass_name', required=True, choices=list(NATIVE['passes']))
-    native.add_argument('--b0', action='store_true', help='the B0 rehearsal: WAIT and S_wood seed 101 on the B0 record')
-    native.add_argument('--seeds', type=int, nargs='+', default=list(NATIVE['seeds']), choices=NATIVE['seeds'])
-    native.add_argument('--policies', nargs='+', default=list(NATIVE['policies']), choices=NATIVE['policies'])
-    summary = commands.add_parser('native-summary', help="summarize native passes' results.json")
-    summary.add_argument('outputs', type=Path, nargs='+')
+    from sim.free import CONTROLS
+    free = commands.add_parser('free', help='free-play-v1: a policy, its initialization and the controls on one record set '
+                               '(one part)')
+    free.add_argument('--output', type=Path, required=True)
+    free.add_argument('--world', required=True, choices=sorted(VILLAGES),
+                      help='the world played, over its own archive; the policy must have trained in it (no default)')
+    free.add_argument('--split', default='development', choices=('development', 'final'))
+    free.add_argument('--final', action='store_true', help='the final split is final evaluation data: say so')
+    free.add_argument('--first', type=int, required=True, help="the split's index of record 0's layout")
+    free.add_argument('--records', type=int, required=True)
+    free.add_argument('--key', type=int, required=True, help="the start draws' key (sim/combat.py draw_village)")
+    free.add_argument('--muggers', type=int, choices=(0, 1), required=True, help='Stage A without (0) or with (1) muggers')
+    free.add_argument('--xp-rate', type=int, choices=FREE_PLAY['xp_rates'], required=True)
+    free.add_argument('--ticks', type=int, default=FREE['ticks'], help="a life's native ticks from arm")
+    free.add_argument('--read-ticks', type=int, default=FREE['read'], help='the read of the same life beside it')
+    free.add_argument('--checkpoint', type=Path, help='a free-play-v1 checkpoint (obs-v6)')
+    free.add_argument('--initial', type=Path, help="that run's saved initialization (its initial.zip)")
+    free.add_argument('--policy-seed', type=int, help="the policy's training seed (its lives' seeds)")
+    free.add_argument('--seeds', type=int, nargs=2, metavar=('SAMPLED1', 'SAMPLED2'), help="the sampled passes' seeds")
+    free.add_argument('--controls', nargs='+', default=[], choices=CONTROLS)
+    free.add_argument('--period', type=int, help="the rotation's ticks a member (no default)")
+    free.add_argument('--control-seed', type=int, required=True,
+                      help="the controls' actor seed (random legal play's), which every output of one evaluation shares")
+    free.add_argument('--plan', help="a plan of sim/gate.py FREE['plans']: refuse before any life is played when that "
+                                     'plan would not read this output')
+    free.add_argument('--unfinished-run', action='store_true',
+                      help='the checkpoint is one of checkpoints/ of a run that failed and left its summary.json: a '
+                           'description only')
+    free.add_argument('--part', type=int, nargs=2, default=(0, 1), metavar=('I', 'N'))
+    free.add_argument('--change', help='a changed world of sim/changed.py CHANGES (the scorecard; never with --plan)')
+    free.add_argument('--change-passes', nargs='+', default=['sampled1'], choices=('sampled1', 'sampled2'),
+                      help="with --change, the policy's sampled passes (default: pass 1 alone)")
     args = parser.parse_args()
+    if args.command == 'free':
+        try:
+            result = free_run(args.output, world=args.world, split=args.split, first=args.first, records=args.records,
+                              key=args.key,
+                              muggers=bool(args.muggers), xp_rate=args.xp_rate, ticks=args.ticks, read=args.read_ticks,
+                              checkpoint=args.checkpoint, initial=args.initial, policy_seed=args.policy_seed,
+                              seeds=args.seeds, controls=tuple(args.controls), period=args.period,
+                              control_seed=args.control_seed, unfinished=args.unfinished_run, plan=args.plan,
+                              part=tuple(args.part), final=args.final, change=args.change,
+                              change_passes=tuple(args.change_passes))
+        except (ValueError, FreeStop) as error:
+            raise SystemExit(f'[free] {error}')
+        print(json.dumps(result))
+        return
     if args.command == 'merge':
         result = merge(args.output)
         print(json.dumps(result['cells'], indent=1))
-        return
-    if args.command == 'native':
-        result = native_run(args.output, args.pass_name, native_schedule(args.b0, tuple(args.seeds), tuple(args.policies)))
-        print(f"[native-hour {args.pass_name}] {result['status']}: {len(result['hours'])} hours in {result['seconds']:.0f} s")
-        raise SystemExit(0 if result['status'] == 'completed' else 1)
-    if args.command == 'native-summary':
-        print(json.dumps(native_summary(args.outputs), indent=1))
         return
     if args.records == 'final2' and (args.split != 'final' or not set(args.goals) <= set(HOUR['final2']['goals'])):
         parser.error(f"the final2 records are final-split records of {' '.join(HOUR['final2']['goals'])} only")

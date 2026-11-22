@@ -32,15 +32,20 @@ stub(`${ENGINE}/engine/script/ServerTriggerType.js`, { default: { APLOC1: 100, A
     APOBJ1: 300, OPHELD1: 400, OPHELD5: 404, OPHELDU: 410 } });
 stub(`${ENGINE}/cache/config/LocType.js`, { default: { get: (id: number) => locTypes[id] } });
 // Held items: shrimps (Eat, op 1) and logs (no iop), each with a script for every held trigger but OPHELDU's.
-const objTypes: Record<number, { id: number; category: number; iop: (string | null)[]; debugname: string }> = {
-    315: { id: 315, category: -1, iop: ['Eat', null, null, null, 'Drop'], debugname: 'shrimp' },
-    1511: { id: 1511, category: -1, iop: [null, null, null, null, 'Drop'], debugname: 'logs' } };
-stub(`${ENGINE}/cache/config/ObjType.js`, { default: { get: (id: number) => objTypes[id] ?? { op: [null, null, 'Take'] } } });
+const objTypes: Record<number, { id: number; category: number; iop: (string | null)[]; debugname: string; name: string }> = {
+    315: { id: 315, category: -1, iop: ['Eat', null, null, null, 'Drop'], debugname: 'shrimp', name: 'Shrimps' },
+    1511: { id: 1511, category: -1, iop: [null, null, null, null, 'Drop'], debugname: 'logs', name: 'Logs' },
+    1277: { id: 1277, category: -1, iop: [null, 'Wield', null, null, 'Drop'], debugname: 'bronze_sword', name: 'Bronze sword' },
+    // nine eatable kinds f0..f8, so that item-v4's page and pack options reach entries 8 and over
+    ...Object.fromEntries(Array.from({ length: 9 }, (_, k) => [3000 + k, { id: 3000 + k, category: -1,
+        iop: ['Eat', null, null, null, 'Drop'], debugname: `f${k}`, name: `f${k}` }])) };
+stub(`${ENGINE}/cache/config/ObjType.js`, { default: { get: (id: number) => objTypes[id] ?? { op: [null, null, 'Take'] },
+    getId: (name: string) => Object.values(objTypes).find(o => o.debugname === name)?.id ?? -1 } });
 stub(`${ENGINE}/cache/config/InvType.js`, { default: { INV: 93 } });
 stub(`${ENGINE}/cache/config/CategoryType.js`, { default: { get: (id: number) => ({ id }) } });
 stub(`${ENGINE}/engine/script/ScriptProvider.js`, { default: {
     getByTrigger: (trigger: number, id: number) => trigger >= 400 && trigger < 410 ? { name: `${trigger}:${id}` } : null,
-    getByTriggerSpecific: () => null } });
+    getByTriggerSpecific: () => null, getByName: (name: string) => ({ name }) } });
 stub(`${ENGINE}/engine/script/ScriptRunner.js`, { default: { init: (script: { name: string }) => ({ script: script.name }) } });
 stub(`${ENGINE}/util/Environment.js`, { default: { node: { debug: true } } });   // the engine's default world config
 for (const path of ['cache/config/Component.js', 'cache/config/DbRowType.js',
@@ -58,10 +63,15 @@ stub('../../vendor/rs-sdk/server/vendor/rsmod-pathfinder', { CollisionFlag: { WA
     WALL_SOUTH: 0x20, WALL_WEST: 0x80 }, CollisionType: { NORMAL: 0 }, canTravel: () => true, isFlagged: () => false });
 
 const { EngineAgent } = await import('./agent');
+const { ItemPages, itemPage, kindPage } = await import('../core/items');
+const { selectHeldWide } = await import('../core/wide');
+const { pageRow } = await import('../core/actions');
+const { selectHeld } = await import('../core/affordances');
+const { A_DEPOSIT0, A_DROP0, A_HELD0, A_USE0 } = await import('../core/actions');
 const { CLICK_ROWS } = await import('../core/clicks');
 
 type Call = [string, ...unknown[]];
-function fixture(x = 3200, z = 3200) {
+function fixture(x = 3200, z = 3200, pack?: Record<number, { id: number; count: number }>) {
     flags.clear(); inView.clear(); world.objs.clear();
     const calls: Call[] = [];
     const player = { x, z, level: 0, originX: x, originZ: z, slot: 1, delayed: false, stats: [0],
@@ -75,11 +85,13 @@ function fixture(x = 3200, z = 3200) {
         processWalktrigger() { calls.push(['processWalktrigger']); },
         hasWaypoints() { return this.waypoints.length > 0; },
         setInteraction(kind: string, target: unknown, trigger: number) {
-            calls.push(['setInteraction', kind, trigger]); this.target = target; this.trigger = trigger; return true; },
-        getInventory: (inv: number) => inv === 93 ? { get: (slot: number) => held[slot] ?? null } : null };
-    const held: Record<number, { id: number; count: number }> = { 0: { id: 315, count: 1 }, 1: { id: 1511, count: 1 } };
+            calls.push(['setInteraction', kind, trigger]); this.target = target; this.trigger = trigger;
+            this.targetOp = trigger; return true; }, targetOp: -1,
+        getInventory: (inv: number) => inv === 93 ? { capacity: 28, get: (slot: number) => held[slot] ?? null } : null };
+    const held: Record<number, { id: number; count: number }> = pack ?? { 0: { id: 315, count: 1 }, 1: { id: 1511, count: 1 } };
     const agent: any = Object.create(EngineAgent.prototype);
     Object.assign(agent, { player, cfg: {}, option: null, optionEnd: null, decisionRoute: null, latestRoute: null,
+        decision: 7, itemPages: new ItemPages(), using: null,
         lastObservation: { clicks: Array.from({ length: 24 }, (_, k) => ({ dx: OFFSETS[k][0], dz: OFFSETS[k][1],
             inside: true, open: true })) } });
     return { agent, player, calls, names: () => calls.map(c => c[0]) };
@@ -241,4 +253,80 @@ test('a use on a held item with no script clears the pending action, then sends 
         ['messageGame', 'Nothing interesting happens.']]);
     expect(player.target).toBeNull();
     expect([player.lastItem, player.lastUseItem]).toEqual([1511, 315]);   // OpHeldUHandler's second lookup swaps them
+});
+
+test('a use on a loc sets its interaction with the use trigger and the picked item', () => {
+    const { agent, player } = fixture();
+    const loc = { type: 1276, x: 3201, z: 3200, level: 0, shape: 10, angle: 0 };
+    agent.interactLoc(1, { loc, rawOps: ['Chop down'], name: 'Tree' }, null, 'Use', 'act_0', { slot: 1, id: 1511 });
+    expect([player.target, player.targetOp, player.lastUseItem]).toEqual([loc, 110, 1511]);   // APLOCU
+});
+
+test('under item-v3 each row acts on its kind\'s first slot: drop one, pick, use on another kind, eat, deposit the kind', () => {
+    // the pack: shrimps in slots 0 and 5, logs in slots 1 to 3, a sword in slot 9
+    const pack = { 0: { id: 315, count: 1 }, 1: { id: 1511, count: 1 }, 2: { id: 1511, count: 1 }, 3: { id: 1511, count: 1 },
+        5: { id: 315, count: 1 }, 9: { id: 1277, count: 1 } };
+    const { agent, player, calls } = fixture(3200, 3200, pack);
+    agent.bankIsOpen = () => true;
+    const look = () => {  // the observation the next row is chosen from (projectItems' page and selectHeld)
+        const items = agent.inventoryItems(93).map((i: any) => ({ ...i, options: objTypes[i.id].iop.filter(Boolean) }));
+        const invSel = (agent.itemPages.contract === 'item-v3' ? kindPage : itemPage)(items, 0, 28);
+        agent.lastObservation = { ...agent.lastObservation, mask: new Array(96).fill(1), invSel,
+            heldSel: selectHeld(invSel, agent.using) };
+        return agent.lastObservation;
+    };
+    agent.itemPages.reset('item-v3');
+    expect(look().invSel.map((e: any) => [e.slot, e.id, e.count, e.total]).slice(0, 4)).toEqual(
+        [[0, 315, 1, 2], [1, 1511, 1, 3], [9, 1277, 1, 1], [-1, -1, 0, 0]]);
+    expect(agent.dispatch(A_DROP0 + 1, null)).toBe('drop slot 1');   // the one log of the kind's first slot
+    expect(calls.at(-1)).toEqual(['executeScript', '404:1511', true]);
+    expect(agent.dispatch(A_USE0 + 1, null)).toBe('use: picked Logs');   // a pick takes that log
+    expect(agent.using).toEqual({ slot: 1, id: 1511, name: 'Logs' });
+    const targets = look().heldSel;   // the page's other kinds, each once: the logs are none
+    expect(targets.map((h: any) => [h.slot, h.option])).toEqual([[0, 'Use'], [9, 'Use']]);
+    expect(agent.dispatch(A_HELD0, null)).toBe('use: nothing interesting happens');   // logs on the shrimps
+    expect([player.lastItem, player.lastUseItem]).toEqual([1511, 315]);   // the logs on the shrimps (swapped)
+    expect(look().heldSel.map((h: any) => [h.slot, h.option])).toEqual([[0, 'Eat'], [9, 'Wield']]);
+    expect(agent.dispatch(A_HELD0, null)).toBe('opheld Eat slot 0');   // an Eat plays on the kind's first slot
+    expect(agent.wieldSlot(agent.lastObservation, 'bronze_sword')).toBe(1);   // the setup's Wield finds its kind
+    expect(agent.dispatch(A_DEPOSIT0 + 1, null)).toBe('bank_deposit: slot 1 id 1511 requested 3');   // the whole kind
+    agent.itemPages.reset();   // item-v2: the physical page, a deposit of the slot's own count
+    expect(look().invSel.map((e: any) => e.slot).slice(0, 4)).toEqual([0, 1, 2, 3]);
+    expect(agent.dispatch(A_DEPOSIT0 + 1, null)).toBe('bank_deposit: slot 1 id 1511 requested 1');
+    expect(agent.dispatch(A_DROP0 + 2, null)).toBe('drop slot 2');
+});
+
+test('under item-v4 the rows of entries 8..15 act on their entry: drop, pick, a pack option, a use and a deposit', () => {
+    // f0..f8 in slots 0..8 (each offers Eat), logs in slots 9 and 11, the sword in slot 10: 11 kinds on one page of 16
+    const pack: Record<number, { id: number; count: number }> = Object.fromEntries(Array.from({ length: 9 }, (_, k) =>
+        [k, { id: 3000 + k, count: 1 }]));
+    Object.assign(pack, { 9: { id: 1511, count: 1 }, 10: { id: 1277, count: 1 }, 11: { id: 1511, count: 1 } });
+    const { agent, player, calls } = fixture(3200, 3200, pack);
+    agent.bankIsOpen = () => true;
+    agent.itemPages.reset('item-v4');
+    const look = () => {
+        const items = agent.inventoryItems(93).map((i: any) => ({ ...i, options: objTypes[i.id].iop.filter(Boolean) }));
+        const invSel = kindPage(items, 0, 28, 16);
+        agent.lastObservation = { ...agent.lastObservation, mask: new Array(128).fill(1), invSel,
+            heldSel: selectHeldWide(invSel, agent.using) };
+        return agent.lastObservation;
+    };
+    const page = look();
+    expect(page.invSel.map((e: any) => [e.slot, e.id, e.total]).slice(8, 12)).toEqual(
+        [[8, 3008, 1], [9, 1511, 2], [10, 1277, 1], [-1, -1, 0]]);
+    expect(page.heldSel.map((h: any) => [h.slot, h.option])).toEqual([...Array.from({ length: 9 }, (_, k) => [k, 'Eat']),
+        [10, 'Wield']]);
+    expect(agent.dispatch(pageRow(A_HELD0, 8), null)).toBe('opheld Eat slot 8');   // row 96: the ninth pack option
+    expect(agent.dispatch(pageRow(A_HELD0, 9), null)).toBe('opheld Wield slot 10');  // row 97
+    expect(agent.dispatch(pageRow(A_DROP0, 9), null)).toBe('drop slot 9');   // row 105: the logs' first slot
+    expect(calls.at(-1)).toEqual(['executeScript', '404:1511', true]);
+    expect(agent.dispatch(pageRow(A_USE0, 9), null)).toBe('use: picked Logs');   // row 121
+    expect(agent.using).toEqual({ slot: 9, id: 1511, name: 'Logs' });
+    const targets = look().heldSel;   // every other kind's Use: f0..f8 and the sword
+    expect(targets.map((h: any) => h.slot)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 10]);
+    expect(agent.dispatch(pageRow(A_HELD0, 8), null)).toBe('use: nothing interesting happens');   // row 96: logs on f8
+    expect([player.lastItem, player.lastUseItem]).toEqual([1511, 3008]);   // the logs on f8 (swapped)
+    look();
+    expect(agent.dispatch(pageRow(A_DEPOSIT0, 9), null)).toBe('bank_deposit: slot 9 id 1511 requested 2');  // row 113
+    expect(agent.dispatch(pageRow(A_DROP0, 12), null)).toBe('drop: stale selection');   // row 108: an empty entry
 });

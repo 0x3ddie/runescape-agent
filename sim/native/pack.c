@@ -119,8 +119,9 @@ static int resolve_layout(RsPack *P, int32_t index, const Heap heap[5], RsErr *e
         || r->n_npcs < 0 || r->n_npcs > RS_MAX_NPCS || r->n_fish < 0 || r->n_camp < 0 || r->n_outside < 0
         || r->n_groves < 0 || r->n_sites < 0)
         return bad(err, "a layout count is negative or beyond the world's capacity");
+    if (r->world < 1 || r->world > RS_N_DECLARED) return bad(err, "a layout's world is not a declared one");
     *L = (RsLayout){.rec = r, .index = index, .kind = r->kind, .W = r->W, .H = r->H, .T = r->T, .x0 = r->x0,
-                    .z0 = r->z0, .n_src = r->n_src, .n_start = r->n_start, .n_locs = r->n_locs, .n_open = r->n_open,
+                    .z0 = r->z0, .world = r->world, .village = RS_DECLARED_VILLAGE[r->world - 1], .n_src = r->n_src, .n_start = r->n_start, .n_locs = r->n_locs, .n_open = r->n_open,
                     .n_npcs = r->n_npcs, .n_fish = r->n_fish, .n_camp = r->n_camp, .n_outside = r->n_outside,
                     .n_groves = r->n_groves, .n_sites = r->n_sites};
     int64_t T = r->T;

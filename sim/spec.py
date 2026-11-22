@@ -19,13 +19,20 @@ are those of obs-v5 (rl/obs.py), so a model built from OBSERVATION_SHAPES is the
 
 Goals are assigned per world slot (world b asks for GOALS[b % 4] in every episode), so every update
 holds the same number of transitions per goal; the physical start is sampled independently of it.
-The declared exception: one goal in every world slot (goal_set).
+The declared exception (phase 1's specialists): one goal in every world slot (goal_set).
+
+free-play-v1 (sim/task.py FreePlayEpisode) follows OBSERVATION_SHAPES_V6, obs-v6: no goal
+and no time input, so neither goal_vec nor budget_vec nor the critic's goal count (critic_vec); a batch names the table
+its observations follow (OBSERVATIONS). Its reward is each step's paid level gain, nothing is settled at the end, a
+death or a life cut by its drawn length is done (info['terminal'] TERMINAL_DEATH or TERMINAL_HORIZON), info['goal'] is -1
+(no goal, so a reader by goal fails) and info['last_obs'] holds, for each world whose life ended at the step, the observation at that end (zero elsewhere).
 """
 from __future__ import annotations
 
 import numpy as np
 
 from baseline.resource_task import GOAL_VEC, GOALS
+from obs import OBSERVATION, OBSERVATION_V6, PROG_VEC_V6, TASK_VEC_V6
 
 N_ACTIONS = 96
 # obs-v5: rl/obs.py project() plus the task's inputs (baseline/resource_task.py ResourceEpisode._budget), goal_vec in
@@ -41,6 +48,11 @@ OBSERVATION_SHAPES = {
     'text_vec': (133,), 'use_ids': (1,), 'worn_ids': (14,),
     'budget_vec': (2,), 'critic_vec': (1,), 'goal_vec': (len(GOAL_VEC),),
 }
+# obs-v6 (rl/obs.py project_v6): obs-v5's projection with prog_vec's 21 progress entries and task_vec without its decision
+# count, and no task input.
+OBSERVATION_SHAPES_V6 = {**{k: v for k, v in OBSERVATION_SHAPES.items() if k not in ('budget_vec', 'critic_vec', 'goal_vec')},
+                         'prog_vec': (PROG_VEC_V6,), 'task_vec': (TASK_VEC_V6,)}
+OBSERVATIONS = {OBSERVATION: OBSERVATION_SHAPES, OBSERVATION_V6: OBSERVATION_SHAPES_V6}
 
 
 # The first activity task's physical start, identical for every goal
@@ -81,7 +93,7 @@ def dtype(name):
 # Per-world step information. Episode fields are those of the episode that ended at this step
 # (zero elsewhere); `goal` is the goal of the episode the step belongs to.
 INFO_FIELDS = {
-    'goal': np.int32,              # index into GOALS
+    'goal': np.int32,              # index into GOALS; -1 in free-play-v1, which has none
     'unsupported': np.bool_,       # see above: stop before the update
     'terminal': np.int32,          # 0 running, 1 horizon, 2 death (this step ended the episode)
     'episode_return': np.float32,  # the audited goal return of the ended episode
@@ -93,11 +105,12 @@ INFO_FIELDS = {
 TERMINAL_RUNNING, TERMINAL_HORIZON, TERMINAL_DEATH = 0, 1, 2
 
 
-def check_batch(obs, n):
-    """Shapes, dtypes and legality of one batch; raises on any departure (used by tests and adapters)."""
-    if set(obs) != set(OBSERVATION_SHAPES):
-        raise ValueError(f'observation keys differ: {sorted(set(obs) ^ set(OBSERVATION_SHAPES))}')
-    for name, shape in OBSERVATION_SHAPES.items():
+def check_batch(obs, n, shapes=OBSERVATION_SHAPES):
+    """Shapes, dtypes and legality of one batch under its table (OBSERVATIONS); raises on any departure (used by tests
+    and adapters)."""
+    if set(obs) != set(shapes):
+        raise ValueError(f'observation keys differ: {sorted(set(obs) ^ set(shapes))}')
+    for name, shape in shapes.items():
         value = np.asarray(obs[name])
         if value.shape != (n, *shape) or value.dtype != dtype(name):
             raise ValueError(f'{name}: {value.dtype}{value.shape}, expected {np.dtype(dtype(name))}{(n, *shape)}')

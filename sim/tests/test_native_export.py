@@ -275,8 +275,9 @@ class _Deaths:
     """The world a death script touches (DeathContext's reads and npc_death's), recording what it does."""
 
     def __init__(self, tables, seed, tick, exclusions, player):
-        from sim.engine import Rng
+        from sim.engine import LOOT_OUTSIDE, Rng
         self.t, self.rng, self.tick, self.exclusions = tables, Rng(seed), tick, frozenset(exclusions)
+        self.loot_outside = LOOT_OUTSIDE  # World.loot_outside of every world the C port plays
         self.members = bool(tables.meta['environment']['members'])
         self.player, self.events, self.calls = player, [], []
 
@@ -623,8 +624,8 @@ def test_scarce_variants_are_variant_layouts_under_cpubatchs_keys(ex, supply, ke
 
 
 def test_declared_world_refuses_unported_content(ex, tables, compact):
-    """A pool whose layout holds a loc or an npc whose trigger names a script C does not port (a door, a bank booth,
-    a bank teller) is refused; the pools as they are pass."""
+    """A pool whose layout holds a loc or an npc whose trigger names a script C does not port (a bank booth, stairs, a
+    bank teller) is refused; the pools as they are pass."""
     import dataclasses
     sec, c = ex.sections, nx.contract()
     layouts = compact[0]
@@ -675,6 +676,30 @@ def test_a_plain_pool_exports_as_its_derived_pool_without_trees(tables, supply, 
     assert not digests[0]['manifest']['trees'] and digests[0]['manifest']['counts']['compact'] == 3
 
 
+def test_a_layout_whose_village_holds_more_npcs_than_a_world_is_refused(tables, supply, name_table_path, tmp_path):
+    """Free play places the layout's npcs, a goblin at every chicken spawn, the start group's mugger and the chickens
+    (sim/combat.py village_npcs): a compact-world-v1 layout whose village would hold more than RS_MAX_NPCS is refused
+    at export (the C engine would stop at its first life there), and the same layout less its extra chickens is not."""
+    from dataclasses import replace
+    from names import NameTable
+    from sim import combat, world
+    layout = world.generate(world.split_seeds('train', 1)[0], tables)
+    kinds = {k for k, v in tables.npc_types.items() if v['debugname'] in ('chicken', 'chicken_brown')}
+    chickens = [k for k, row in enumerate(layout.npcs) if int(row[1]) in kinds]
+    assert len(chickens) == len(combat.camp(layout, tables)) >= 1
+    village = len(layout.npcs) + len(chickens) + 1
+    extra = (native.load().constants()['RS_MAX_NPCS'] - village) // 2 + 1  # each chicken adds itself and a goblin
+    full = replace(layout, npcs=np.concatenate([layout.npcs, layout.npcs[[chickens[0]] * extra]]))
+    with np.load(SUPPLY) as data:
+        small = world.save_pool(tmp_path / 'supply.npz', supply[:1], version=str(data['version']))
+    names = NameTable(name_table_path)
+    with pytest.raises(nx.ExportError, match='village npcs'):
+        nx.export(tmp_path / 'full.pack', world.save_pool(tmp_path / 'full.npz', [full]), small, TABLES, names=names,
+                  trees=False, variants=1, log=lambda _: None)
+    assert not (tmp_path / 'full.pack').exists()
+    nx.check_village(layout, tables, native.load().constants())
+
+
 def test_a_pack_of_these_sections_opens_in_c(ex, tables, compact, supply, tmp_path):
     """The sections, with one compact layout, one supply layout and its first variants, pass the C reader's checks
     (bounds, record layouts, sorted keys, variant rows) and its declared-world guard, and read back as written."""
@@ -708,3 +733,147 @@ def test_a_pack_of_these_sections_opens_in_c(ex, tables, compact, supply, tmp_pa
     for name, struct in (('MSGS', 'RsMsg'), ('OBJ_TYPES', 'RsObjType'), ('LAYOUTS', 'RsLayoutRec'), ('DROP_OPS', 'RsDropOp')):
         same(np.frombuffer(pack.section(ids[name]), native.record_dtype(struct)).tobytes(), sec[name].tobytes(), name)
     equal(np.frombuffer(pack.section(ids['HEAP_U16']), np.uint16), np.concatenate(heaps.parts['u16']), 'the u16 heap')
+
+
+# ---- village-world-v2 ------------------------------------------------------------------------------------------------
+TABLES_V2 = TABLES.with_name('draynor-nc2.npz')
+POOL_V2 = LOGS / 'sim' / 'world' / 'train-128-20000-v2.npz'
+
+
+@pytest.fixture(scope='module')
+def v2_pack(name_table_path, tmp_path_factory):
+    """(pool file, pack path, decoded sections, manifest) of the v2 training pool's first 8 layouts over draynor-nc2."""
+    if not (TABLES_V2.exists() and POOL_V2.exists() and SUPPLY.exists()):
+        pytest.skip('private v2 archive, v2 pool or supply pool absent')
+    from names import NameTable
+    from sim import search, world
+    work = tmp_path_factory.mktemp('v2-export')
+    pool = world.save_pool(work / 'pool.npz', world.load_pool(POOL_V2)[0][:8])
+    supply = world.save_pool(work / 'supply.npz', world.load_pool(SUPPLY)[0][:1], version=search.SUPPLY['world'])
+    path = nx.export(work / 'v2.pack', pool, supply, TABLES_V2, names=NameTable(name_table_path), trees=False, variants=1,
+                     log=lambda _: None)
+    _, meta, sections = native.read_pack(path)
+    names = {v: k for k, v in native.load().constants()['sections'].items()}
+    decoded = {names[sid]: value for sid, (_, _, _, value) in sections.items()}
+    return pool, path, decoded, meta
+
+
+def _records(decoded, name, struct):
+    return np.frombuffer(decoded[name] if isinstance(decoded[name], bytes) else decoded[name].tobytes(),
+                         native.record_dtype(struct))
+
+
+def test_a_village_world_v2_pack_names_its_world_and_holds_its_content(v2_pack):
+    """Over draynor-nc2 the v2 pool's pack: each compact record names village-world-v2 and the supply record
+    search-world-v1 (world_of); the plants' Pick is RS_S_PICK with each plant's picks row; the field items' and the
+    cape's OPHELDU are their default use scripts, whose cases set their own flags only; the loot flag of the world's own
+    list (LOOT_OUTSIDE less the cabbage) beside the default one; the manifest names the pools' worlds, the archive's
+    content and that list."""
+    from sim import combat, engine, world
+    pool, path, decoded, meta = v2_pack
+    c, t = nx.contract(), nx.load_tables(TABLES_V2)
+    scripts = {name: k for k, (name, _, _) in enumerate(native.load().scripts())}
+    records = _records(decoded, 'LAYOUTS', 'RsLayoutRec')
+    ids = {name: 1 + k for k, name in enumerate(world.WORLDS)}
+    assert {int(r['world']) for r in records if r['kind'] == c['RS_LAYOUT_COMPACT']} == {ids['village-world-v2']}
+    assert {int(r['world']) for r in records if r['kind'] != c['RS_LAYOUT_COMPACT']} == {ids['search-world-v1']}
+    locs = _records(decoded, 'LOC_TYPES', 'RsLocType')
+    picks = t.meta['content']['picks']
+    for k, lt in t.loc_types.items():
+        row = picks.get(lt['debugname'])
+        assert bool(locs[k]['has_pick']) == (row is not None), k
+        if row is not None:
+            assert (int(locs[k]['pick_item']), int(locs[k]['pick_respawn']), bool(locs[k]['pick_scaled'])) == \
+                (t.obj_id(row['item']), row['respawn'], row['scaled'])
+            assert int(locs[k]['trig_script'][c['RS_TRIG_OP'] + 1]) == scripts['RS_S_PICK']   # OPLOC2
+    objs = _records(decoded, 'OBJ_TYPES', 'RsObjType')
+    heldu = c['RS_OTRIG_HELDU']
+    for name, script in (('cabbage', 'RS_S_USE_DEFAULT_CABBAGE'), ('potato', 'RS_S_USE_DEFAULT_POTATO'),
+                         ('onion', 'RS_S_USE_DEFAULT_ONION'), ('black_cape', 'RS_S_USE_DEFAULT_BLACK_CAPE')):
+        assert int(objs[t.obj_id(name)]['trig_script'][heldu]) == scripts[script], name
+    for key, flag in nx.FIELD_USE_FLAGS.items():
+        cases = set(engine.FIELD_USE[key])
+        on = {t.obj_types[k]['debugname'] for k in t.obj_types if int(objs[k]['flags']) & c[f'RS_OF_{flag}']}
+        assert on == cases & {v['debugname'] for v in t.obj_types.values()}, key
+    own = combat.VILLAGE_V2['loot_outside']
+    for k in t.obj_types:
+        flags = int(objs[k]['flags'])
+        assert bool(flags & c['RS_OF_LOOT_OUTSIDE_OWN']) == engine.loot_outside(t, k, own), k
+        assert bool(flags & c['RS_OF_LOOT_OUTSIDE']) == engine.loot_outside(t, k), k
+    cabbage = int(objs[t.obj_id('cabbage')]['flags'])
+    assert cabbage & c['RS_OF_LOOT_OUTSIDE'] and not cabbage & c['RS_OF_LOOT_OUTSIDE_OWN']
+    assert meta['worlds'] == dict(compact='village-world-v2', supply='supply-world-v1')
+    assert meta['content'] == sorted(t.meta['content']) and 'picks' in meta['content']
+    assert meta['loot_outside'] == list(own)
+    consts = _records(decoded, 'CONSTS', 'RsConsts')[0]
+    assert int(consts['s_produce_pick']) != c['RS_NONE']
+
+
+def test_a_v1_pack_holds_none_of_village_world_v2(ex, tables):
+    """Over draynor-nc1 nothing of village-world-v2 enters a pack: the plants' Pick stays unknown (Python raises
+    'engine script [oploc2,cabbage]' there too), the field items' and the cape's OPHELDU stay unknown, no case flag of
+    theirs or loot flag of an own list is set, the pick's produce string is not interned."""
+    c = nx.contract()
+    scripts = {name: k for k, (name, _, _) in enumerate(native.load().scripts())}
+    locs, objs = ex.sections['LOC_TYPES'], ex.sections['OBJ_TYPES']
+    for k, lt in tables.loc_types.items():
+        if lt['debugname'] in ('cabbage', 'potato', 'onion'):
+            assert int(locs['trig_script'][k, c['RS_TRIG_OP'] + 1]) == scripts['RS_S_UNKNOWN'] and not locs['has_pick'][k]
+    for name in ('cabbage', 'potato', 'onion', 'black_cape'):
+        assert int(objs['trig_script'][tables.obj_id(name), c['RS_OTRIG_HELDU']]) == scripts['RS_S_UNKNOWN'], name
+    bits = sum(c[f'RS_OF_{flag}'] for flag in (*nx.FIELD_USE_FLAGS.values(), 'LOOT_OUTSIDE_OWN'))
+    assert not np.any(objs['flags'] & bits)
+    assert int(ex.sections['CONSTS'][0]['s_produce_pick']) == c['RS_NONE']
+    assert '[proc,pickup_loc_floor]' not in ex.s.text
+
+
+def test_a_village_world_v2_pool_over_an_archive_without_its_picks_is_refused(tmp_path):
+    """The v2 pool's scripts read the pick rows: over draynor-nc1 (which CpuBatch refuses for free play) no pack is
+    written; over draynor-v3 the firemaking and cooking rows are still refused first."""
+    if not POOL_V2.exists():
+        pytest.skip('private v2 pool absent')
+    from sim import world
+    pool = world.save_pool(tmp_path / 'pool.npz', world.load_pool(POOL_V2)[0][:2])
+    with pytest.raises(nx.ExportError, match='picks rows'):
+        nx.export(tmp_path / 'v2.pack', pool, SUPPLY, TABLES, trees=False, variants=1, log=lambda _: None)
+    assert not (tmp_path / 'v2.pack').exists()
+
+
+def test_the_use_default_closures_name_one_id_in_the_export_and_the_harness(ex):
+    """Every use_default closure the oracle runs (engine.HELD's and the pick archive's FIELD_USE) maps to the same rs.h
+    id in the exporter and in the harness's frame names, each its own."""
+    import inspect
+    from sim import engine, native_harness as H
+    closures = {k: fn for k, fn in {**engine.HELD, **engine.ARCHIVE_SCRIPTS['picks']}.items()
+                if fn.__qualname__ == 'use_default.<locals>.script'}
+    assert len(closures) == 7
+    names = {k: name for name, k in ex.script.items()}
+    exported = {key: names[ex.script_id(fn)] for key, fn in closures.items()}
+    harness = {key: H.CLOSURES['use_default.<locals>.script'](inspect.getclosurevars(fn).nonlocals)
+               for key, fn in closures.items()}
+    assert exported == harness and len(set(exported.values())) == 7
+    assert exported == {key: nx.USE_DEFAULT_IDS[key] for key in closures}
+
+
+def test_check_village_bounds_a_village_world_v2_layout(tables):
+    """check_village counts a v2 layout's village npcs as village_npcs would (the layout's npcs, the highwayman among
+    them, a goblin at each chicken spawn, no muggers): the training pool's layouts fit RS_MAX_NPCS; one with more rows
+    is refused."""
+    import dataclasses
+    if not POOL_V2.exists():
+        pytest.skip('private v2 pool absent')
+    from sim import combat, world
+    c = nx.contract()
+    layouts = world.load_pool(POOL_V2)[0]
+    counts = [len(combat.village_npcs(layout, tables, [])) for layout in layouts]
+    for layout in layouts:
+        nx.check_village(layout, tables, c)
+    assert max(counts) <= c['RS_MAX_NPCS'] and max(counts) >= 12, (min(counts), max(counts))
+    big = max(layouts, key=lambda layout: len(combat.village_npcs(layout, tables, [])))
+    spot = next(row for row in big.npcs if tables.npc_types[int(row[1])]['debugname'] == world.SPOT)  # not a chicken
+    grown = lambda k: dataclasses.replace(big, npcs=np.concatenate([big.npcs, [spot] * k]))
+    room = c['RS_MAX_NPCS'] - len(combat.village_npcs(big, tables, []))
+    nx.check_village(grown(room), tables, c)   # exactly RS_MAX_NPCS village npcs, no mugger among them, fit
+    assert len(combat.village_npcs(grown(room), tables, [])) == c['RS_MAX_NPCS']
+    with pytest.raises(nx.ExportError, match='village npcs'):
+        nx.check_village(grown(room + 1), tables, c)

@@ -88,7 +88,7 @@ int rs_script_step(World *w, Frame *f, RsSusp *out) {
             return rs_stat_sub(w, RS_SKILL_HITPOINTS, 1, 0);
         } else if (t_mode == 4) {
             (void)rs_inv_add(w->P, p->inv, RS_INV_CAP, 0, t_obj, 1);
-            return rs_add_xp(w, RS_SKILL_WOODCUTTING, 40);
+            return rs_add_xp(w, RS_SKILL_WOODCUTTING, 40, RS_XPC_NONE, 0, 0);  /* no cause, as the oracle double's add_xp */
         } else if (t_mode == 5) {
             (void)rs_inv_add(w->P, p->inv, RS_INV_CAP, 0, t_coins, 1);
         }

@@ -8,14 +8,32 @@ from sb3_contrib.common.recurrent.policies import RecurrentMultiInputActorCritic
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch import nn
 
-from act_contract import A_ACT0, A_CLICK_HIGH, A_CLICK_LOW, A_HELD0, ACT_V3, N_CLICK, N_CLICK_LOW
+from act_contract import A_ACT0, A_CLICK_HIGH, A_CLICK_LOW, A_HELD0, ACT_V3, N_CLICK, N_CLICK_LOW, N_HELD
 from feedback_contract import FEEDBACK_V2
+from item_contract import ITEM_V2
 from names import name_table
-from obs import A_DEPOSIT0, A_DROP0, A_USE0, A_WITHDRAW0, MASK, OBSERVATION
+from obs import A_DEPOSIT0, A_DROP0, A_USE0, A_WITHDRAW0, MASK, N_ACTIONS, N_INV_SEL, OBSERVATION
+from wide_contract import (ACT_V4, ITEM_V4, MASK_V6, N_ACTIONS_V4, N_PAGE, OBSERVATION_V7, PAGE_FAMILIES, WIDE_SHAPES,
+                           page_row)
 
 OPTION_VOCAB = 4001  # hashed option text (act_contract.name_id), +1 for the 0 pad slot
 # The action, mask and feedback versions a checkpoint records beside its observation version (native-click).
 CONTRACT = dict(actions=ACT_V3, mask=MASK, feedback=FEEDBACK_V2)
+
+
+def run_contract(items=ITEM_V2):
+    """The contract a run records in its checkpoints and checks every checkpoint against: CONTRACT under item-v2 (a
+    checkpoint that records no item contract is item-v2's), with the item contract beside it otherwise (`items`:
+    item-v3, the page of kinds; item-v4, the page of 16 kinds, with act-v4's 128 rows and mask-v6). check_names compares
+    the whole record, so none loads as another."""
+    if items == ITEM_V4:
+        return dict(CONTRACT, actions=ACT_V4, mask=MASK_V6, items=ITEM_V4)
+    return CONTRACT if items == ITEM_V2 else dict(CONTRACT, items=items)
+
+
+def action_rows(contract):
+    """The policy's row count under a recorded contract: act-v4's 128, act-v3's 96 otherwise."""
+    return N_ACTIONS_V4 if (contract or {}).get('actions') == ACT_V4 else N_ACTIONS
 
 
 def identity(names, options, observations, name, width):
@@ -117,23 +135,149 @@ def option_embedding(width=16):
     return embedding
 
 
+# The normalized value target of the goal-free study: PopArt (a running scale was the other choice). Its statistics are
+# a debiased exponential average over updates, `beta` the newest rollout's weight; the scale is at least `min_std`. A
+# declared setting, not frozen.
+POPART = dict(method='popart', beta=0.1, min_std=0.01)
+
+
+class PopArt(nn.Module):
+    """A value head whose output is a normalized value n(h) = W h + b, scaled back: V(h) = std * n(h) + mean
+    (van Hasselt et al. 2016, "Preserving Outputs Precisely, while Adaptively Rescaling Targets"). It holds the very weight
+    and bias Parameters of the Linear head it replaces, so an optimizer made before keeps them; mean, std and the moments
+    are buffers, saved with the policy. update() moves the statistics towards a batch of value targets and rescales W and
+    b so that V(h) stays the same for every h (within float32 rounding); the learner then fits n(h) to the normalized
+    target, (target - mean) / std, which is the unnormalized error divided by std."""
+
+    def __init__(self, linear, beta, min_std):
+        super().__init__()
+        if not (0 < beta <= 1 and min_std > 0):
+            raise ValueError(f'PopArt needs 0 < beta <= 1 and min_std > 0, not {beta}, {min_std}')
+        self.weight, self.bias = linear.weight, linear.bias
+        self.beta, self.min_std = beta, min_std
+        self.register_buffer('mean', torch.zeros(1))
+        self.register_buffer('std', torch.ones(1))
+        # the debiasing weight and the first and second moments, each an exponential average over updates (float64)
+        self.register_buffer('moments', torch.zeros(3, dtype=torch.float64))
+
+    def forward(self, latent):
+        return nn.functional.linear(latent, self.weight, self.bias) * self.std + self.mean
+
+    @torch.no_grad()
+    def update(self, targets):
+        """Move the statistics towards these value targets (every element counts once) and keep the outputs."""
+        x = targets.detach().reshape(-1).double()
+        batch = torch.stack([x.new_ones(()), x.mean(), (x * x).mean()])
+        self.moments.mul_(1 - self.beta).add_(self.beta * batch)
+        mean = self.moments[1] / self.moments[0]
+        std = (self.moments[2] / self.moments[0] - mean * mean).clamp(min=self.min_std ** 2).sqrt()
+        old_mean, old_std = self.mean.double(), self.std.double()
+        self.weight.copy_(self.weight.double() * old_std / std)
+        self.bias.copy_((self.bias.double() * old_std + old_mean - mean) / std)
+        self.mean.copy_(mean)
+        self.std.copy_(std)
+
+
+def check_value_norm(policy, value_norm):
+    """A checkpoint trains on only with the value normalization it was built with (MaskedRecurrentPolicy value_norm): its
+    statistics are part of its value head. None is an unnormalized value target, every checkpoint before goal-free play."""
+    found = getattr(policy, 'value_norm', None)
+    if found != value_norm:
+        raise ValueError(f'the checkpoint has value normalization {found or "none"}, the run {value_norm or "none"}')
+
+
 def load_name_vectors(policy, vectors):
     for module in policy.modules():
         if isinstance(module, NameEmbedding):
             module.table.copy_(torch.as_tensor(vectors, dtype=torch.float16))
 
 
-def check_names(policy, observation=OBSERVATION, contract=CONTRACT):
+# A name table rebuilt from a user's own game files by the same text model and script (scripts/name_vectors.py) can
+# differ from the one a policy trained with in a few float16 values from one machine to another: its digest differs
+# while it means the same. check_names takes such a table only by the trained table's fingerprint (name_fingerprint),
+# which a published policy carries beside it (scripts/export_policy.py): its rows and dimension, the sha256 of its kinds
+# and names in order, and for each dimension the sum, the sum of squares and the row-weighted sum (each row's weight its
+# place in the table, 1 / N to 1) of its vectors; no vector's values. NAMES_RTOL: float16's step is at most 2^-10 of a
+# value's magnitude in its normal range (2^-24 absolute below it, NAMES_ATOL a row), so a table moved one step in every
+# value moves a dimension's sum or row-weighted sum by at most 2^-10 of its sum of magnitudes (the same sum weighted),
+# and its sum of squares by at most 2^-9 + 2^-20 of itself; 2^-8 admits about two such steps in every value. 1e-3 would
+# refuse a table one step off in every value away from zero (its sums of squares move up to 1.95e-3), and a scale of 1%
+# moves every sum of squares by 2.01%, five times 2^-8. The row-weighted sums see vectors moved between rows, which the
+# plain sums do not.
+NAMES_FINGERPRINT = 'names-fingerprint-v1'
+NAMES_RTOL, NAMES_ATOL = 2 ** -8, 2 ** -24
+
+
+def name_fingerprint(table):
+    """The fingerprint (NAMES_FINGERPRINT) of name table `table` (rl/names.py NameTable): no vector's values."""
+    import hashlib
+    order = sorted(table.rows, key=table.rows.get)
+    vectors, weights = _fingerprint_parts(table)
+    return dict(version=NAMES_FINGERPRINT, digest=table.digest, rows=int(table.spec[0]), dim=int(table.spec[1]),
+                names_sha256=hashlib.sha256(''.join(f'{kind}\t{name}\n' for kind, name in order).encode()).hexdigest(),
+                sums=vectors.sum(0).tolist(), squares=(vectors ** 2).sum(0).tolist(),
+                weighted=(weights * vectors).sum(0).tolist())
+
+
+def _fingerprint_parts(table):
+    """A table's vectors (its rows past row 0, float64 from their float16 values) and each row's weight, 1 / N to 1."""
+    vectors = table.vectors[1:].astype(np.float64)
+    return vectors, np.arange(1, len(vectors) + 1, dtype=np.float64)[:, None] / max(1, len(vectors))
+
+
+def fingerprint_problem(fingerprint, table, trained):
+    """Why name table `table` is not the one fingerprint `fingerprint` describes, the table of digest `trained` (a
+    policy's names[2]), or None: another version or digest, rows or dimension, kinds or names, or a sum beyond its
+    tolerance (NAMES_RTOL of its scale, plus NAMES_ATOL a row)."""
+    if not isinstance(fingerprint, dict) or fingerprint.get('version') != NAMES_FINGERPRINT:
+        return f'no {NAMES_FINGERPRINT} fingerprint'
+    if fingerprint.get('digest') != trained:
+        return f"a fingerprint of table {fingerprint.get('digest')}, the policy's is {trained}"
+    mine = name_fingerprint(table)
+    if (fingerprint.get('rows'), fingerprint.get('dim')) != (mine['rows'], mine['dim']):
+        return f"{mine['rows']} rows of {mine['dim']}, the fingerprint's {fingerprint.get('rows')} of {fingerprint.get('dim')}"
+    if fingerprint.get('names_sha256') != mine['names_sha256']:
+        return 'its kinds and names (in order) are not the fingerprint\'s'
+    vectors, weights = _fingerprint_parts(table)
+    floor = NAMES_ATOL * len(vectors)
+    for key, scale in (('sums', np.abs(vectors).sum(0)), ('weighted', (weights * np.abs(vectors)).sum(0)),
+                       ('squares', (vectors ** 2).sum(0))):
+        want = np.asarray(fingerprint.get(key), dtype=np.float64)
+        if want.shape != scale.shape:
+            return f'the fingerprint\'s {key} are not {len(scale)} numbers'
+        gap = np.abs(np.asarray(mine[key]) - want)
+        over = np.flatnonzero(gap > NAMES_RTOL * scale + floor)
+        if len(over):
+            d = int(over[0])
+            return (f'the {key} of dimension {d} are {mine[key][d]!r}, the fingerprint\'s {float(want[d])!r}: beyond '
+                    f'{NAMES_RTOL:g} of {scale[d]:.6g} (and {len(over) - 1} more dimensions)')
+    return None
+
+
+def check_names(policy, observation=OBSERVATION, contract=CONTRACT, fingerprint=None):
     """A policy reads names through the table it was trained with, the one projection reads, and
     inputs of the observation version it was trained on (rl/obs.py OBSERVATION) under the action, mask
     and feedback versions it was trained with (CONTRACT). A checkpoint that records another version, or
     none (every one saved before obs-v3), is refused; an obs-v3, mask-v3 one plays only after
-    convert_checkpoint. observation=None skips both checks (historical tools)."""
+    convert_checkpoint. observation=None skips both checks (historical tools). The table in use
+    (RL_NAME_TABLE) must have the policy's recorded digest, or, given the trained table's `fingerprint`
+    (name_fingerprint), hold it (fingerprint_problem). It changes nothing (a public copy's vectors are filled by its
+    loader: sim/hour.py load_free_policy). Returns how the table was taken: path 'digest' or 'fingerprint', the table's
+    digest, and for a fingerprint the trained digest and the tolerance."""
     names = getattr(policy, 'names', None)
     if not names:
         raise ValueError('the checkpoint predates names-v1')
-    if names[2] != name_table().digest:
+    table = name_table()
+    if names[2] == table.digest:
+        taken = dict(path='digest', table=table.digest)
+    elif fingerprint is None:
         raise ValueError('the checkpoint was trained with another name table than RL_NAME_TABLE')
+    else:
+        problem = fingerprint_problem(fingerprint, table, names[2])
+        if problem is not None:
+            raise ValueError(f'the checkpoint was trained with another name table than RL_NAME_TABLE, by its '
+                             f'fingerprint: {problem}')
+        taken = dict(path='fingerprint', table=table.digest, trained=names[2], rtol=NAMES_RTOL)
     if observation is not None and getattr(policy, 'observation', None) != observation:
         raise ValueError(f"the checkpoint reads {getattr(policy, 'observation', None) or 'obs-v1'} inputs, not "
                          f'{observation}; train a fresh model, or convert an obs-v3 one (convert_checkpoint)')
@@ -141,6 +285,7 @@ def check_names(policy, observation=OBSERVATION, contract=CONTRACT):
         found = getattr(policy, 'contract', None) or 'act-v2, mask-v2 and feedback-v1 (none recorded)'
         raise ValueError(f'the checkpoint was trained under {found}, not {contract}; train a fresh model, or convert a '
                          'mask-v3 one (convert_checkpoint)')
+    return taken
 
 
 class GameFeatures(BaseFeaturesExtractor):
@@ -237,9 +382,19 @@ class MaskedRecurrentPolicy(RecurrentMultiInputActorCriticPolicy):
         self.contract = kwargs.pop('contract', None)
         # convert_checkpoint's record (method, source and its versions) stays in the model's saved policy_kwargs.
         kwargs.pop('conversion', None)
+        # The value target's normalization (POPART), saved with the policy_kwargs; None (every checkpoint before goal-free
+        # play) keeps SB3's Linear value head.
+        self.value_norm = kwargs.pop('value_norm', None)
         super().__init__(*args, **kwargs)
-        if not isinstance(self.action_space, spaces.Discrete) or self.action_space.n != 96:
-            raise ValueError('Game policy requires the unchanged Discrete(96) head')
+        rows = action_rows(self.contract)
+        if not isinstance(self.action_space, spaces.Discrete) or self.action_space.n != rows:
+            raise ValueError(f'Game policy requires the Discrete({rows}) head of its contract')
+        if self.value_norm is not None:
+            settings = dict(self.value_norm)
+            if settings.pop('method', None) != 'popart':
+                raise ValueError(f'value_norm is PopArt (POPART) or None, not {self.value_norm}')
+            # the head's own Parameters, which the optimizer already holds, under the same state-dict names
+            self.value_net = PopArt(self.value_net, **settings)
         self._name_embeddings = [m for m in self.modules() if isinstance(m, NameEmbedding)]
 
     def make_features_extractor(self):
@@ -251,11 +406,14 @@ class MaskedRecurrentPolicy(RecurrentMultiInputActorCriticPolicy):
 
     # Action rows scored one observed slot at a time (a pointer, as in AlphaStar): (scorer, slots, first row, first
     # slot, slot count or None for all). Drop, deposit and use all point at the inventory page; one click scorer
-    # scores the click slots in their two row groups (act-v3).
+    # scores the click slots in their two row groups (act-v3). Under act-v4 (WIDE_POINTERS) the page families lie in
+    # two groups as well, entries 8..15 on rows 96..127, each scored by its family's one scorer.
     POINTERS = (('act', 'act', A_ACT0, 0, None), ('click', 'click', A_CLICK_LOW, 0, N_CLICK_LOW),
-                ('held', 'held', A_HELD0, 0, None), ('drop', 'sel', A_DROP0, 0, None), ('deposit', 'sel', A_DEPOSIT0, 0, None),
-                ('withdraw', 'bank', A_WITHDRAW0, 0, None), ('use', 'sel', A_USE0, 0, None),
-                ('click', 'click', A_CLICK_HIGH, N_CLICK_LOW, N_CLICK - N_CLICK_LOW))
+                ('held', 'held', A_HELD0, 0, N_HELD), ('drop', 'sel', A_DROP0, 0, N_INV_SEL),
+                ('deposit', 'sel', A_DEPOSIT0, 0, N_INV_SEL), ('withdraw', 'bank', A_WITHDRAW0, 0, None),
+                ('use', 'sel', A_USE0, 0, N_INV_SEL), ('click', 'click', A_CLICK_HIGH, N_CLICK_LOW, N_CLICK - N_CLICK_LOW))
+    WIDE_POINTERS = tuple((name, slots, page_row(base, N_INV_SEL), N_INV_SEL, N_INV_SEL) for (name, slots), (base, _) in
+                          zip((('held', 'held'), ('drop', 'sel'), ('deposit', 'sel'), ('use', 'sel')), PAGE_FAMILIES))
 
     def _build_mlp_extractor(self):
         super()._build_mlp_extractor()
@@ -264,7 +422,8 @@ class MaskedRecurrentPolicy(RecurrentMultiInputActorCriticPolicy):
         # rows had learned which mix of trees and npcs meant "chop", and waited beside
         # four trees in Varrock. Every other slot family is scored the same way.
         observed = set(self.observation_space.spaces)
-        self.pointers = [pointer for pointer in self.POINTERS if f'{pointer[1]}_feats' in observed]
+        wide = self.WIDE_POINTERS if self.action_space.n == N_ACTIONS_V4 else ()
+        self.pointers = [pointer for pointer in (*self.POINTERS, *wide) if f'{pointer[1]}_feats' in observed]
         self.slot_embedding = NameEmbedding(self.names[0], self.names[1], 16)
         self.slot_options = option_embedding()
         for name, slots in dict.fromkeys((name, slots) for name, slots, *_ in self.pointers):
@@ -278,7 +437,7 @@ class MaskedRecurrentPolicy(RecurrentMultiInputActorCriticPolicy):
         if self._active_mask is not None:
             raise RuntimeError('Concurrent/reentrant policy use is unsupported')
         mask = obs['mask']
-        if mask.ndim != 2 or mask.shape[1] != 96:
+        if mask.ndim != 2 or mask.shape[1] != self.action_space.n:
             raise ValueError('Invalid action mask')
         binary = torch.all((mask == 0) | (mask == 1))
         mask = mask.bool().clone()
@@ -524,6 +683,38 @@ def convert_checkpoint(source, output):
     model.save(output)
     return record
 
+
+def widen_state(state, policy):
+    """The one tested crossing to the wide contract (rl/wide_contract.py): the state dict
+    `state` of an obs-v6 policy of act-v3's 96 rows (free-play-v3 or v10), as the obs-v7, act-v4 policy `policy` holds
+    it. Every tensor is copied; each GameFeatures extractor's first encoder layer gets zero weights for the page's new
+    entries 8..15 (sel_ids, sel_feats; the pack options' inputs reach only the scorers, which are kept), and the action
+    head zero weights and biases for rows 96..127, which the families' kept scorers score in any case. So on a pack of 8
+    kinds or fewer every score of rows 0..95 and the value equal the source's up to float rounding, and so do the choice
+    probabilities under the source's mask (rl/tests/test_wide_contract.py); under mask-v6 the play can differ, since
+    mask-v6 has no drop rule. Returns the new state dict; the caller checks the source's own versions first."""
+    if policy.observation != OBSERVATION_V7 or policy.action_space.n != N_ACTIONS_V4:
+        raise ValueError(f'widen_state gives an {OBSERVATION_V7} policy of {N_ACTIONS_V4} rows, not '
+                         f'{policy.observation} of {policy.action_space.n}')
+    state, space = dict(state), policy.observation_space
+    for name, module in policy.named_modules(remove_duplicate=False):
+        if isinstance(module, GameFeatures):
+            key = f'{name}.encoder.0.weight'
+            weight, parts, first = state[key], [], 0
+            for k in module.keys:
+                width = int(np.prod(space[k].shape)) * (16 if k.endswith(('_ids', '_op')) else 1)
+                old = width // N_PAGE * N_INV_SEL if k in WIDE_SHAPES else width  # entry-major: entries 0..7 first
+                parts += [weight[:, first:first + old], weight.new_zeros((weight.shape[0], width - old))]
+                first += old
+            if weight.shape[1] - first != 128 * len(module.sets):  # then the sets' pooled features (forward), kept
+                raise ValueError(f"the source's {name} does not read obs-v6's inputs ({weight.shape[1]} columns)")
+            state[key] = torch.cat([*parts, weight[:, first:]], dim=1)
+    for key in ('action_net.weight', 'action_net.bias'):
+        head = state[key]
+        if head.shape[0] != N_ACTIONS:
+            raise ValueError(f"the source's action head has {head.shape[0]} rows, not act-v3's {N_ACTIONS}")
+        state[key] = torch.cat([head, head.new_zeros((N_ACTIONS_V4 - N_ACTIONS, *head.shape[1:]))])
+    return state
 
 if __name__ == '__main__':
     import argparse

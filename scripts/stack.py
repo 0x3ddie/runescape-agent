@@ -155,8 +155,13 @@ def world_settings(index):
             "NODE_PROFILE": "demo" + uuid.uuid4().hex[:8], "RL_DEMO_BOOT_ID": str(uuid.uuid4())}
 
 
+# A demo's settings belong to this stack (--demo-spectator, --demo-pace-ms): a shell's own copies never reach a world or
+# its command, so a world without the flags is never a paced demo world (a shared world would be held to its pace).
+DEMO_VARIABLES = ("RL_DEMO_SPECTATOR", "RL_DEMO_PACE_MS")
+
+
 def engine_environment(values, bun):
-    environment = {**os.environ, **values}
+    environment = {**{k: v for k, v in os.environ.items() if k not in DEMO_VARIABLES}, **values}
     environment["PATH"] = str(bun.parent) + os.pathsep + environment.get("PATH", "")
     environment["PYTHONPATH"] = os.pathsep.join(
         p for p in (str(ROOT / "rl"), str(ROOT), environment.get("PYTHONPATH")) if p)
@@ -516,7 +521,7 @@ def run(bun, output, timeout_seconds, command, stop_file=None, worlds=1, lockste
             record("launched", name=name, owner_pid=process.proc.pid, argv=argv, cwd=str(cwd))
             return process
         try:
-            record("start", supervisor_pid=os.getpid(), settings=per_world, timeout_seconds=timeout_seconds)
+            record("start", supervisor_pid=os.getpid(), settings=per_world, timeout_seconds=timeout_seconds, demo=demo)
             if stop_file is not None and stop_file.exists():
                 raise StackCancelled("stop requested before startup")
             readiness_options = {"stop_file": stop_file} if stop_file is not None else {}
@@ -608,11 +613,12 @@ def main():
     parser.add_argument("--blocks", type=int, default=0,
                         help="port blocks the world service may use at once (booting, ready, in use and cooling)")
     parser.add_argument("--demo-spectator", metavar="NAME",
-                        help="a demo: the one network login the world admits, hidden, inert, kept on the agent's tile "
-                             "(with --demo-pace-ms, --lockstep and --worlds 1)")
+                        help="a demo: the one network login the world admits, hidden, inert, kept on the agent's tile, "
+                             "or, with RL_SHARED_AGENTS, at the view sim.real demo sets (with --demo-pace-ms, --lockstep "
+                             "and --worlds 1)")
     parser.add_argument("--demo-pace-ms", type=int, metavar="MS",
                         help="a demo: milliseconds the world waits after each tick (1..500; the client walks a tile "
-                             "in about 450)")
+                             "in about 450); a shared world ticks at most once in that time")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if (args.demo_spectator is None) != (args.demo_pace_ms is None):

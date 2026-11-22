@@ -68,6 +68,11 @@ SCENARIOS = dict(
     under=dict(levels=dict(woodcutting=14, fishing=14, mining=14)),     # one under the oak, anchovy, iron unlocks
     unlocked=dict(levels=dict(woodcutting=15, fishing=15, mining=15)),
 )
+# free-play-v1's scenario starts (Scenario.village: its draw is draw_village's, its group VILLAGE's)
+FREE_SCENARIOS = dict(
+    freehurt=dict(hp=2),                          # a life at 2 hitpoints: deaths come early
+    freeworn=dict(worn=True, levels=dict(woodcutting=15, fishing=15, mining=15)),
+)
 
 
 class CanonError(RuntimeError):
@@ -194,7 +199,12 @@ CLOSURES = {
                                                              'OUTER' if v['outer'] else 'MAIN'),
     'use_default.<locals>.script': lambda v: {'weapon_poison': 'RS_S_USE_DEFAULT_WEAPON_STAB',
                                               'ogre_arrow_shaft': 'RS_S_USE_DEFAULT_FEATHER',
-                                              'knife': 'RS_S_USE_DEFAULT_CATEGORY_22'}[v['cases'][0]],
+                                              'knife': 'RS_S_USE_DEFAULT_CATEGORY_22',
+                                              # engine.FIELD_USE's (the pick archive's), by their first case
+                                              'half_baked_batta': 'RS_S_USE_DEFAULT_CABBAGE',
+                                              'bowl_water': 'RS_S_USE_DEFAULT_POTATO',
+                                              'bowl_empty': 'RS_S_USE_DEFAULT_ONION',
+                                              'reddye': 'RS_S_USE_DEFAULT_BLACK_CAPE'}[v['cases'][0]],
     'npc_default_retaliate.<locals>.script': lambda v: 'RS_S_NPC_DEFAULT_RETALIATE_AP' if v['ap'] else
     'RS_S_NPC_DEFAULT_RETALIATE',
     'door.<locals>.script': lambda v: 'RS_S_DOOR_OPEN' if v['turn'] == 1 else 'RS_S_DOOR_CLOSE',
@@ -514,6 +524,23 @@ class Canon:
         elif kind == 'excluded':
             a8 = e[{'clue_drop': 'RS_EXCL_CLUE', 'loot_drop': 'RS_EXCL_LOOT'}[d['what']]]
             obj, v0 = d['obj'], d['npc']
+        elif kind == 'xp':  # World.add_xp: the stat, its cause (RS_XPC_*), the amount and the stat before and after
+            cause = d.get('cause')
+            if cause not in (None, 'produce', 'hit', 'bury', 'light'):
+                raise CanonError(f'an xp cause {cause} outside RS_XPC_*')
+            a8, b8, count, v0, v1 = d['stat'], e[f"RS_XPC_{(cause or 'none').upper()}"], d['xp'], d['before'], d['after']
+            if cause == 'hit':
+                obj, v2 = d['npc'], d['life']
+            elif cause == 'produce':
+                obj, v2 = d['obj'], -1 if d['src'] is None else d['src']
+            elif cause is not None:
+                obj = d['obj']
+        elif kind == 'hit':  # player_melee_attack's hit, the xp's cause
+            a8, obj, count, v0, v1, v2, v3 = source(d['source']), d['npc'], d['type'], d['life'], d['damage'], d['hp'], d['style']
+            if a8 < 0:
+                raise CanonError('a hit by another player')
+        elif kind == 'npc_respawn':  # World.npc_respawn's record (the XP check's): the npc, its base type, the new life
+            obj, count, v0 = d['npc'], d['type'], d['life']
         else:
             raise CanonError(f'event kind {kind} outside RS_EV_*')
         return [e[f'RS_EV_{kind.upper()}'], tick, a8, b8, has, obj, count, v0, v1, v2, v3]
@@ -661,6 +688,7 @@ class WorldTrace:
         self.task, self.rows, self.pending, self.tail = None, [], [], deque(maxlen=TAIL)
         self.events_seen = self.chat_seen = 0
         self.episode = 0
+        self.most_objs = 0  # the most ground objs (len(world.objs)) at a tick's end since run() began
 
     def bind(self, task):
         """A new episode of this slot (GoalEpisode.__init__): its agent's Rows and its world's draws come here."""
@@ -685,6 +713,7 @@ class WorldTrace:
         chat = [(t, sid(text)) for t, text in world.chat_log[self.chat_seen:]]
         texts = [(t, sid(iface), com, sid(text)) for t, (iface, com), text in world.text_log]
         self.events_seen, self.chat_seen = len(world.events), len(world.chat_log)
+        self.most_objs = max(self.most_objs, len(world.objs))
         row = Row(world.tick, zlib.crc32(record.tobytes()), record, self.pending, events, chat, texts, self.episode)
         self.pending = []
         self.rows.append(row)
@@ -705,7 +734,7 @@ class Scenario:
     def __init__(self, spec):
         """spec: a SCENARIOS name, a JSON object's text or a dict."""
         if isinstance(spec, str):
-            spec = SCENARIOS[spec] if spec in SCENARIOS else json.loads(spec)
+            spec = {**SCENARIOS, **FREE_SCENARIOS}[spec] if spec in SCENARIOS or spec in FREE_SCENARIOS else json.loads(spec)
         spec = dict(spec)
         unknown = set(spec) - set(self.KEYS)
         if unknown:
@@ -726,6 +755,21 @@ class Scenario:
                 c[name] = self.spec[name]
         return c
 
+    def village(self, draw, key, slot, episode, layouts, tables, muggers, layout=None, region=None):
+        """A free-play start (sim/combat.py draw_village): its draws, then the spec's levels, hp, food and worn
+        (its group is VILLAGE's; a `layout` replaces the layout draw)."""
+        if 'group' in self.spec or 'variant' in self.spec or 'supply_layout' in self.spec:
+            raise ValueError('a free-play scenario sets layout, levels, hp, food or worn')
+        start = draw(key, slot, episode, layouts, tables, muggers, layout=self.spec.get('layout', layout), region=region)
+        start['levels'] = {**start['levels'], **self.spec.get('levels', {})}
+        v = start['village']
+        if 'hp' in self.spec:
+            v['hp'] = max(1, min(start['levels']['hitpoints'], int(self.spec['hp'])))
+        for name in ('food', 'worn'):
+            if name in self.spec:
+                v[name] = self.spec[name]
+        return start
+
     def supply(self, draw, key, slot, episode, layouts, sites, layout=None, variant=None):
         start = draw(key, slot, episode, layouts, sites, layout=self.spec.get('supply_layout', layout),
                      variant=self.spec.get('variant', variant))
@@ -738,12 +782,17 @@ def hooks(scenario=None):
     """The Python side's hooks for one batch call (module docstring), restored on exit."""
     from sim import search, vec
     from sim.agent import Agent
-    from sim.task import GoalEpisode
-    init, capture = GoalEpisode.__init__, Agent.capture_text
-    draws = vec.draw_start, vec.draw_combat, search.draw_supply
+    from sim.task import FreePlayEpisode, GoalEpisode
+    init, free_init, capture = GoalEpisode.__init__, FreePlayEpisode.__init__, Agent.capture_text
+    draws = vec.draw_start, vec.draw_combat, search.draw_supply, vec.draw_village
 
     def episode_init(self, world, *args, **kwargs):
         init(self, world, *args, **kwargs)
+        if _BINDING:
+            _BINDING[-1].bind(self)
+
+    def life_init(self, world, *args, **kwargs):  # FreePlayEpisode's own __init__ (it does not call GoalEpisode's)
+        free_init(self, world, *args, **kwargs)
         if _BINDING:
             _BINDING[-1].bind(self)
 
@@ -752,16 +801,17 @@ def hooks(scenario=None):
         if trace is not None:
             trace.tick(self)
         capture(self)
-    GoalEpisode.__init__, Agent.capture_text = episode_init, capture_text
+    GoalEpisode.__init__, FreePlayEpisode.__init__, Agent.capture_text = episode_init, life_init, capture_text
     if scenario is not None:
         vec.draw_start = lambda *a, **k: scenario.start(draws[0], *a, **k)
         vec.draw_combat = lambda *a, **k: scenario.combat(draws[1], *a, **k)
         search.draw_supply = lambda *a, **k: scenario.supply(draws[2], *a, **k)
+        vec.draw_village = lambda *a, **k: scenario.village(draws[3], *a, **k)
     try:
         yield
     finally:
-        GoalEpisode.__init__, Agent.capture_text = init, capture
-        vec.draw_start, vec.draw_combat, search.draw_supply = draws
+        GoalEpisode.__init__, FreePlayEpisode.__init__, Agent.capture_text = init, free_init, capture
+        vec.draw_start, vec.draw_combat, search.draw_supply, vec.draw_village = draws
 
 
 # ---- sides ----------------------------------------------------------------------------------------------------------
@@ -809,12 +859,12 @@ class PythonSide:
 
     def start_episode(self, b, episode):
         """Rebuild world b at episode `episode` (a repro: CpuBatch's counter set, then its _episode)."""
-        from sim.spec import OBSERVATION_SHAPES, dtype
+        from sim.spec import dtype
         self.env.episodes[b] = episode
         with hooks(self.scenario):
             o = self.env._episode(b)
         obs = {name: value.copy() for name, value in self.obs.items()}
-        for name in OBSERVATION_SHAPES:
+        for name in self.env.shapes:
             obs[name][b] = np.asarray(o[name], dtype(name))
         self.obs = obs
         return self.env._state(), obs
@@ -831,7 +881,8 @@ class PythonSide:
 
     @property
     def goals(self):
-        return list(self.env.goals)
+        """Each world's goal, for the reports ('no goal' in free play)."""
+        return ['no goal'] * self.n if self.env.free else list(self.env.goals)
 
     @property
     def starts(self):
@@ -884,7 +935,16 @@ class NativeSide:
             return self.batch.step(state, action)
         if state['key'] != self.batch.key:
             raise ValueError('a state of another reset')
-        self.batch.step_into(np.asarray(action, np.int32), check=False)
+        try:
+            self.batch.step_into(np.asarray(action, np.int32), check=False)
+        except Exception as error:  # the worlds below the failing one stepped: begin those whose life ended, as the
+            last = getattr(error, 'world', None)  # Python side's step began them before its own raise, then raise
+            try:
+                if isinstance(last, int) and last > 0:
+                    self._rebegin(np.flatnonzero(self.batch.views['done'][:last]))
+            except Exception:  # noqa: BLE001 - the step's own error is the one both sides are compared on
+                pass
+            raise error
         self._rebegin(np.flatnonzero(self.batch.views['done']))
         self.batch.check()
         return self.batch.outputs()
@@ -905,7 +965,7 @@ class NativeSide:
 
     @property
     def goals(self):
-        return list(self.batch.goals)
+        return ['no goal'] * self.n if self.batch.free else list(self.batch.goals)
 
     @property
     def starts(self):
@@ -1002,14 +1062,16 @@ class Replay:
 
 
 class PolicySource:
-    """A policy's sampled actions: the actor of an obs-v2/mask-v2 MaskedRecurrentPolicy on the
-    Python side's observation, its LSTM state carried per world and reset at episode starts, each action drawn by
-    torch.multinomial from the masked distribution with a seeded generator. The other side gets the same actions after
-    its observation compared equal; the policy is never recomputed in C."""
+    """A policy's sampled actions (design 5, source 3): the actor of a MaskedRecurrentPolicy on the Python side's
+    observation, its LSTM state carried per world and reset at episode starts, each action drawn by torch.multinomial
+    from the masked distribution with a seeded generator. The other side gets the same actions after its observation
+    compared equal; the policy is never recomputed in C. A goal policy reads obs-v5 (check_names), an array the batch
+    lacks filled with zeros; a free-play-v1 one reads obs-v6 (`exact`): loaded by sim/hour.py load_free_policy with its
+    checks, it plays only observations of exactly its own arrays, so it never acts on a goal task's."""
 
-    def __init__(self, policy, spaces, seed=0):
+    def __init__(self, policy, spaces, seed=0, exact=False):
         import torch
-        self.torch, self.policy, self.spaces, self.seed = torch, policy, spaces, seed
+        self.torch, self.policy, self.spaces, self.seed, self.exact = torch, policy, spaces, seed, exact
         self.generator = torch.Generator().manual_seed(seed)
         self.state = None
         policy.set_training_mode(False)
@@ -1018,12 +1080,19 @@ class PolicySource:
     def load(cls, path, seed=0):
         from sb3_contrib import RecurrentPPO
         from baseline.policy import check_names
+        from sim.task import FREE_PLAY
         model = RecurrentPPO.load(path, device='cpu')
+        if getattr(model.policy, 'observation', None) == FREE_PLAY['observation']:
+            from sim.hour import load_free_policy
+            model, _ = load_free_policy(path)
+            return cls(model.policy, model.observation_space.spaces, seed, exact=True)
         check_names(model.policy)
         return cls(model.policy, model.observation_space.spaces, seed)
 
     def __call__(self, step, obs, slots, starts):
         torch, policy, n = self.torch, self.policy, len(slots)
+        if self.exact and set(obs) != set(self.spaces):
+            raise ValueError(f"an observation with {sorted(set(obs) ^ set(self.spaces))} unlike the policy's own arrays")
         if self.state is None:
             lstm = policy.lstm_actor
             self.state = tuple(torch.zeros(lstm.num_layers, n, lstm.hidden_size) for _ in range(2))
@@ -1033,6 +1102,30 @@ class PolicySource:
             dist, self.state = policy.get_distribution(tensors, self.state, torch.as_tensor(starts, dtype=torch.float32))
             action = torch.multinomial(dist.distribution.probs, 1, generator=self.generator)
         return action.squeeze(1).numpy().astype(np.int32)
+
+
+class ControlSource:
+    """sim/free.py's controls on a free-play Python side (a yardstick's action sequence for both engines, never a
+    label): world b plays control names[b % len(names)], which reads that world's life on the Python side (privileged)
+    and acts through its legal actions; each new life resets it, keyed by (key, slot, episode). `period`: the
+    rotation's ticks a member."""
+
+    def __init__(self, side, names, key, period=None):
+        from sim import free
+        self.side, self.key, self.names = side, key, tuple(names)
+        self.actors = [free.make(self.names[b % len(self.names)], period) for b in range(side.n)]
+
+    def __call__(self, step, obs, slots, starts):
+        env = self.side.env
+        out = np.zeros(len(slots), np.int32)
+        for b in range(len(slots)):
+            if starts[b]:
+                self.actors[b].reset([int(self.key), int(slots[b]), int(env.episodes[b])])
+            out[b] = self.actors[b].act({name: value[b] for name, value in obs.items()}, env.tasks[b])
+        return out
+
+    def __str__(self):
+        return f'control:{",".join(self.names)}'
 
 
 def make_source(spec, key):
@@ -1088,7 +1181,8 @@ class Divergence:
 class Result:
     """A run: decisions stepped, worlds, Rows compared (traced: both sides gave Rows), episodes ended; the first
     divergence, why the run stopped early (both sides raised alike, an unsupported world), and a gap: a path one side
-    has not ported (NotPorted), which stops the comparison and is never a divergence."""
+    has not ported (NotPorted), which stops the comparison and is never a divergence. most_objs: the most ground objs
+    one world of the Python side held at a tick's end (len(world.objs); rs.h RS_MAX_OBJS bounds the C side's)."""
     steps: int = 0
     worlds: int = 0
     ticks: int = 0
@@ -1097,6 +1191,7 @@ class Result:
     divergence: Divergence | None = None
     stopped: str = ''
     gap: str = ''
+    most_objs: int = 0
 
 
 def _plain(value):
@@ -1110,18 +1205,18 @@ def _bits_of(array):
 
 
 def _array_diff(name, a, b):
-    """Lines for differing rows of one array (bitwise), floats shown with their bits."""
-    ba, bb = _bits_of(np.asarray(a)), _bits_of(np.asarray(b))
-    if ba.shape != bb.shape:
-        return [f'{name}: shape {ba.shape} vs {bb.shape}']
-    where = np.argwhere(ba != bb)
+    """Lines for differing values of one array or scalar (a 0-d value: an info field of one world), bitwise, floats
+    shown with their bits."""
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        return [f'{name}: shape {a.shape} vs {b.shape}']
+    where = np.flatnonzero(_bits_of(a.reshape(-1)) != _bits_of(b.reshape(-1)))
     if not len(where):
         return []
-    k = tuple(int(i) for i in where[0])
-    va, vb = np.asarray(a)[k], np.asarray(b)[k]
-    shown = (lambda v: f'{float(v)!r} ({int(np.asarray(v).view(np.uint32)):08x})') if np.asarray(a).dtype == np.float32 \
+    k = tuple(int(i) for i in np.unravel_index(int(where[0]), a.shape))
+    shown = (lambda v: f'{float(v)!r} ({int(np.asarray(v).view(np.uint32)):08x})') if a.dtype == np.float32 \
         else (lambda v: repr(v.item()))
-    return [f'{name}{list(k)}: {shown(va)} != {shown(vb)} ({len(where)} values differ)']
+    return [f'{name}{list(k)}: {shown(a[k])} != {shown(b[k])} ({len(where)} values differ)']
 
 
 def _compare_rows(ra, rb):
@@ -1150,11 +1245,13 @@ def _until(tail, rows, k):
 
 
 def _compare_outputs(b, out_a, out_b, info_names):
-    """(where, detail) of world b's first differing decision output, or None."""
-    from sim.spec import OBSERVATION_SHAPES
+    """(where, detail) of world b's first differing decision output, or None. The observation arrays are the sides'
+    table's (obs-v5, or obs-v6 for free play, whose info also holds last_obs: each ended life's last observation)."""
     _, oa, ra, da, ia = out_a
     _, ob, rb, db, ib = out_b
-    lines = [line for name in OBSERVATION_SHAPES for line in _array_diff(name, oa[name][b], ob[name][b])]
+    if list(oa) != list(ob):
+        return 'observation', [f'observation keys {list(oa)} vs {list(ob)}']
+    lines = [line for name in oa for line in _array_diff(name, oa[name][b], ob[name][b])]
     if lines:
         return 'observation', lines
     if ra is None:  # a reset
@@ -1164,6 +1261,12 @@ def _compare_outputs(b, out_a, out_b, info_names):
     if bool(da[b]) != bool(db[b]):
         return 'done', [f'done {bool(da[b])} != {bool(db[b])}']
     lines = [line for name in info_names for line in _array_diff(f'info.{name}', ia[name][b], ib[name][b])]
+    if ('last_obs' in ia) != ('last_obs' in ib):
+        lines.append(f"info.last_obs on one side only ({'last_obs' in ia} vs {'last_obs' in ib})")
+    elif 'last_obs' in ia:
+        la, lb = ia['last_obs'], ib['last_obs']
+        lines += [f'info.last_obs keys {list(la)} vs {list(lb)}'] if list(la) != list(lb) else \
+            [line for name in la for line in _array_diff(f'info.last_obs.{name}', la[name][b], lb[name][b])]
     return ('info', lines) if lines else None
 
 
@@ -1171,10 +1274,62 @@ def _evidence(rows, slot):
     return [_plain({k: v for k, v in row.items() if k != 'observation'}) for row in rows if row['world'] == slot]
 
 
+# The check failures (sim/audit.py AuditError) whose C text (rs.h RS_E_AUDIT_*) carries less than the oracle's: the
+# oracle's text cut to the fields the C reason carries (an XP event's stat for its dict, a production's or a hit's cause
+# and tick for its dict and stats, a holding's place for its two counts, no values for the pay's). Every other check
+# failure's C text is the oracle's own. XP_WHY maps the XpCheck._fail reasons that C words without their values.
+AUDIT_CUTS = (
+    (re.compile(r'(production|hit|bones buried) at tick (-?\d+) \(.*\) ha(?:s|ve) no xp event(?: for stats \[[\d, ]*\])?',
+                re.S), lambda m: f'{m[1]} at tick {m[2]} has no xp event'),
+    (re.compile(r'xp event at tick (-?\d+) \((\{.*\})\): (.*)', re.S), lambda m: _xp_cut(*m.groups())),
+    (re.compile(r'(\w+) holdings not explained by the events: .*', re.S),
+     lambda m: f'{m[1]} holdings not explained by the events'),
+    (re.compile(r'paid \S+, the fractional level gain \S+'), lambda m: 'paid differs from the fractional level gain'),
+)
+XP_WHY = (
+    (re.compile(r'production by .* trains no such skill', re.S), 'production by a script that trains no such skill'),
+    (re.compile(r'a hit in style -?\d+ gives that stat no more XP'), 'a hit in its style gives that stat no more XP'),
+    (re.compile(r'the stat held -?\d+, not -?\d+'), "the stat's XP before is not its checked XP"),
+    (re.compile(r'the tables give -?\d+ at rate -?\d+'), 'the tables give another amount at its rate'),
+)
+
+
+def _xp_cut(tick, data, why):
+    """XpCheck._fail's text as rs.h RS_E_AUDIT_XP renders it: the event's stat for its dict, XP_WHY's wording."""
+    try:
+        stat = ast.literal_eval(data)['stat']
+    except (ValueError, SyntaxError, TypeError, KeyError):
+        return None
+    why = next((c_why for pattern, c_why in XP_WHY if pattern.fullmatch(why)), why)
+    return f'xp event at tick {tick} (stat {stat}): {why}'
+
+
+def audit_cut(text):
+    """The C text of an oracle check failure's text (AUDIT_CUTS), or None when no cut applies."""
+    for pattern, cut in AUDIT_CUTS:
+        found = pattern.fullmatch(text)
+        if found:
+            return cut(found)
+    return None
+
+
+def raised_alike(error_a, error_b):
+    """How two sides' raises compare: 'text' (one class, one text), 'cut' (a check failure, sim/audit.py AuditError,
+    whose C text is the oracle's text cut to what its C reason carries: audit_cut) or None. Side a is the oracle."""
+    from sim.audit import AuditError
+    if type(error_a) is not type(error_b):
+        return None
+    if str(error_a) == str(error_b):
+        return 'text'
+    if isinstance(error_a, AuditError) and audit_cut(str(error_a)) == str(error_b):
+        return 'cut'
+    return None
+
+
 def _call(fn, *args):
     try:
         return fn(*args), None
-    except Exception as error:  # compared as type and text: both sides must raise alike
+    except Exception as error:  # compared as type and text: both sides must raise alike (raised_alike)
         return None, error
 
 
@@ -1184,7 +1339,17 @@ def run(a, b, source, key, steps, episode=0, repro=None, observe=None):
     Result whose divergence is the first one (None: none). With `episode` (a repro), world 0 is rebuilt at that episode
     after the reset, and only that episode is compared. repro(slot, episode, actions) renders the report's repro
     line. observe(step, out_a, out_b), if given, sees both sides' outputs once they compared equal (step -1: the
-    first observations)."""
+    first observations). The Result's most_objs is the most ground objs a world of side a held at a tick's end in this
+    run."""
+    traces = getattr(a, 'traces', [])
+    for trace in traces:
+        trace.most_objs = 0
+    result = _run(a, b, source, key, steps, episode, repro, observe)
+    result.most_objs = max((trace.most_objs for trace in traces), default=0)
+    return result
+
+
+def _run(a, b, source, key, steps, episode, repro, observe):
     from sim.spec import INFO_FIELDS
     n, slots, goals = a.n, a.first + np.arange(a.n), a.goals
     info_names = [*INFO_FIELDS, 'made', 'kills', 'facts']
@@ -1246,11 +1411,30 @@ def run(a, b, source, key, steps, episode=0, repro=None, observe=None):
         if gap:
             result.gap = f'{gap} (step {step})'
             return None, None, result
-        if type(err_a) is type(err_b) and str(err_a) == str(err_b):
-            result.stopped = f'both sides raised {type(err_a).__name__} at step {step}: {err_a}'
-            return None, None, result
+        alike = raised_alike(err_a, err_b)
         texts = [f'{side.name}: {"no exception" if err is None else f"{type(err).__name__}: {err}"}'
                  for side, err in ((a, err_a), (b, err_b))]
+        if alike == 'cut':  # the detail the C text leaves out lies in the step's tick rows: they must agree, up to the
+            rows_a, rows_b = a.take(), b.take()  # world the C side names (later worlds may not have stepped)
+            if rows_a[0] is not None and rows_b[0] is not None:
+                last = getattr(err_b, 'world', n - 1)
+                last = min(n - 1, last if isinstance(last, int) and last >= 0 else n - 1)
+                # the oracle steps its worlds in order and stops at its raise: rows past C's world mean it raised later
+                if any(rows_a[w] for w in range(last + 1, n)):
+                    return None, None, diverge('exception', 0, texts, step, before[0][1], -1, before[0][0], 0)
+                for w in range(last + 1):
+                    found = _compare_rows(rows_a[w], rows_b[w])
+                    if found:
+                        where, detail, k = found
+                        row = (rows_a[w] or rows_b[w])[min(k, len(rows_a[w] or rows_b[w]) - 1)]
+                        ep, decision = before[w]
+                        return None, None, diverge(where, w, detail, step, decision, row.tick, ep,
+                                                   int(row.episode != ep), (rows_a[w], rows_b[w], k))
+            result.stopped = f'both sides raised {type(err_a).__name__} at step {step}: {err_a} (C text: {err_b})'
+            return None, None, result
+        if alike:
+            result.stopped = f'both sides raised {type(err_a).__name__} at step {step}: {err_a}'
+            return None, None, result
         a.take(), b.take()
         return None, None, diverge('exception', 0, texts, step, before[0][1], -1, before[0][0], 0)
 
@@ -1314,6 +1498,20 @@ class Inputs:
     scenario: str | None = None
     against: str = 'cpu'
     pack: str | None = None
+    # free-play-v1's batch settings (sim/vec.py CpuBatch): the XP rate, muggers and the life length as JSON text
+    xp_rate: int | None = None
+    muggers: bool | None = None
+    life: str | None = None
+
+    @property
+    def free(self):
+        return self.task == native.FREE_TASK
+
+    def batch_settings(self):
+        """free-play-v1's CpuBatch and NativeBatch settings ({} for a goal task)."""
+        if not self.free:
+            return {}
+        return dict(xp_rate=self.xp_rate, muggers=self.muggers, life=None if self.life is None else tuple(json.loads(self.life)))
 
     def goal_set(self):
         from baseline.resource_task import GOALS
@@ -1325,7 +1523,9 @@ class Inputs:
             args = ['--task', self.task, '--pool', self.pool, '--key', str(key), '--slot', str(slot), '--episode',
                     str(episode), '--actions', ','.join(map(str, actions)) or 'none', '--against', self.against]
             for flag, value in (('--archive', self.archive), ('--supply', self.supply), ('--pack', self.pack),
-                                ('--scenario', self.scenario), ('--horizon', self.horizon)):
+                                ('--scenario', self.scenario), ('--horizon', self.horizon), ('--xp-rate', self.xp_rate),
+                                ('--muggers', None if self.muggers is None else int(self.muggers)),
+                                ('--life', self.life)):
                 if value is not None:
                     args += [flag, str(value)]
             if self.supply_count:
@@ -1348,18 +1548,22 @@ def build(inputs, n, first=0, tables_=None):
         supply, none = load_pool(inputs.supply)
         count = inputs.supply_count or len(supply)
         search = (supply[:count], none[:count])
-    kwargs = dict(derived=None if derived[0] is None else derived, first=first, task=inputs.task, search=search,
-                  goals=inputs.goal_set())
+    kwargs = dict(derived=None if derived[0] is None else derived, first=first, task=inputs.task, search=search)
+    if not inputs.free:
+        kwargs['goals'] = inputs.goal_set()
     if inputs.horizon is not None:
         kwargs['horizon'] = inputs.horizon
-    env = CpuBatch(tables_, layouts, n, **kwargs)
+    env = CpuBatch(tables_, layouts, n, **kwargs, **inputs.batch_settings())
     a = PythonSide(env, scenario=inputs.scenario, name='cpu')
     if inputs.against == 'cpu':
         return a, PythonSide(twin(env), scenario=inputs.scenario, name='cpu-twin')
     if inputs.against != 'native':
         raise ValueError(f'against cpu or native, not {inputs.against}')
-    batch = native.NativeBatch(inputs.pack, n, first=first, task=inputs.task, goals=inputs.goal_set(),
-                               horizon=inputs.horizon)
+    from sim.build import DATA
+    opened = {name: path for name, path in (('tables', inputs.archive or DATA), ('pool', inputs.pool),
+                                            ('supply_pool', inputs.supply)) if path}  # as the training workers open it
+    batch = native.NativeBatch(inputs.pack, n, first=first, task=inputs.task, inputs=opened,
+                               **{k: v for k, v in kwargs.items() if k in ('goals', 'horizon')}, **inputs.batch_settings())
     a.canon = Canon(PackStrings(batch.pack))  # the pack's string ids, as canon.c writes them
     return a, NativeSide(batch, scenario=inputs.scenario, python=a)
 
@@ -1372,11 +1576,16 @@ def add_arguments(parser):
     parser.add_argument('--task', default='goal-activity-v2')
     parser.add_argument('--goals', default='all', help='all, or one goal in every slot')
     parser.add_argument('--horizon', type=int)
+    parser.add_argument('--xp-rate', type=int, help='free-play-v1: the worlds\' XP rate (1 or 25)')
+    parser.add_argument('--muggers', type=int, choices=(0, 1), help='free-play-v1: muggers placed (1) or not (0)')
+    parser.add_argument('--life', help='free-play-v1: the life length as JSON, e.g. \'["uniform", 200, 600]\'')
     parser.add_argument('--worlds', type=int, default=4)
     parser.add_argument('--first', type=int, default=0)
     parser.add_argument('--key', type=int, default=7)
     parser.add_argument('--steps', type=int, default=100)
-    parser.add_argument('--source', default='random', help='random, biased, idle, walk, eat, list:1,2,3 or policy:PATH[:seed]')
+    parser.add_argument('--source', default='random', help='random, biased, idle, walk, eat, list:1,2,3, policy:PATH[:seed] or '
+                        '(free-play-v1) control:NAME[,NAME...] (sim/free.py controls)')
+    parser.add_argument('--period', type=int, default=None, help="control:rotation's ticks a member")
     parser.add_argument('--scenario', help=f'a scenario start: {", ".join(SCENARIOS)}, or a JSON object')
     parser.add_argument('--against', default='cpu', help='cpu (a twin CpuBatch) or native (a NativeBatch on --pack)')
     parser.add_argument('--pack')
@@ -1392,14 +1601,17 @@ def main(args):
         Scenario(args.scenario)  # refuse an unknown one before loading anything
     inputs = Inputs(pool=args.pool, archive=args.archive, supply=args.supply, supply_count=args.supply_count,
                     task=args.task, goals=args.goals, horizon=args.horizon, scenario=args.scenario, against=args.against,
-                    pack=args.pack)
+                    pack=args.pack, xp_rate=args.xp_rate, muggers=None if args.muggers is None else bool(args.muggers),
+                    life=args.life)
     if args.slot is not None:
         actions = [] if args.actions in (None, 'none') else [int(v) for v in args.actions.split(',')]
         a, b = build(inputs, 1, first=args.slot)
         result = run(a, b, Replay(actions), args.key, len(actions), episode=args.episode, repro=inputs.repro(args.key))
     else:
         a, b = build(inputs, args.worlds, first=args.first)
-        result = run(a, b, make_source(args.source, args.key), args.key, args.steps, repro=inputs.repro(args.key))
+        source = ControlSource(a, args.source[8:].split(','), args.key, args.period) if args.source.startswith('control:') \
+            else make_source(args.source, args.key)
+        result = run(a, b, source, args.key, args.steps, repro=inputs.repro(args.key))
     print(f'[native diff] {a.name} vs {b.name}: {result.worlds} worlds, {result.steps} decisions, '
           f'{result.ticks if result.traced else "untraced"} ticks, {result.episodes} episodes ended, '
           f'{"diverged" if result.divergence else "no divergence"}{"; " + result.stopped if result.stopped else ""}'
@@ -1434,26 +1646,129 @@ GATE = dict(
     quick=dict(firsts=(0,), random=(2, 50), biased=(2, 70), policy=(2, 50), hypothesis=(20, 300), scenario=(2, 30),
                threads=(64, 40), soak=0),
 )
-PARTS = ('cases', 'digests', 'threads', 'soak')
+# free-play-v1's configurations (the gate's `goals` column names them): the XP rate, muggers and the life length.
+# Short lives end by their length and, with muggers or a hurt start, by a death within a case; the long ones (full
+# gate only) play whole 36,000-tick lives, past RS_MAX_EVENTS events a life, so their settlement runs in steps, at both
+# XP rates (the 25x one added on 12 November: high levels and large XP counts in long lives).
+FREE_CONFIGS = {
+    'x1-none': dict(xp_rate=1, muggers=False, life=('uniform', 100, 1000)),
+    'x1-muggers': dict(xp_rate=1, muggers=True, life=('uniform', 100, 1000)),
+    'x25-none': dict(xp_rate=25, muggers=False, life=('uniform', 100, 1000)),
+    'x25-muggers': dict(xp_rate=25, muggers=True, life=('uniform', 100, 1000)),
+    'x1-none-long': dict(xp_rate=1, muggers=False, life=('fixed', 36000)),
+    'x25-none-long': dict(xp_rate=25, muggers=False, life=('fixed', 36000)),
+}
+# village-world-v2's configurations, an opt-in world set of its own (gate --world village-world-v2; added 13 November):
+# the village-world-v1 set above (the goal tasks and FREE_CONFIGS: the gate's default) and its recorded results do not
+# change. v2 holds no muggers, and the C engine plays no goal task on its layouts, so the set is free play alone. No name
+# holds a v1 name, so an --only pattern of the v1 set matches no v2 case.
+FREE_CONFIGS_V2 = {
+    'w2-x1': dict(xp_rate=1, muggers=False, life=('uniform', 100, 1000)),
+    'w2-x25': dict(xp_rate=25, muggers=False, life=('uniform', 100, 1000)),
+    'w2-x1-long': dict(xp_rate=1, muggers=False, life=('fixed', 36000)),
+    'w2-x25-long': dict(xp_rate=25, muggers=False, life=('fixed', 36000)),
+}
+FREE_ALL = {**FREE_CONFIGS, **FREE_CONFIGS_V2}  # every free-play configuration by name
+FREE_LONG = ('x1-none-long', 'x25-none-long', 'w2-x1-long', 'w2-x25-long')
+GATE_WORLDS = ('village-world-v1', 'village-world-v2')  # the gate's world sets; the first is the default
+FREE_SOURCES = ('random', 'biased', 'hypothesis')  # obs-v6 has no trained or fresh policy on this line
+# The long lives' play: sim/free.py controls (ControlSource), whose fights fill a life with events (the chickens
+# control passes 4,096 by about tick 8,200), the rotation at one of the soak's declared periods (not the study's).
+FREE_LONG_CONTROLS, ROTATION_PERIOD = ('chickens', 'rotation'), 1500
+GATE['full'].update(long=(1, 7000), free_soak=2 * 10 ** 7)
+GATE['quick'].update(long=(0, 0), free_soak=0)
+# village-world-v2's training-workers part (gate_workers; added 13 November): worlds and decisions a run, as the digests
+# part checks the goal tasks' workers path for village-world-v1
+GATE['full'].update(workers=(32, 250))
+GATE['quick'].update(workers=(8, 100))
+WORKERS_CONFIGS, WORKERS_COUNTS, WORKERS_KEY = ('w2-x1', 'w2-x25'), (1, 2, 4), 1
+PARTS = ('cases', 'digests', 'threads', 'soak', 'workers', 'policy')
 SOAK_N, SOAK_KEY, SOAK_EVERY = 128, 100_000, 1000  # soak worlds per batch, first key, 1 in SOAK_EVERY episodes replayed
 SOAK_SOURCES = ('biased', 'policy:A', 'policy:S')
 SOAK_FAILURES = 50  # a soak stops resetting after this many errors and unsupported worlds (each one is reported)
 # The compact pool FOUR_GOAL_DIGESTS' v5 batch was recorded on (sim/tests/test_workers.py v5_inputs): the digests part
-# reads it (gate --digest-pool's default) whatever the gate's --pool, so a gate on another pool (the native gap study's
-# arm Layouts) can pass that part. A checkout without logs/ (a cloud machine's) names its uploaded copy.
+# reads it (gate --digest-pool's default) whatever the gate's --pool, so a gate on another pool (an earlier study's
+# layouts arm) can pass that part. A checkout without logs/ (a remote host's) names its uploaded copy.
 DIGEST_POOL = native.ROOT / 'logs' / 'sim' / 'world' / 'train-8-nc1-derived.npz'
+# Each world set's default inputs (gate --archive, --pool, --pack): village-world-v1's are the gate's as before;
+# village-world-v2's are its training pool (plain), its archive with the pick rows and their pack without trees.
+GATE_INPUTS = dict(archive=native.ROOT / 'logs/sim/data/draynor-nc1.npz',
+                   pool=native.ROOT / 'logs/sim/world/train-8-nc1-derived.npz', pack=native.PACK)
+GATE_INPUTS_V2 = dict(archive=native.ROOT / 'logs/sim/data/draynor-nc2.npz',
+                      pool=native.ROOT / 'logs/sim/world/train-128-20000-v2.npz', pack=native.PACK_V2)
+# The policy part (gate_policy; added 14 November, for a learned policy's state that no other part reached): each
+# world set's pinned free-play-v1 checkpoint (a file under ignored logs/, its sha256 pinned here), sampled, in both
+# engines side by side under its frozen plan's batch (sim/gate.py FREE['plans']: the world, XP rate, muggers and life) on
+# that plan's training pool. village-world-v2's set plays its own inputs (its pool is that plan's); village-world-v1's,
+# whose cases play train-8-nc1, plays the first pilot's 128-layout pool through that pool's pack. free_policy: the first
+# world slot of each run (run k plays key k + 1), worlds a run, decisions a run (full: past the longest life, 36,000 ticks
+# at about 14 ticks a decision, so each world's first life ends; measured on the Mac alone at full size, 14 November:
+# 688 s and 469 s, v2 and v1, 105 and 154 world decisions a second, loads included).
+GATE_POLICY = {
+    GATE_WORLDS[0]: dict(plan='pilot', checkpoint=native.ROOT / 'logs/native/policies/pilot-run77-latest.zip',
+                         sha256='cc77f60ff61ed93a09f545a72a688f3e63bcbc639731d5f214c451081be4bb48',
+                         pool=native.ROOT / 'logs/sim/world/train-128-1000-nc1.npz',
+                         pack=native.ROOT / 'logs/native/train-128-1000-nc1-a6c325a-ids3-item3.pack'),
+    GATE_WORLDS[1]: dict(plan='wider_pilot',
+                         checkpoint=native.ROOT / 'logs/native/policies/wider-pilot-s79-a1-ppo_1572864_steps.zip',
+                         sha256='ffd81cf49e79d3ac336da55fee5ce721b110df119a0d0d6c8e0b43c78b60fabb'),
+}
+GATE['full'].update(free_policy=((0, 8, 16), 8, 3000))
+GATE['quick'].update(free_policy=((0,), 4, 200))
+# The respawn-cycle life (14 November): the wider pilot's update-24 checkpoint, sampled on the C engine (key 81, torch
+# seed 4, 1,024 worlds), reached it after 5,695,488 decisions; replayed, both engines raise at its last decision (an
+# agent's hit in its npc's respawn cycle, before [ai_spawn], owed XP by the check). The policy part of
+# village-world-v2's set plays it on that set's training pool: it must play every action with no stop, no divergence and
+# no gap.
+RESPAWN_LIFE = dict(world=GATE_WORLDS[1], key=81, slot=295, episode=7, actions=(
+    27, 94, 87, 79, 68, 1, 91, 8, 2, 28, 20, 6, 5, 1, 10, 14, 14, 8, 1, 8, 1, 7, 13, 3, 10, 0, 9, 10, 7, 1, 1, 7, 9,
+    2, 15, 10, 2, 3, 1, 7, 16, 0, 9, 14, 1, 6, 1, 14, 10, 8, 0, 15, 6, 2, 2, 61, 3, 3, 95, 7, 2, 0, 61, 2, 5, 1, 2,
+    2, 44, 3, 0, 0, 6, 12, 25, 68, 3, 40, 5, 61, 38, 37, 5, 1, 42, 39, 4, 44, 6, 40, 43, 4, 62, 8, 24, 42, 68, 3, 0,
+    78, 7, 1, 11, 0, 9, 3, 13, 7, 40, 14, 7, 1, 8, 13, 5, 12, 4, 11, 1, 1, 15, 0, 61, 7, 12, 8, 6, 0, 0, 37, 13, 13,
+    9, 15, 1, 4, 13, 8, 16, 3, 11, 0, 13, 13, 9, 1, 10, 4, 1, 1, 3, 0, 78, 0, 2, 15, 39, 38, 2, 5, 4, 5, 4, 8, 61,
+    37, 40, 39, 5, 38, 4, 3, 38, 13, 61, 38, 40, 2, 61, 38, 6, 40, 39, 3, 37, 40, 4, 1, 75, 91, 9, 1, 12, 73, 1, 9,
+    10, 1, 6, 10, 5, 37, 11, 90, 9, 0, 8, 2, 1, 72, 15, 13, 14, 2, 75, 0, 0, 77, 1, 0, 15, 16, 18, 5, 5, 6, 0, 13,
+    1, 15, 13, 1, 1, 15, 12, 16, 14, 2, 14, 16, 9, 1, 16, 4, 1, 14, 0, 73, 1, 0, 10, 1, 5, 4, 6, 0, 1, 38, 3, 0, 0,
+    1, 2, 3, 4, 0, 7, 0, 10, 2, 4, 0, 4, 12, 5, 16, 1, 2, 4, 5, 0, 7, 76, 9, 0, 1, 76, 3, 5, 76, 5, 1, 3, 2, 8, 12,
+    12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61))
 
 
-def gate_configs(mode):
-    """(task, goals, first) of every configuration, in run order."""
+def gate_parts(mode, world=GATE_WORLDS[0]):
+    """The part rows (besides the cases) a world set's gate writes in a mode: village-world-v1's digests (its goal tasks'
+    workers path), village-world-v2's training workers (gate_workers), the thread check, the soak in the full gate (the
+    quick gate has none) and the policy part (gate_policy), in both modes and both sets."""
+    if world not in GATE_WORLDS:
+        raise ValueError(f'the gate plays the world sets {GATE_WORLDS}, not {world!r}')
+    return ['digests' if world == GATE_WORLDS[0] else 'workers', 'threads', *(['soak'] if GATE[mode]['soak'] else []),
+            'policy']
+
+
+def gate_configs(mode, world=GATE_WORLDS[0]):
+    """(task, goals, first) of every configuration of a world set, in run order; free-play-v1's goals column is its
+    FREE_CONFIGS (FREE_CONFIGS_V2) name (its long lives in the full gate only). village-world-v2's set is its free-play
+    configurations alone."""
     firsts = GATE[mode]['firsts']
     from baseline.resource_task import GOALS
+    if world not in GATE_WORLDS:
+        raise ValueError(f'the gate plays the world sets {GATE_WORLDS}, not {world!r}')
+    if world != GATE_WORLDS[0]:
+        return [(native.FREE_TASK, name, first) for name in FREE_CONFIGS_V2
+                if name not in FREE_LONG or GATE[mode]['long'][0] for first in firsts]
+    free = [name for name in FREE_CONFIGS if name not in FREE_LONG or GATE[mode]['long'][0]]
     return [(task, 'all', first) for task in GATE_TASKS for first in firsts] + \
-        [(task, goal, first) for task in SINGLE_GOAL_TASKS for goal in GOALS for first in firsts]
+        [(task, goal, first) for task in SINGLE_GOAL_TASKS for goal in GOALS for first in firsts] + \
+        [(native.FREE_TASK, name, first) for name in free for first in firsts]
 
 
-def gate_cases():
-    """(source, scenario) of every configuration's cases."""
+def gate_cases(task=None, goals=None):
+    """(source, scenario) of a configuration's cases: the goal tasks' list; free-play-v1's keyed and Hypothesis play,
+    its scenarios under biased play and the hurt start under attack (UNDER_ATTACK: with muggers the attacker comes),
+    and on a long-life configuration keyed random play alone."""
+    if task == native.FREE_TASK:
+        if goals in FREE_LONG:
+            return [(f'control:{name}', None) for name in FREE_LONG_CONTROLS]
+        return [*((source, None) for source in FREE_SOURCES), *(('biased', name) for name in FREE_SCENARIOS),
+                *((source, 'freehurt') for source in UNDER_ATTACK)]
     cases = [('random', None), ('biased', None), *((f'policy:{name}', None) for name in FRESH_POLICIES), ('hypothesis', None)]
     return cases + [('biased', name) for name in SCENARIOS] + [(source, 'danger') for source in UNDER_ATTACK]
 
@@ -1476,14 +1791,16 @@ def retarget(env, first, goals=None):
 def world_digest(obs, reward, done, info, b):
     """sha256 of world b's row of a step's outputs (every observation array bitwise, reward bits, done, info)."""
     import hashlib
-    from sim.spec import INFO_FIELDS, OBSERVATION_SHAPES
+    from sim.spec import INFO_FIELDS
     h = hashlib.sha256()
-    for name in OBSERVATION_SHAPES:
+    for name in obs:  # the batch's table, in its order (obs-v5, or free play's obs-v6)
         h.update(np.ascontiguousarray(obs[name][b]).tobytes())
     if reward is not None:
         h.update(np.float32(reward[b]).tobytes() + bytes([bool(done[b])]))
         for name in (*INFO_FIELDS, 'made', 'kills', 'facts'):
             h.update(np.ascontiguousarray(info[name][b]).tobytes())
+        for name in info.get('last_obs', {}):  # free play: each ended life's last observation
+            h.update(np.ascontiguousarray(info['last_obs'][name][b]).tobytes())
     return h.hexdigest()
 
 
@@ -1509,6 +1826,7 @@ class GateContext:
     pack_path: str
     work: Path
     threads: int
+    world: str = GATE_WORLDS[0]
     tables: object = None
     layouts: list = None
     derived: list = None
@@ -1520,9 +1838,21 @@ class GateContext:
     def load(self, policies=True):
         from sim.workers import load_tables
         from sim.world import load_pool
+        from sim.combat import village_of
         self.tables = load_tables(self.archive)
         self.layouts, derived = load_pool(self.pool)
         self.derived = None if derived[0] is None else derived
+        found = {(village_of(layout) or {}).get('version') for layout in self.layouts}
+        if found != {self.world}:  # a world set plays its own world's pool (its free-play batches name it too)
+            raise ValueError(f"the gate's {self.world} set plays that world's pool, not {self.pool} "
+                             f"({sorted(map(str, found))} layouts)")
+        if self.world != GATE_WORLDS[0]:  # the wider world's set plays training layouts only, never held-out ones
+            from sim.world import SPLITS
+            lo, hi = SPLITS['train']
+            outside = sorted({int(layout.seed) for layout in self.layouts if not lo <= layout.seed < hi})
+            if outside:
+                raise ValueError(f"the gate's {self.world} set plays layouts of the train split only (seeds {lo} to "
+                                 f"{hi - 1}): {self.pool} holds {len(outside)} others, {outside[:5]}")
         supply, none = load_pool(self.supply)
         self.search = (supply, none)
         self.pack = native.open_pack(self.pack_path, inputs=dict(tables=self.archive, pool=self.pool,
@@ -1546,20 +1876,38 @@ class GateContext:
             out[name] = (model.policy, model.observation_space.spaces, f'{model.policy.observation}/fresh-{seed}')
         return out
 
-    def base(self, task):
-        """One CpuBatch of GATE_N worlds per task (its layout tables built once; retarget gives the others)."""
+    def base(self, task, goals='all'):
+        """One CpuBatch of GATE_N worlds per task (free-play-v1: per configuration; its layout tables built once;
+        retarget gives the others)."""
         from sim.combat import task_spec
         from sim.vec import CpuBatch
-        if task not in self.bases:
-            self.bases[task] = CpuBatch(self.tables, self.layouts, GATE_N, derived=self.derived, task=task,
-                                        search=self.search if task_spec(task)['search'] else None)
-        return self.bases[task]
+        k = (task, goals) if task == native.FREE_TASK else task
+        if k not in self.bases:
+            if task == native.FREE_TASK:
+                self.bases[k] = CpuBatch(self.tables, self.layouts, GATE_N, derived=self.derived, task=task,
+                                         world=self.world, **FREE_ALL[goals])
+            else:
+                self.bases[k] = CpuBatch(self.tables, self.layouts, GATE_N, derived=self.derived, task=task,
+                                         search=self.search if task_spec(task)['search'] else None)
+        return self.bases[k]
 
     def inputs(self, task, goals, scenario=None):
+        if task == native.FREE_TASK:
+            c = FREE_ALL[goals]
+            return Inputs(pool=self.pool, archive=self.archive, task=task, scenario=scenario, against='native',
+                          pack=self.pack_path, xp_rate=c['xp_rate'], muggers=c['muggers'], life=json.dumps(c['life']))
         from sim.combat import task_spec
         supply = task_spec(task)['supply']
         return Inputs(pool=self.pool, archive=self.archive, supply=self.supply if supply else None, task=task, goals=goals,
                       scenario=scenario, against='native', pack=self.pack_path)
+
+    def batch(self, task, goals, n, first=0, threads=1):
+        """The configuration's NativeBatch on the gate's pack."""
+        if task == native.FREE_TASK:
+            return native.NativeBatch(self.pack, n, first=first, task=task, threads=threads, world=self.world,
+                                      **FREE_ALL[goals])
+        return native.NativeBatch(self.pack, n, first=first, task=task, goals=self.inputs(task, goals).goal_set(),
+                                  threads=threads)
 
     def source(self, spec, key):
         if spec.startswith('policy:'):
@@ -1588,9 +1936,16 @@ class CaseResult:
     stopped: list = field(default_factory=list)
     reports: list = field(default_factory=list)
     seconds: float = 0.0
+    most_objs: int = 0  # the most ground objs one Python world held at a tick's end over the runs (Result.most_objs)
+    compared: int = 0  # decisions both sides' outputs compared equal at (compared_steps), over the runs
+    census: dict | None = None  # free play: what its Python lives reached (FreeCensus), over the runs
+    deaths: int | None = None  # free play: lives that ended by a death (not by their length), over the runs
 
-    def add(self, result, key):
+    def add(self, result, key, compared=None):
+        """A run's counts (compared: its compared decisions, default compared_steps(result))."""
         self.runs += 1
+        self.most_objs = max(self.most_objs, result.most_objs)
+        self.compared += compared_steps(result) if compared is None else compared
         self.decisions += result.steps
         self.world_decisions += result.steps * result.worlds
         self.ticks += result.ticks
@@ -1606,9 +1961,19 @@ class CaseResult:
 
     def line(self):
         return (f'[gate] {self.task} {self.goals} first {self.first} {self.source} {self.scenario or "-"}: {self.runs} '
-                f'runs, {self.decisions} decisions ({self.world_decisions} world), {self.ticks} ticks, {self.episodes} '
-                f'episodes ended, {self.divergences} divergences, {self.gaps} gaps'
+                f'runs, {self.decisions} decisions ({self.world_decisions} world, {self.compared} compared), {self.ticks} '
+                f'ticks, {self.episodes} episodes ended{"" if self.deaths is None else f" ({self.deaths} deaths)"}, '
+                f'{self.divergences} divergences, {self.gaps} gaps, at most {self.most_objs} ground objs'
                 f'{f", {len(self.stopped)} stopped alike" if self.stopped else ""} ({self.seconds:.0f} s)')
+
+
+def compared_steps(result):
+    """The decisions a run compared equal on both sides: its steps, less the one a divergence was found at (a divergence
+    at the reset, step -1, leaves none). A run stopped alike compared the steps before its stop (an unsupported world's
+    step included: its outputs compared equal); a gap's run, those before the gap."""
+    if result.divergence is None:
+        return result.steps
+    return max(0, min(result.steps, result.divergence.step))
 
 
 def gate_case(ctx, env, batch, canon, mode, task, goals, first, source, scenario, log):
@@ -1617,6 +1982,17 @@ def gate_case(ctx, env, batch, canon, mode, task, goals, first, source, scenario
     g, t0 = GATE[mode], time.time()
     out = CaseResult(case_id(task, goals, first, source, scenario), task, goals, first, source, scenario)
     inputs = ctx.inputs(task, goals, scenario)
+    census, deaths = (FreeCensus(ctx.tables), [0]) if task == native.FREE_TASK else (None, None)
+
+    def observe(step, out_a, out_b):
+        """Free play's coverage, read off the Python side once both sides' outputs compared equal: each life's census
+        and the lives that ended by a death."""
+        if step >= 0:
+            done, terminal = np.asarray(out_a[3], bool), np.asarray(out_a[4]['terminal'])
+            deaths[0] += int((done & (terminal != 1)).sum())
+        for w, life in enumerate(env.tasks):
+            census.read(w, life)
+    observing = observe if census is not None else None
 
     def sides():
         a = PythonSide(env, canon=canon, scenario=scenario)
@@ -1630,11 +2006,12 @@ def gate_case(ctx, env, batch, canon, mode, task, goals, first, source, scenario
                   suppress_health_check=list(HealthCheck), print_blob=False)
         @given(key=st.integers(-2 ** 31, 2 ** 31 - 1), values=st.lists(st.integers(0, 95), min_size=1, max_size=most))
         def example(key, values):
-            result = run(a, b, Listed(values), key, len(values), repro=inputs.repro(key))
+            result = run(a, b, Listed(values), key, len(values), repro=inputs.repro(key), observe=observing)
             failed = result.divergence is not None or bool(result.gap)
             last[:] = [(result, key)] if failed else last
             out.add(Result(result.steps, result.worlds, result.ticks, result.episodes, result.traced, None,
-                           result.stopped, ''), key)  # every example's counts; the failure is recorded once below
+                           result.stopped, '', result.most_objs), key,
+                    compared_steps(result))  # every example's counts; the failure once below
             assert not failed, 'a divergence or a gap'
         last = []
         try:
@@ -1646,10 +2023,14 @@ def gate_case(ctx, env, batch, canon, mode, task, goals, first, source, scenario
             out.add(Result(divergence=result.divergence, gap=result.gap), key)
             out.runs -= 1
     else:
-        keys, steps = g['scenario' if scenario else source.split(':')[0]]
+        keys, steps = g['scenario' if scenario else 'long' if source.startswith('control:') else source.split(':')[0]]
         for key in range(1, keys + 1):
             a, b = sides()
-            out.add(run(a, b, ctx.source(source, key), key, steps, repro=inputs.repro(key)), key)
+            play = ControlSource(a, source[8:].split(','), key, ROTATION_PERIOD) if source.startswith('control:') \
+                else ctx.source(source, key)
+            out.add(run(a, b, play, key, steps, repro=inputs.repro(key), observe=observing), key)
+    if census is not None:
+        out.census, out.deaths = dict(census.counts), deaths[0]
     out.seconds = time.time() - t0
     log(out.line())
     for report in out.reports:
@@ -1661,14 +2042,15 @@ def gate_cases_part(ctx, mode, shard, skip, emit, log):
     """Every configuration of this shard (index % k == i), each case once (skip(id): leave it out)."""
     import gc
     i, k = shard
-    for index, (task, goals, first) in enumerate(gate_configs(mode)):
+    for index, (task, goals, first) in enumerate(gate_configs(mode, ctx.world)):
         if index % k != i:
             continue
-        todo = [(src, sc) for src, sc in gate_cases() if not skip(case_id(task, goals, first, src, sc))]
+        todo = [(src, sc) for src, sc in gate_cases(task, goals) if not skip(case_id(task, goals, first, src, sc))]
         if not todo:
             continue
-        env = retarget(ctx.base(task), first, goals)
-        batch = native.NativeBatch(ctx.pack, GATE_N, first=first, task=task, goals=ctx.inputs(task, goals).goal_set())
+        free = task == native.FREE_TASK
+        env = retarget(ctx.base(task, goals), first, None if free else goals)
+        batch = ctx.batch(task, goals, GATE_N, first=first)
         canon = Canon(PackStrings(ctx.pack))
         for source, scenario in todo:
             emit(gate_case(ctx, env, batch, canon, mode, task, goals, first, source, scenario, log))
@@ -1742,6 +2124,7 @@ def gate_digests(ctx, log, pool=DIGEST_POOL):
             finally:
                 workers.close()
     out['failures'] = sorted(k for k, v in out['expected'].items() if out['got'].get(k) != v)
+    out['pool'] = dict(path=str(Path(pool).absolute()), sha256=native.sha256_file(pool))  # the v5 batch's (--digest-pool)
     out['seconds'] = time.time() - t0
     log(f'[gate] digests: {", ".join(f"{k} {"equal" if k not in out["failures"] else "DIFFERS"}" for k in out["expected"])} '
         f'({out["seconds"]:.0f} s)')
@@ -1755,10 +2138,12 @@ def gate_threads(ctx, mode, log):
     import time
     n, steps = GATE[mode]['threads']
     t0, out = time.time(), dict(id='threads', worlds=n, decisions=steps, failures=[])
-    for task in ('goal-activity-v2', 'goal-activity-v5'):
+    tasks = (('goal-activity-v2', 'all'), ('goal-activity-v5', 'all'), (native.FREE_TASK, 'x1-muggers')) \
+        if ctx.world == GATE_WORLDS[0] else ((native.FREE_TASK, 'w2-x1'),)
+    for task, goals in tasks:
         runs = {}
         for threads in (1, 3, 8):
-            batch, source = native.NativeBatch(ctx.pack, n, task=task, threads=threads), Biased(1)
+            batch, source = ctx.batch(task, goals, n, threads=threads), Biased(1)
             state, obs = batch.reset(1)
             rows = [world_digest(obs, None, None, None, b) for b in range(n)]
             for step in range(steps):
@@ -1772,9 +2157,202 @@ def gate_threads(ctx, mode, log):
             if bad:
                 out['failures'].append(f'{task}: {threads} threads differ from 1 at row {bad[0]} ({len(bad)} rows)')
     out['seconds'] = time.time() - t0
-    log(f'[gate] threads: {n} worlds, {steps} decisions, v2 and v5 at 1, 3 and 8 threads: '
+    played = 'v2, v5 and free play' if ctx.world == GATE_WORLDS[0] else f'free play ({tasks[0][1]})'
+    log(f'[gate] threads: {n} worlds, {steps} decisions, {played} at 1, 3 and 8 threads: '
         f'{"; ".join(out["failures"]) or "identical"} ({out["seconds"]:.0f} s)')
     return out
+
+
+def gate_workers(ctx, mode, log):
+    """village-world-v2's training workers (sim/workers.py CpuWorkers, the path sim.train collects through) on the set's
+    pool, archive and pack: the C engine in 1, 2 and 4 worker processes against the Python reference in one, under keyed
+    random legal play from one reset (WORKERS_KEY) on each of WORKERS_CONFIGS (lives of 100-1000 ticks, so lives end and
+    begin within a run): the settings in effect equal (the world among them), and every world's outputs (world_digest:
+    observations, reward, done, info, each ended life's last observation) equal at the reset and every decision. As the
+    digests part checks the goal tasks' workers path for village-world-v1."""
+    import time
+    from sim.engine import Rng
+    from sim.spec import OBSERVATIONS
+    from sim.task import FREE_PLAY
+    from sim.vec import R_ACTION
+    from sim.workers import CpuWorkers
+    n, steps = GATE[mode]['workers']
+    observation = FREE_PLAY['observation']
+    t0 = time.time()
+    out = dict(id='workers', worlds=n, decisions=steps, configs=list(WORKERS_CONFIGS), counts=list(WORKERS_COUNTS),
+               key=WORKERS_KEY, compared=0, ticks=0, episodes=0, failures=[])
+    for goals in WORKERS_CONFIGS:
+        runs, settings = {}, {}
+        for engine, count in (('cpu', 1), *(('native', c) for c in WORKERS_COUNTS)):
+            env = CpuWorkers(n, count, ctx.pool, tables=ctx.archive, task=native.FREE_TASK, goals=None, engine=engine,
+                             pack=ctx.pack_path if engine == 'native' else None, observation=observation,
+                             shapes=OBSERVATIONS[observation], batch=dict(world=ctx.world, **FREE_ALL[goals]))
+            rows = []
+            try:
+                settings[engine, count] = env.settings_in_effect
+                rng = Rng(WORKERS_KEY)
+                state, obs = env.reset(WORKERS_KEY)
+                rows.append([world_digest(obs, None, None, None, b) for b in range(n)])
+                for step in range(steps):
+                    legal = [np.flatnonzero(obs['mask'][b]) for b in range(n)]
+                    action = np.array([row[int(rng(R_ACTION, step, b) * len(row))] for b, row in enumerate(legal)],
+                                      np.int32)
+                    state, obs, reward, done, info = env.step(state, action)
+                    rows.append([world_digest(obs, reward, done, info, b) for b in range(n)])
+                    if engine == 'cpu':
+                        out['ticks'] += int(np.asarray(info['decision_ticks']).sum())
+                        out['episodes'] += int(np.asarray(done).sum())
+            except Exception as error:  # an unsupported world or a worker's error: the part fails with its words
+                out['failures'].append(f'{goals}: {engine} in {count} workers raised at decision {len(rows) - 1}: '
+                                       f'{type(error).__name__}: {error}'[:2000])
+            finally:
+                env.close()
+            runs[engine, count] = rows
+        for (engine, count), rows in runs.items():
+            if engine == 'cpu':
+                continue
+            if settings.get((engine, count)) != settings.get(('cpu', 1)):
+                out['failures'].append(f'{goals}: the C engine in {count} workers has other settings in effect '
+                                       f'({settings.get((engine, count))} vs {settings.get(("cpu", 1))})')
+            bad = [(k, b) for k, (x, y) in enumerate(zip(runs['cpu', 1], rows)) for b in range(n) if x[b] != y[b]]
+            if len(rows) != steps + 1 or len(runs['cpu', 1]) != steps + 1:
+                continue  # a run that raised (its failure above) compared no whole run
+            if bad:
+                out['failures'].append(f'{goals}: the C engine in {count} workers differs from the Python reference '
+                                       f'first at decision {bad[0][0] - 1} world {bad[0][1]} ({len(bad)} world outputs)')
+            else:
+                out['compared'] += n * steps
+    out['seconds'] = time.time() - t0
+    log(f'[gate] workers: {n} worlds, {steps} decisions, {", ".join(WORKERS_CONFIGS)}; the C engine in '
+        f'{", ".join(map(str, WORKERS_COUNTS))} workers against the Python reference in one: '
+        f'{"; ".join(out["failures"]) or "identical"} ({out["episodes"]} lives ended; {out["seconds"]:.0f} s)')
+    return out
+
+
+def gate_policy(ctx, mode, log):
+    """The world set's pinned free-play checkpoint (GATE_POLICY): its sampled actions (PolicySource, seeded by the run's
+    key, one torch thread) played by both engines side by side (run, traced, as a case is) under its frozen plan's batch
+    (sim/gate.py FREE['plans']) on that plan's training pool and the pool's pack, GATE[mode]['free_policy'] runs; then,
+    in village-world-v2's set, the respawn-cycle life (RESPAWN_LIFE), which must play all its actions with no stop, no
+    divergence and no gap. Nothing is played, and the part fails, unless the checkpoint has its pinned sha256, the plan
+    names this world, the pool and archive are the plan's (its run's pool and tables sha256) and the pack opens on them
+    (its oracle, exporter, ids and recorded inputs); an error raised outside the runs (a load, a build) fails the part
+    with its words. The row holds the files it played with their sha256, a case's counts (compared: the decisions both
+    sides compared equal, over the runs), what the Python lives reached (PolicyCensus), the lives that ended by a death,
+    and the found life's run."""
+    import time
+    import torch
+    from sim.gate import FREE as STUDY, free_plan_world
+    t0, pinned = time.time(), GATE_POLICY[ctx.world]
+    plan = STUDY['plans'][pinned['plan']]
+    firsts, n, steps = GATE[mode]['free_policy']
+    v1 = ctx.world == GATE_WORLDS[0]
+    files = dict(checkpoint=pinned['checkpoint'], pool=pinned['pool'] if v1 else ctx.pool,
+                 pack=pinned['pack'] if v1 else ctx.pack_path, archive=ctx.archive)
+    batch = dict(xp_rate=plan['xp_rate'], muggers=plan['run']['muggers'], life=list(plan['run']['life']))
+    out = dict(id='policy', plan=pinned['plan'], batch=batch, firsts=list(firsts), worlds=n, decisions=steps,
+               files={k: dict(path=str(Path(v).absolute()), sha256=native.sha256_file(v) if Path(v).exists() else None)
+                      for k, v in files.items()},
+               runs=0, compared=0, world_decisions=0, ticks=0, episodes=0, deaths=0, divergences=0, gaps=0, stopped=[],
+               reports=[], census=None, most_objs=0, found_life=None, failures=[])
+    got = {k: v['sha256'] for k, v in out['files'].items()}
+    for name, want in (('checkpoint', pinned['sha256']), ('pool', plan['run']['pool']), ('archive', plan['run']['tables'])):
+        if got[name] != want:
+            out['failures'].append(f'the {name} {files[name]} has sha256 {got[name]}, not the pinned {want}')
+    if free_plan_world(plan) != ctx.world:
+        out['failures'].append(f"plan {pinned['plan']} is {free_plan_world(plan)}'s, not {ctx.world}'s")
+    if not out['failures']:  # the pack opens on these inputs (its oracle, exporter, ids and recorded inputs)
+        try:
+            native.open_pack(files['pack'], inputs=dict(tables=files['archive'], pool=files['pool']))
+        except (OSError, ValueError, RuntimeError) as error:
+            out['failures'].append(f"the pack {files['pack']} does not open on the plan's inputs: {error}"[:2000])
+    if not out['failures']:
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            _policy_play(ctx, out, files, batch, firsts, n, steps)
+        except Exception as error:  # a load or build error: the part fails with its words, as the workers part does
+            out['failures'].append(f'the play raised {type(error).__name__}: {error}'[:2000])
+        finally:
+            torch.set_num_threads(threads)
+    out['seconds'] = time.time() - t0
+    log(policy_line(out))
+    for report in out['reports']:
+        log(report)
+    return out
+
+
+def _policy_play(ctx, out, files, batch, firsts, n, steps):
+    """gate_policy's runs and the found life, counted into its row `out`."""
+    from sim.workers import load_tables
+    inputs = Inputs(pool=str(files['pool']), archive=str(files['archive']), task=native.FREE_TASK, against='native',
+                    pack=str(files['pack']), xp_rate=batch['xp_rate'], muggers=batch['muggers'],
+                    life=json.dumps(batch['life']))
+    tables = load_tables(inputs.archive)
+    census, deaths = PolicyCensus(tables), [0]
+    for k, first in enumerate(firsts):
+        key = k + 1
+        a, b = build(inputs, n, first=first, tables_=tables)
+
+        def observe(step, out_a, out_b, a=a):
+            if step >= 0:
+                done, terminal = np.asarray(out_a[3], bool), np.asarray(out_a[4]['terminal'])
+                deaths[0] += int((done & (terminal != 1)).sum())
+            for w, life in enumerate(a.env.tasks):
+                census.read(w, life)
+        result = run(a, b, PolicySource.load(str(files['checkpoint']), key), key, steps, repro=inputs.repro(key),
+                     observe=observe)
+        out['runs'] += 1
+        out['compared'] += compared_steps(result)
+        out['world_decisions'] += result.steps * result.worlds
+        for name in ('ticks', 'episodes'):
+            out[name] += getattr(result, name)
+        out['most_objs'] = max(out['most_objs'], result.most_objs)
+        if result.stopped:
+            out['stopped'].append(f'key {key} first {first}: {result.stopped}')
+        if result.gap:
+            out['gaps'] += 1
+            out['reports'].append(f'key {key} first {first}: not ported: {result.gap}')
+        if result.divergence is not None:
+            out['divergences'] += 1
+            out['reports'].append(result.divergence.text())
+        del a, b
+    out['census'], out['deaths'] = dict(census.counts), deaths[0]
+    if ctx.world == RESPAWN_LIFE['world']:
+        life = RESPAWN_LIFE
+        a, b = build(inputs, 1, first=life['slot'], tables_=tables)
+        result = run(a, b, Replay([[x] for x in life['actions']]), life['key'], len(life['actions']),
+                     episode=life['episode'], repro=inputs.repro(life['key']))
+        out['found_life'] = dict(key=life['key'], slot=life['slot'], episode=life['episode'],
+                                 actions=len(life['actions']), steps=result.steps, ticks=result.ticks,
+                                 stopped=result.stopped, gap=result.gap,
+                                 divergence=None if result.divergence is None else result.divergence.where)
+        if result.divergence is not None:
+            out['divergences'] += 1
+            out['reports'].append(result.divergence.text())
+        if result.gap:
+            out['gaps'] += 1
+        if result.divergence is not None or result.gap or result.stopped or result.steps != len(life['actions']):
+            out['failures'].append(
+                f"the respawn-cycle life (key {life['key']}, slot {life['slot']}, episode {life['episode']}) played "
+                f"{result.steps} of its {len(life['actions'])} actions: "
+                f"{result.stopped or result.gap or (result.divergence and result.divergence.where) or 'cut short'}"[:2000])
+
+
+def policy_line(row):
+    """The policy part's line (gate_policy, gate_summary)."""
+    found = row.get('found_life')
+    life = '' if found is None else (f"; the respawn-cycle life: {found['steps']} of {found['actions']} actions"
+                                     f"{', stopped' if found['stopped'] else ''}"
+                                     f"{', diverged at ' + found['divergence'] if found['divergence'] else ''}"
+                                     f"{', a gap' if found['gap'] else ''}")
+    checkpoint = row['files']['checkpoint']
+    return (f"[gate] policy: {row['plan']} {Path(checkpoint['path']).name} ({str(checkpoint['sha256'])[:16]}) on "
+            f"{Path(row['files']['pool']['path']).name}: {row['runs']} runs, {row['world_decisions']} world decisions "
+            f"({row['compared']} of {row['runs'] * row['decisions']} decisions compared), {row['ticks']} ticks, "
+            f"{row['episodes']} lives ended ({row['deaths']} deaths), {row['divergences']} divergences, {row['gaps']} "
+            f"gaps, {len(row['stopped'])} stopped alike{life}; "
+            f"{'; '.join(row['failures']) or 'no failure'} ({row.get('seconds', 0):.0f} s)")
 
 
 def soak_selected(key, slot, episode):
@@ -1790,18 +2368,22 @@ class SoakReplays:
     def __init__(self, ctx):
         self.ctx, self.canon = ctx, Canon(PackStrings(ctx.pack))
         self.envs = {}
-        self.replayed = self.divergences = self.gaps = self.mismatches = 0
+        self.replayed = self.divergences = self.gaps = self.mismatches = self.most_objs = 0
         self.stopped, self.reports = [], []
 
-    def replay(self, task, key, slot, episode, actions, recorded=None):
+    def replay(self, task, key, slot, episode, actions, recorded=None, goals='all'):
+        """goals: free-play-v1's FREE_CONFIGS name (its settings), 'all' for a goal task."""
         from sim.vec import CpuBatch
         from sim.combat import task_spec
         ctx = self.ctx
-        if task not in self.envs:
-            self.envs[task] = CpuBatch(ctx.tables, ctx.layouts, 1, derived=ctx.derived, task=task,
-                                       search=ctx.search if task_spec(task)['search'] else None)
-        a = PythonSide(retarget(self.envs[task], slot), canon=self.canon)
-        b = NativeSide(native.NativeBatch(ctx.pack, 1, first=slot, task=task))
+        k = (task, goals)
+        if k not in self.envs:
+            self.envs[k] = CpuBatch(ctx.tables, ctx.layouts, 1, derived=ctx.derived, task=task, world=ctx.world,
+                                    **FREE_ALL[goals]) \
+                if task == native.FREE_TASK else CpuBatch(ctx.tables, ctx.layouts, 1, derived=ctx.derived, task=task,
+                                                          search=ctx.search if task_spec(task)['search'] else None)
+        a = PythonSide(retarget(self.envs[k], slot), canon=self.canon)
+        b = NativeSide(ctx.batch(task, goals, 1, first=slot))
         differs = []
 
         def observe(step, out_a, out_b):
@@ -1811,8 +2393,9 @@ class SoakReplays:
             if mine != recorded[step + 1]:
                 differs.append(step)
         result = run(a, b, Replay([[x] for x in actions]), key, len(actions), episode=episode,
-                     repro=ctx.inputs(task, 'all').repro(key), observe=observe)
+                     repro=ctx.inputs(task, goals).repro(key), observe=observe)
         self.replayed += 1
+        self.most_objs = max(self.most_objs, result.most_objs)
         if result.divergence is not None:
             self.divergences += 1
             self.reports.append(result.divergence.text())
@@ -1835,15 +2418,23 @@ def gate_soak(ctx, mode, log):
     (NativeBatch.step), every exception and unsupported world recorded and its episode replayed in Python, and 1 in
     SOAK_EVERY episodes (soak_selected) replayed in Python from its start and action log (SoakReplays)."""
     import time
-    target = GATE[mode]['soak']
-    segments = [(task, source) for task in GATE_TASKS for source in SOAK_SOURCES]
-    per = -(-target // len(segments))
+    target, free_target = GATE[mode]['soak'], GATE[mode]['free_soak']
+    v1 = ctx.world == GATE_WORLDS[0]
+    segments = [(task, 'all', source) for task in GATE_TASKS for source in SOAK_SOURCES] if v1 else []
+    target = target if v1 else 0  # village-world-v2's set: free play alone
+    per = -(-target // len(segments)) if segments else 0
+    # free-play-v1's own segments (added on 12 November; the goal tasks' share is as it was): biased play on its short
+    # configurations, which replay quickly, and their own world-tick target
+    free = [(native.FREE_TASK, name, 'biased') for name in (FREE_CONFIGS if v1 else FREE_CONFIGS_V2) if name not in FREE_LONG]
+    free_per = -(-free_target // len(free)) if free_target else 0
     replays = SoakReplays(ctx)
     t0 = time.time()
-    out = dict(id='soak', target=target, ticks=0, decisions=0, episodes=0, errors=[], unsupported=[], segments=[])
-    for index, (task, spec) in enumerate(segments):
-        batch, key, ticks, t1 = native.NativeBatch(ctx.pack, SOAK_N, task=task, threads=ctx.threads), \
-            SOAK_KEY + 1000 * index, 0, time.time()
+    out = dict(id='soak', target=target, free_target=free_target, ticks=0, free_ticks=0, decisions=0, episodes=0,
+               errors=[], unsupported=[], segments=[])
+    for index, (task, goals, spec) in enumerate(segments + (free if free_per else [])):
+        if task == native.FREE_TASK:
+            per = free_per
+        batch, key, ticks, t1 = ctx.batch(task, goals, SOAK_N, threads=ctx.threads), SOAK_KEY + 1000 * index, 0, time.time()
         slots, episodes0 = np.arange(SOAK_N), out['episodes']
         while ticks < per and len(out['errors']) + len(out['unsupported']) < SOAK_FAILURES:
             source = FastBiased(key) if spec == 'biased' else ctx.source(spec, key)
@@ -1864,15 +2455,15 @@ def gate_soak(ctx, mode, log):
                     out['errors'].append(f'{task} {spec} key {key} step {step} world {world}: '
                                          f'{type(error).__name__}: {error}')
                     if 0 <= world < SOAK_N:
-                        replays.replay(task, key, world, episodes[world], actions[world])
+                        replays.replay(task, key, world, episodes[world], actions[world], goals=goals)
                     break
                 step += 1
                 ticks += int(info['decision_ticks'].sum())
                 out['decisions'] += SOAK_N
                 for b in np.flatnonzero(info['unsupported']):
                     reason = next((e['reason'] for e in reversed(batch.evidence) if e['world'] == b), '?')
-                    out['unsupported'].append(f'{task} {spec} key {key} world {b} episode {episodes[b]}: {reason}')
-                    replays.replay(task, key, int(b), episodes[b], actions[b])
+                    out['unsupported'].append(f'{task} {goals} {spec} key {key} world {b} episode {episodes[b]}: {reason}')
+                    replays.replay(task, key, int(b), episodes[b], actions[b], goals=goals)
                 if info['unsupported'].any():
                     break
                 for b in range(SOAK_N):
@@ -1881,21 +2472,22 @@ def gate_soak(ctx, mode, log):
                 for b in np.flatnonzero(done):
                     out['episodes'] += 1
                     if recorded[b] is not None:
-                        replays.replay(task, key, int(b), episodes[b], actions[b], recorded[b])
+                        replays.replay(task, key, int(b), episodes[b], actions[b], recorded[b], goals=goals)
                     actions[b] = []
                     recorded[b] = [world_digest(obs, None, None, None, b)] if soak_selected(key, b, episodes[b] + 1) \
                         else None
                 starts = done
             key += 1
-        out['ticks'] += ticks
-        out['segments'].append(dict(task=task, source=spec, ticks=ticks, episodes=out['episodes'] - episodes0,
+        out['free_ticks' if task == native.FREE_TASK else 'ticks'] += ticks
+        out['segments'].append(dict(task=task, goals=goals, source=spec, ticks=ticks, episodes=out['episodes'] - episodes0,
                                     seconds=round(time.time() - t1, 1)))
-        log(f'[gate] soak {task} {spec}: {ticks} ticks, {out["episodes"] - episodes0} episodes, '
+        log(f'[gate] soak {task} {goals} {spec}: {ticks} ticks, {out["episodes"] - episodes0} episodes, '
             f'{replays.replayed} replayed so far ({time.time() - t1:.0f} s)')
     out.update(replayed=replays.replayed, divergences=replays.divergences, gaps=replays.gaps,
                mismatches=replays.mismatches, stopped=replays.stopped, reports=replays.reports,
-               seconds=time.time() - t0)
-    log(f'[gate] soak: {out["ticks"]} ticks, {out["decisions"]} world decisions, {out["episodes"]} episodes, '
+               most_objs=replays.most_objs, seconds=time.time() - t0)  # most_objs: over the replayed episodes
+    log(f'[gate] soak: {out["ticks"]} ticks (free play {out["free_ticks"]}), {out["decisions"]} world decisions, '
+        f'{out["episodes"]} episodes, '
         f'{len(out["errors"])} errors, {len(out["unsupported"])} unsupported, {out["replayed"]} replayed: '
         f'{out["divergences"]} divergences, {out["gaps"]} gaps, {out["mismatches"]} output mismatches '
         f'({out["seconds"]:.0f} s)')
@@ -1904,82 +2496,583 @@ def gate_soak(ctx, mode, log):
     return out
 
 
+# ---- free-play-v1's soak in the C engine (the reachability soak in each engine) ------------------------------------
+# Random legal play and sim/free.py's controls on free-play lives of village-world-v1 Stage A, each run in lockstep
+# with the Python reference through `run`: every decision's outputs and every tick's record, draws and events compared.
+# A divergence, a gap or an unsupported world ends its run there; it is reported with its evidence, never dropped.
+FREE_SOAK_CONTROLS = ('wood', 'fish', 'mine', 'melee', 'chickens', 'rotation@1500', 'rotation@9000')
+_SOAK_INPUTS = {}
+
+
+def free_soak_run(job):
+    """One soak run: job (pack, pool, archive, muggers, xp_rate, life, source, key, worlds, steps) -> its JSONL row."""
+    import time
+    from sim.vec import CpuBatch
+    from sim.workers import load_tables
+    from sim.world import load_pool
+    pack_path, pool, archive, muggers, xp_rate, life, source, key, worlds, steps = job
+    if (pack_path, pool, archive) not in _SOAK_INPUTS:  # the pack's recorded archive and pool must be these
+        _SOAK_INPUTS[pack_path, pool, archive] = (load_tables(archive), load_pool(pool)[0],
+                                                  native.open_pack(pack_path, inputs=dict(tables=archive, pool=pool)))
+    tables, layouts, pack = _SOAK_INPUTS[pack_path, pool, archive]
+    t0 = time.time()
+    settings = dict(xp_rate=xp_rate, muggers=muggers, life=tuple(life))
+    env = CpuBatch(tables, layouts, worlds, task=native.FREE_TASK, **settings)
+    a = PythonSide(env, canon=Canon(PackStrings(pack)))
+    b = NativeSide(native.NativeBatch(pack, worlds, task=native.FREE_TASK, **settings))
+    name, _, period = source.partition('@')
+    play = RandomLegal(key) if name == 'random' else ControlSource(a, [name], key, int(period) if period else None)
+    ends = dict(horizon=0, death=0, ticks=0, events=0)
+    seen = [0] * worlds
+    census, played = FreeCensus(tables), set()
+
+    def observe(step, out_a, out_b):
+        if step >= 0:
+            done, info = out_a[3], out_a[4]
+            for w in np.flatnonzero(done):
+                ends['horizon' if info['terminal'][w] == 1 else 'death'] += 1
+                ends['ticks'] = max(ends['ticks'], int(info['episode_ticks'][w]))
+                ends['events'] = max(ends['events'], seen[w])
+        for w, task in enumerate(env.tasks):
+            seen[w] = len(task.world.events) - task.event_start
+            census.read(w, task)
+        played.update(s['layout'] for s in env.starts if s is not None)
+    result = run(a, b, play, key, steps, observe=observe)
+    return dict(form='muggers' if muggers else 'none', world=env.world, layouts=sorted(played), census=census.counts,
+                xp_rate=xp_rate, life=list(life), source=source, key=key, worlds=worlds, steps=result.steps, world_decisions=result.steps * result.worlds, ticks=result.ticks,
+                lives=result.episodes, horizons=ends['horizon'], deaths=ends['death'], longest=ends['ticks'],
+                most_events=max([ends['events'], *seen]), most_objs=result.most_objs,
+                divergence=None if result.divergence is None else result.divergence.text(), gap=result.gap or None,
+                stopped=result.stopped or None, seconds=round(time.time() - t0, 1))
+
+
+class FreeCensus:
+    """What a free-play run's Python lives reached (read(b, task) after each step, world slot b's life now): picks and
+    the Picks refused on a full inventory (their message), willow and yew logs, pen door openings (a step that finds a
+    door open which the last step found closed) and the steps with one open, the highwayman's hits on the player, the
+    player's on it and its defeats, and the black cape (its drop) picked up and worn; a coverage count, not an output of
+    either engine. A life that ended in a step (CpuBatch starts the next one in it) is read to its end first, so its last
+    decision counts (a lethal hit, say)."""
+
+    def __init__(self, tables):
+        self.counts = dict(picks=0, pick_full=0, willow_yew_logs=0, door_openings=0, door_open_steps=0,
+                           highwayman_damage=0, highwayman_hits=0, highwayman_defeated=0, cape_pickups=0, cape_worn=0)
+        self.slots = {}  # world slot: (its life's World, events read, chat lines read, a pen door open at the last read)
+        self.logs = {tables.obj_ids[name] for name in ('willow_logs', 'yew_logs') if name in tables.obj_ids}
+        self.cape = tables.obj_ids.get('black_cape')
+        self.cross = {k for k, v in tables.loc_types.items() if v['debugname'] == 'poordoor_cross'}
+        self.hunter = {k for k, v in tables.npc_types.items() if v['debugname'] == 'highwayman'}
+        self.full = None  # the full-inventory messages of the archive's plants (pick: pick_full_<plant>)
+
+    def read(self, b, task):
+        w, c = task.world, self.counts
+        last, seen, said, was_open = self.slots.get(b, (None, 0, 0, False))
+        if last is not None and last is not w:
+            self._events(last, seen, said)
+            seen, said, was_open = 0, 0, False
+        self._events(w, seen, said)
+        now_open = any(loc.active and loc.type in self.cross for row in w.loc_at.values() for loc in row)
+        c['door_open_steps'] += now_open
+        c['door_openings'] += now_open and not was_open
+        self.slots[b] = (w, len(w.events), len(w.chat_log), now_open)
+
+    def _events(self, w, seen, said):
+        from sim.engine import WORN
+        c = self.counts
+        if self.full is None:
+            plants = (w.t.meta.get('content') or {}).get('picks') or {}
+            self.full = {w.text(f'pick_full_{name}') for name in plants}
+        c['pick_full'] += sum(text in self.full for _, text in w.chat_log[said:])
+        hunters = {n.nid for n in w.npcs if n.type in self.hunter}
+        for _, kind, d in w.events[seen:]:
+            if kind == 'produce':
+                c['picks'] += d.get('script') == '[proc,pickup_loc_floor]'
+                c['willow_yew_logs'] += d.get('obj') in self.logs
+            elif kind == 'hit':
+                c['highwayman_hits'] += d.get('type') in self.hunter
+            elif kind == 'npc_defeated':
+                c['highwayman_defeated'] += d.get('type') in self.hunter
+            elif kind == 'agent_hp':
+                c['highwayman_damage'] += d.get('cause') == 'damage' and d.get('source') in hunters
+            elif kind == 'pickup':
+                c['cape_pickups'] += self.cape is not None and d.get('obj') == self.cape
+            elif kind == 'transfer':
+                c['cape_worn'] += self.cape is not None and d.get('dst') == WORN and d.get('obj') == self.cape
+
+
+class PolicyCensus(FreeCensus):
+    """FreeCensus with what a policy's play reached in either world (the policy part, gate_policy): the agent's hits and
+    the npcs it defeated, its productions, XP events and level-ups (an xp event that raised the stat's level, which
+    queues its dialog)."""
+
+    def __init__(self, tables):
+        super().__init__(tables)
+        self.counts.update(agent_hits=0, agent_defeats=0, productions=0, xp_events=0, level_ups=0)
+
+    def _events(self, w, seen, said):
+        from sim.engine import level_for
+        super()._events(w, seen, said)
+        c = self.counts
+        for _, kind, d in w.events[seen:]:  # the world's one player is the agent: a hit or defeat with a source is its
+            if kind == 'hit':
+                c['agent_hits'] += d.get('source') is not None
+            elif kind == 'npc_defeated':
+                c['agent_defeats'] += d.get('source') is not None
+            elif kind == 'produce':
+                c['productions'] += 1
+            elif kind == 'xp':
+                c['xp_events'] += 1
+                c['level_ups'] += level_for(d['after']) > level_for(d['before'])
+
+
+def free_soak(output, pack, pool, archive, jobs, processes):
+    """Run the jobs (free_soak_run) on `processes` processes; lives.jsonl gets one row a run in completion order and
+    manifest.json the settings, counts and times, with the commit (marked -dirty for a changed tree), the native library's
+    file (its tag digests the C source, the generated header, the flags and the interpreter) and the pack's sha256.
+    Returns the manifest."""
+    import multiprocessing as mp
+    import time
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False)
+    t0, rows = time.time(), []
+    with (output / 'runs.jsonl').open('w') as stream, mp.get_context('spawn').Pool(processes) as workers:
+        for row in workers.imap_unordered(free_soak_run, [(str(pack), str(pool), str(archive), *job) for job in jobs]):
+            stream.write(json.dumps(row) + '\n')
+            stream.flush()
+            rows.append(row)
+            print(f"[free-soak] {row['form']} {row['source']} key {row['key']}: {row['world_decisions']} world decisions, "
+                  f"{row['ticks']} ticks, {row['lives']} lives ({row['horizons']} cut, {row['deaths']} deaths), "
+                  f"{'DIVERGED' if row['divergence'] else row['gap'] or row['stopped'] or 'equal'} "
+                  f"({row['seconds']:.0f} s)", flush=True)
+    counts = {}
+    for row in rows:
+        c = counts.setdefault(f"{row['form']}/{row['source']}", dict(runs=0, world_decisions=0, ticks=0, lives=0,
+                                                                     horizons=0, deaths=0, divergences=0, gaps=0,
+                                                                     stopped=0, longest=0, most_events=0,
+                                                                     most_objs=0))
+        for k in ('world_decisions', 'ticks', 'lives', 'horizons', 'deaths'):
+            c[k] += row[k]
+        c['runs'] += 1
+        c['divergences'] += row['divergence'] is not None
+        c['gaps'] += row['gap'] is not None
+        c['stopped'] += row['stopped'] is not None
+        c['longest'], c['most_events'] = max(c['longest'], row['longest']), max(c['most_events'], row['most_events'])
+        c['most_objs'] = max(c['most_objs'], row['most_objs'])
+        c['census'] = {k: c.get('census', {}).get(k, 0) + v for k, v in row['census'].items()}
+        c['layouts'] = sorted(set(c.get('layouts', [])) | set(row['layouts']))
+    manifest = dict(version='free-soak', commit=_commit(), library=native.library()[0].name, pack=str(pack),
+                    pack_sha256=native.sha256_file(pack), pool=str(pool), archive=str(archive), worlds=sorted({row['world'] for row in rows}),
+                    processes=processes, jobs=[list(j) for j in jobs], wall_seconds=round(time.time() - t0, 1),
+                    counts=counts)
+    (output / 'manifest.json').write_text(json.dumps(manifest, indent=1) + '\n')
+    return manifest
+
+
+def free_soak_jobs(none_random, none_controls, muggers_random, muggers_controls, worlds, xp_rate, life, key0):
+    """The soak's runs: (muggers, xp_rate, life, source, key, worlds, steps); *_random: (runs, steps), *_controls:
+    (runs a control, steps), each run its own key from key0 on."""
+    jobs, key = [], key0
+    for muggers, (runs, steps), (control_runs, control_steps) in ((False, none_random, none_controls),
+                                                                 (True, muggers_random, muggers_controls)):
+        for _ in range(runs):
+            jobs.append((muggers, xp_rate, life, 'random', key, worlds, steps))
+            key += 1
+        for name in FREE_SOAK_CONTROLS:
+            for _ in range(control_runs):
+                jobs.append((muggers, xp_rate, life, name, key, worlds, control_steps))
+                key += 1
+    return jobs
+
+
+def free_soak_arguments(parser):
+    logs = native.ROOT / 'logs'
+    parser.add_argument('--pack', required=True, help='the pack of --pool (sim.native export)')
+    parser.add_argument('--pool', required=True, help='a pool of one village world: compact-world-v1 or village-world-v2 '
+                        '(its layouts; derived tables unused); village-world-v2 holds no muggers (--muggers-* 0,0)')
+    parser.add_argument('--archive', default=str(logs / 'sim/data/draynor-nc1.npz'),
+                        help='the archive of the pack (village-world-v2: draynor-nc2.npz)')
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--xp-rate', type=int, default=1)
+    parser.add_argument('--life', default='["fixed", 36000]')
+    parser.add_argument('--worlds', type=int, default=8)
+    parser.add_argument('--key', type=int, default=500_000, help='the first run\'s key (each run its own)')
+    for name, default in (('none-random', '12,4000'), ('none-controls', '2,6000'), ('muggers-random', None),
+                          ('muggers-controls', None)):
+        parser.add_argument(f'--{name}', default=default, help='runs,steps (controls: runs a control,steps); the mugger '
+                            "runs' default: 4,1500 and 1,1500 in a world with muggers, 0,0 in one without")
+    parser.add_argument('--processes', type=int, default=6)
+
+
+def free_soak_main(args):
+    from sim.combat import village_of
+    from sim.world import load_pool
+    pair = lambda text: tuple(int(v) for v in text.split(','))
+    village = village_of(load_pool(args.pool)[0][0])
+    muggers = village is not None and village.get('muggers') is not False
+    defaults = dict(muggers_random='4,1500', muggers_controls='1,1500') if muggers else \
+        dict(muggers_random='0,0', muggers_controls='0,0')
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+        elif not muggers and pair(getattr(args, name))[0]:
+            raise SystemExit(f"{village['version'] if village else args.pool} holds no muggers: --{name.replace('_', '-')} "
+                             'runs must be 0')
+    jobs = free_soak_jobs(pair(args.none_random), pair(args.none_controls), pair(args.muggers_random),
+                          pair(args.muggers_controls), args.worlds, args.xp_rate, json.loads(args.life), args.key)
+    manifest = free_soak(args.output, args.pack, args.pool, args.archive, jobs, args.processes)
+    bad = sum(c['divergences'] + c['gaps'] + c['stopped'] for c in manifest['counts'].values())
+    for name, c in manifest['counts'].items():
+        print(f"[free-soak] {name}: {c['runs']} runs, {c['world_decisions']} world decisions, {c['ticks']} ticks, "
+              f"{c['lives']} lives ({c['horizons']} cut, {c['deaths']} deaths; longest {c['longest']} ticks, most "
+              f"events {c['most_events']}, most ground objs {c['most_objs']}), {c['divergences']} divergences, "
+              f"{c['gaps']} gaps, {c['stopped']} stopped; {len(c['layouts'])} layouts; reached {c['census']}")
+    print(f"[free-soak] {'CLEAN' if bad == 0 else 'NOT CLEAN'} in {manifest['wall_seconds']:.0f} s")
+    sys.exit(0 if bad == 0 else 1)
+
+
 # ---- the gate's command line -------------------------------------------------------------------------------------
 def _commit():
+    """HEAD's commit, with '-dirty' when a tracked file differs from it; 'unknown' outside a checkout (or without git)."""
     import subprocess
     try:
-        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=native.ROOT, capture_output=True, text=True,
-                              timeout=10).stdout.strip()
+        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=native.ROOT, capture_output=True, text=True, timeout=10)
         dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=native.ROOT,
-                               capture_output=True, text=True, timeout=10).stdout.strip()
+                               capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return 'unknown'
-    return head + ('-dirty' if dirty else '')
+    if head.returncode or dirty.returncode or not COMMIT.fullmatch(head.stdout.strip()):
+        return 'unknown'
+    return head.stdout.strip() + ('-dirty' if dirty.stdout.strip() else '')
+
+
+COMMIT = re.compile(r'[0-9a-f]{40}')  # a gate's rows are of one such commit, clean (gate_summary)
+
+
+# run()'s stops (Result.stopped, in a case row's `stopped` or a soak replay's): an unsupported world, flagged alike or
+# raised alike by a setup, passes; any other exception both sides raised alike stopped the run before its decisions.
+STOP = re.compile(r'both sides raised (\w+) at step -?\d+: |world slot \d+ reached unsupported content at step ')
+
+
+def unsupported_stop(text):
+    """Whether a stop is an unsupported world's (the gate passes it; every other stop alike fails the gate)."""
+    from sim.engine import Unsupported
+    found = STOP.search(text)
+    if found is None:
+        raise ValueError(f'not a stop of run(): {text[:200]}')
+    if found.group(1) is None:
+        return True
+    names, todo = set(), [Unsupported]
+    while todo:
+        cls = todo.pop()
+        names.add(cls.__name__)
+        todo += cls.__subclasses__()
+    return found.group(1) in names
 
 
 def gate_clean(rows):
-    """(clean, divergences, gaps): every case, the digests, the thread check and the soak passed."""
-    divergences = gaps = 0
+    """(clean, divergences, gaps, halted, empty): every case, the digests or the training workers, the thread check, the
+    soak and the policy part (no failure: its pins and the respawn-cycle life) passed; halted: the runs and replays that
+    stopped alike on an exception other than an unsupported world's (unsupported_stop), whose remaining decisions were
+    never compared; empty: the cases and policy parts that compared no decision (every run stopped before one, or a row
+    without the count), which fail the gate too."""
+    divergences = gaps = halted = 0
+    empty = []
     clean = True
     for row in rows:
-        if row['id'] in ('digests', 'threads'):
+        if row['id'] in ('digests', 'threads', 'workers'):
             clean &= not row['failures']
-        elif row['id'] == 'soak':
+            continue
+        if row['id'] == 'policy':
+            clean &= not row['failures']
+        if ('task' in row or row['id'] == 'policy') and not row.get('compared'):
+            empty.append(row['id'])
+        halted += sum(not unsupported_stop(text) for text in row.get('stopped') or [])
+        if row['id'] == 'soak':
             divergences += row['divergences'] + row['mismatches']
             gaps += row['gaps']
             # an unsupported world passes when its replay flags it alike (a replay that does not is a divergence)
-            clean &= not row['errors'] and row['ticks'] >= row['target']
+            clean &= not row['errors'] and row['ticks'] >= row['target'] and row.get('free_ticks', 0) >= row.get('free_target', 0)
         else:
             divergences += row['divergences']
             gaps += row['gaps']
-    return clean and divergences == 0 and gaps == 0, divergences, gaps
+    clean = clean and divergences == 0 and gaps == 0 and halted == 0 and not empty
+    return clean, divergences, gaps, halted, empty
 
 
-def gate_summary(rows, log):
-    """The table per task (and goal set), source and scenario, summed over first slots, and the totals."""
+def gate_expected(mode, shard=(0, 1), only=None, world=GATE_WORLDS[0], parts=None):
+    """The row ids a gate run writes: with the cases part, the cases (gate_cases) of its world set's shard's
+    configurations (gate_configs, index % k == i), and the set's other parts in this mode (gate_parts) that `parts`
+    names (default: every part), each that `only` matches."""
+    i, k = shard
+    parts = PARTS if parts is None else parts
+    pattern = re.compile(only) if only else None
+    ids = [case_id(task, goals, first, source, scenario)
+           for index, (task, goals, first) in enumerate(gate_configs(mode, world))
+           if index % k == i for source, scenario in gate_cases(task, goals)] if 'cases' in parts else []
+    ids += [name for name in gate_parts(mode, world) if name in parts]
+    return {name for name in ids if pattern is None or pattern.search(name)}
+
+
+def claimed_cases(rows, parts=None):
+    """The row ids a merged set of result rows claims: its mode's whole gate of its world set, cases and parts (a row
+    that names no world is village-world-v1's, as every row before the world sets), or, when every row comes from an
+    --only rerun, the cases and parts its patterns match; `parts` narrows the claim to the parts named (gate --summary
+    --parts: a merge that leaves a part out on purpose). None when the rows hold no mode, more than one, or more than one
+    world set."""
+    modes = {row.get('mode') for row in rows}
+    worlds = {row.get('world', GATE_WORLDS[0]) for row in rows}
+    if len(modes) != 1 or None in modes or len(worlds) != 1:
+        return None
+    mode, world = modes.pop(), worlds.pop()
+    patterns = {row.get('only') for row in rows}
+    if None in patterns:
+        return gate_expected(mode, world=world, parts=parts)
+    return set().union(*(gate_expected(mode, only=pattern, world=world, parts=parts) for pattern in patterns))
+
+
+def provenance_key(provenance):
+    """A provenance's identity: all of it but the files' paths (each file is its sha256; a path is where it lay)."""
+    if not provenance:
+        return provenance
+    files = {name: {k: v for k, v in entry.items() if k != 'path'} for name, entry in (provenance.get('files') or {}).items()}
+    return json.dumps(dict(provenance, files=files), sort_keys=True)
+
+
+def provenance_problems(rows):
+    """Why the rows are not of one gate's inputs: each row must carry the same provenance (gate_provenance, compared
+    without its paths: provenance_key) that names their world set, and the pack must record the archive, pool and supply
+    pool the rows played ([] when they are)."""
+    found = {provenance_key(row.get('provenance')) for row in rows}
+    if len(found) != 1:
+        return [f'the rows name {len(found)} sets of inputs (provenance), not one']
+    given = rows[0].get('provenance')
+    if not given:
+        return ['the rows name no inputs (provenance)']
+    problems = []
+    if given.get('world') != rows[0].get('world', GATE_WORLDS[0]):
+        problems.append(f"the inputs are of {given.get('world')}, the rows of {rows[0].get('world', GATE_WORLDS[0])}")
+    files, recorded = given.get('files') or {}, given.get('pack_inputs') or {}
+    for name, key in (('archive', 'tables'), ('pool', 'pool'), ('supply', 'supply_pool')):
+        if recorded.get(key) != (files.get(name) or {}).get('sha256'):
+            problems.append(f'the pack records another {key} than the {name} the rows played')
+    return problems
+
+
+def gate_summary(rows, log, expected=None, parts=None):
+    """The table per task (and goal set), source and scenario, summed over first slots, free play's census, and the
+    totals. Clean only when gate_clean holds, the rows hold every expected row id (cases and parts) and no other of their
+    mode's gate (expected: a run's own ids, gate_expected; None: those the rows claim, claimed_cases, narrowed to `parts`
+    when given), and, when there are rows, they are all of one clean commit (40 hex digits, not '-dirty', not 'unknown')
+    and of one set of inputs (provenance_problems)."""
     groups = OrderedDict()
     for row in rows:
         if 'task' not in row:
             continue
         k = (row['task'], row['goals'], row['source'], row['scenario'] or '-')
-        g = groups.setdefault(k, dict(firsts=[], runs=0, decisions=0, world_decisions=0, ticks=0, episodes=0,
-                                      divergences=0, gaps=0, stopped=0))
+        g = groups.setdefault(k, dict(firsts=[], runs=0, decisions=0, compared=0, world_decisions=0, ticks=0, episodes=0,
+                                      divergences=0, gaps=0, stopped=0, objs=None))
         g['firsts'].append(row['first'])
         for name in ('runs', 'decisions', 'world_decisions', 'ticks', 'episodes', 'divergences', 'gaps'):
             g[name] += row[name]
+        g['compared'] += row.get('compared') or 0
         g['stopped'] += len(row['stopped'])
-    log('| task | goals | source | scenario | firsts | runs | decisions | world decisions | ticks | episodes | '
-        'divergences | gaps | stopped alike |')
-    log('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+        if 'most_objs' in row:
+            g['objs'] = max(g['objs'] or 0, row['most_objs'])
+    log('| task | goals | source | scenario | firsts | runs | decisions | compared | world decisions | ticks | episodes | '
+        'divergences | gaps | stopped alike | most ground objs |')
+    log('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
     for (task, goals, source, scenario), g in groups.items():
         log(f'| {task} | {goals} | {source} | {scenario} | {",".join(map(str, sorted(g["firsts"])))} | {g["runs"]} | '
-            f'{g["decisions"]} | {g["world_decisions"]} | {g["ticks"]} | {g["episodes"]} | {g["divergences"]} | '
-            f'{g["gaps"]} | {g["stopped"]} |')
-    clean, divergences, gaps = gate_clean(rows)
-    commits = sorted({row.get('commit', '?') for row in rows})
+            f'{g["decisions"]} | {g["compared"]} | {g["world_decisions"]} | {g["ticks"]} | {g["episodes"]} | '
+            f'{g["divergences"]} | {g["gaps"]} | {g["stopped"]} | {"-" if g["objs"] is None else g["objs"]} |')
+    free = [row for row in rows if row.get('task') == native.FREE_TASK]
+    if free:  # what free play's Python lives reached over the cases (FreeCensus), and the deaths
+        census = {}
+        for row in free:
+            for name, count in (row.get('census') or {}).items():
+                census[name] = census.get(name, 0) + count
+        log(f'[gate] free play reached: {", ".join(f"{k} {v}" for k, v in census.items()) or "no census"}; deaths '
+            f'{sum(row.get("deaths") or 0 for row in free)}')
+    for row in rows:
+        if row['id'] == 'policy' and 'files' in row:  # the policy part's line and what its Python lives reached
+            log(policy_line(row))
+            if row.get('census'):
+                log(f'[gate] policy reached: {", ".join(f"{k} {v}" for k, v in row["census"].items())}; deaths '
+                    f'{row.get("deaths") or 0}')
+    clean, divergences, gaps, halted, empty = gate_clean(rows)
+    modes = {(row.get('mode'), row.get('world', GATE_WORLDS[0])) for row in rows}
+    ids = {row['id'] for row in rows}
+    claim = ''
+    if expected is None and parts is not None and len(modes) == 1:  # a merge that names its parts claims no other
+        mode, world = next(iter(modes))
+        foreign = sorted(set(parts) - {'cases', *(gate_parts(mode, world) if mode in GATE and world in GATE_WORLDS else [])})
+        left = [p for p in ['cases', *gate_parts(mode, world)] if p not in parts] if mode in GATE and world in GATE_WORLDS \
+            else []
+        if foreign:
+            log(f'[gate] --parts names parts that {world} {mode} does not have: {foreign}')
+            clean = False
+        claim = f'; claims {", ".join(parts)}' + (f' (leaves out {", ".join(left)})' if left else '')
+    reruns = sorted({str(row.get('only')) for row in rows if row.get('only') is not None})
+    if reruns and all(row.get('only') is not None for row in rows):
+        claim += f'; a rerun of {reruns}'
+    expected = claimed_cases(rows, parts) if expected is None else expected
+    declared = set().union(*(gate_expected(mode, world=world) for mode, world in modes
+                             if mode in GATE and world in GATE_WORLDS))
+    missing, undeclared = sorted((expected or set()) - ids), sorted(ids - declared)
+    if expected is None:
+        log(f'[gate] the rows are of modes and worlds {sorted(map(str, modes))}, not of one gate')
+    for name in missing[:20]:
+        log(f'[gate] missing: {name}')
+    for name in undeclared[:20]:
+        log(f'[gate] undeclared: {name}')
+    for name in empty[:20]:
+        log(f'[gate] compared no decision: {name}')
+    commits = sorted({str(row.get('commit')) for row in rows})
+    one_commit = not rows or (len(commits) == 1 and COMMIT.fullmatch(commits[0]) is not None)
+    if not one_commit:
+        log(f'[gate] the rows are not of one clean commit: {commits[:5]}')
+    problems = provenance_problems(rows) if rows else []
+    for line in problems:
+        log(f'[gate] inputs: {line}')
+    if rows and not problems:
+        given = rows[0]['provenance']
+        pack, env = given['files']['pack'], given.get('env') or {}
+        log(f"[gate] inputs: {given['world']}, pack {Path(pack['path']).name} {pack['sha256'][:16]}, library "
+            f"{given['library']}{''.join(f', {k}={v}' for k, v in env.items())}")
+    clean = clean and expected is not None and not missing and not undeclared and one_commit and not problems
+    objs = [row['most_objs'] for row in rows if 'most_objs' in row]
     log(f'[gate] {len(rows)} rows, commits {commits}: {"CLEAN" if clean else "NOT CLEAN"}, {divergences} divergences, '
-        f'{gaps} gaps')
+        f'{gaps} gaps, {halted} stopped on an exception, {len(empty)} compared nothing, {len(missing)} of '
+        f'{len(expected or ())} rows missing, {len(undeclared)} undeclared; most ground objs '
+        f'{max(objs) if objs else "-"} of RS_MAX_OBJS {native.load().constants()["RS_MAX_OBJS"]}{claim}')
     return clean
 
 
 def gate_arguments(parser):
     logs = native.ROOT / 'logs'
     parser.add_argument('--quick', action='store_true', help='the fixed quick subset (about 15 minutes, no soak)')
-    parser.add_argument('--archive', default=str(logs / 'sim/data/draynor-nc1.npz'))
-    parser.add_argument('--pool', default=str(logs / 'sim/world/train-8-nc1-derived.npz'))
+    parser.add_argument('--world', default=GATE_WORLDS[0], choices=GATE_WORLDS,
+                        help='the world set: village-world-v1 (the goal tasks and its free play: the gate) or '
+                        'village-world-v2 (its free play alone, an opt-in set of its own; its inputs default to '
+                        'GATE_INPUTS_V2)')
+    parser.add_argument('--archive', help='default: draynor-nc1.npz (village-world-v2: draynor-nc2.npz)')
+    parser.add_argument('--pool', help='default: train-8-nc1-derived.npz (village-world-v2: train-128-20000-v2.npz)')
     parser.add_argument('--supply', default=str(logs / 'supply/pools/train-128.npz'))
     parser.add_argument('--digest-pool', default=str(DIGEST_POOL),
                         help="the digests part's v5 pool (default: the one FOUR_GOAL_DIGESTS were recorded on)")
-    parser.add_argument('--pack', default=str(native.PACK))
+    parser.add_argument('--pack', help='default: sim/native.py PACK (village-world-v2: PACK_V2)')
     parser.add_argument('--work', default=str(logs / 'native/gate'), help='the digest packs and the results (ignored)')
     parser.add_argument('--out', help='results, one JSON line per case (default WORK/gate-MODE[-SHARD].jsonl)')
-    parser.add_argument('--parts', default=','.join(PARTS), help=f'comma separated: {", ".join(PARTS)}')
+    parser.add_argument('--parts', help=f'comma separated: {", ".join(PARTS)} (default: all of the world set: '
+                        'village-world-v1 all but workers, village-world-v2 all but digests); with --summary, the parts '
+                        'the merged rows claim (default: every part of their world set and mode)')
     parser.add_argument('--shard', default='0/1', help='i/k: the configurations whose index is i modulo k')
     parser.add_argument('--resume', action='store_true', help='skip the cases already in --out')
-    parser.add_argument('--only', help='run only the cases (and parts) whose id matches this regular expression '
-                        '(TASK|GOALS|FIRST|SOURCE|SCENARIO; digests, threads, soak): a rerun, not the gate')
+    parser.add_argument('--only', help='run only the cases and parts whose id this regular expression matches, searched '
+                        '(TASK|GOALS|FIRST|SOURCE|SCENARIO; digests, threads, soak, workers, policy): a rerun, not the '
+                        "gate. The policy part's id is in the policy-source cases' ids too (policy:A): ^policy$ selects "
+                        'the part alone')
     parser.add_argument('--threads', type=int, default=4, help="the soak's NativeBatch threads")
-    parser.add_argument('--summary', nargs='*', help='print the merged table of these result files and exit')
+    parser.add_argument('--summary', nargs='*', help='print the merged table and verdict of these result files and exit')
+
+
+def summary_parts(text):
+    """The parts a gate command names (gate --parts; with --summary, the parts a merge claims; None: every part of its
+    world set), refusing unknown names and an empty list."""
+    if text is None:
+        return None
+    parts = [p for p in text.split(',') if p]
+    if not parts:
+        raise ValueError('--parts names no part')
+    if set(parts) - set(PARTS):
+        raise ValueError(f'unknown parts {sorted(set(parts) - set(PARTS))}')
+    return parts
+
+
+def gate_settings(args):
+    """(mode, world, parts, shard, out) of a gate command, its --archive, --pool and --pack filled with its world set's
+    defaults (GATE_INPUTS, GATE_INPUTS_V2) where not given. village-world-v2's set has no digests part (FOUR_GOAL_DIGESTS
+    are the goal tasks'), village-world-v1's no workers part (its digests check the workers path): each refuses the other's
+    named; v2's default --out names the world."""
+    mode = 'quick' if args.quick else 'full'
+    world = getattr(args, 'world', None) or GATE_WORLDS[0]
+    v1 = world == GATE_WORLDS[0]
+    for name, value in (GATE_INPUTS if v1 else GATE_INPUTS_V2).items():
+        if getattr(args, name, None) is None:
+            setattr(args, name, str(value))
+    other = 'workers' if v1 else 'digests'
+    parts = summary_parts(args.parts or ','.join(p for p in PARTS if p != other))
+    if not v1 and 'digests' in parts:
+        raise ValueError("village-world-v2's set has no digests part (FOUR_GOAL_DIGESTS are the goal tasks')")
+    if v1 and 'workers' in parts:
+        raise ValueError("village-world-v1's set has no workers part (its digests part checks the workers path)")
+    shard = tuple(int(v) for v in args.shard.split('/'))
+    out = Path(args.out or Path(args.work) / (f'gate-{mode}{"" if v1 else "-" + world}'
+                                              f'{"" if shard == (0, 1) else f"-{shard[0]}of{shard[1]}"}.jsonl'))
+    return mode, world, parts, shard, out
+
+
+def gate_provenance(ctx):
+    """What a gate process plays, written into each of its rows (gate_row) and required alike of every row by the
+    summary: the world set; each input file's absolute path and sha256 (the pack, the archive, the pool, the supply
+    pool); the inputs and the name table the pack's manifest records; the native library's file (its tag digests the C
+    source, the generated header, the flags and the interpreter); and SIM_NATIVE_SOURCE and SIM_NATIVE_LTO where set.
+    The digests part's own pool is in its row."""
+    import os
+    meta = json.loads(ctx.pack.manifest)
+    files = dict(pack=ctx.pack_path, archive=ctx.archive, pool=ctx.pool, supply=ctx.supply)
+    return dict(world=ctx.world,
+                files={k: dict(path=str(Path(v).absolute()), sha256=native.sha256_file(v)) for k, v in files.items()},
+                pack_inputs=meta.get('inputs'), pack_names=meta.get('names'), library=native.library()[0].name,
+                env={k: os.environ[k] for k in ('SIM_NATIVE_SOURCE', 'SIM_NATIVE_LTO') if k in os.environ})
+
+
+def gate_row(row, commit, mode, only, world, provenance=None):
+    """A result row as the gate writes it: the part's or case's fields, the commit, mode, --only and the process's
+    provenance (gate_provenance); a row of village-world-v2's set names its world (a village-world-v1 row names none, as
+    every row before the world sets)."""
+    row = dict(row.__dict__ if hasattr(row, '__dict__') else row, commit=commit, mode=mode, only=only,
+               provenance=provenance)
+    if world != GATE_WORLDS[0]:
+        row['world'] = world
+    return row
+
+
+def resume_done(before, out, commit, mode, world, provenance):
+    """The row ids a resumed run skips: every row already in `out`, which must all be of this run's gate (its commit,
+    mode, world set and provenance), so that the file stays one gate's; any other row refuses the resume."""
+    mine = (commit, mode, world, provenance_key(provenance))
+    other = sorted({row['id'] for row in before if (row.get('commit'), row.get('mode'), row.get('world', GATE_WORLDS[0]),
+                                                    provenance_key(row.get('provenance'))) != mine})
+    if other:
+        raise ValueError(f'--resume: {out} holds {len(other)} rows of another commit, mode, world set or inputs than this '
+                         f'run ({commit}, {mode}, {world}), such as {other[0]}: give a new --out')
+    return {row['id'] for row in before}
+
+
+def resume_rows(out, log):
+    """The rows already in a results file (gate --resume): a last line that an interruption cut short is cut from the
+    file (truncated at its start, so the rows before it stay), and a whole last row whose newline was lost gets it, so
+    that the next row starts a line of its own; any other line that is not a row refuses the resume."""
+    import os
+    data = out.read_bytes()
+    lines, rows, offset = data.splitlines(keepends=True), [], 0
+    for k, line in enumerate(lines):
+        last = k == len(lines) - 1
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                if not last or line.endswith(b'\n'):
+                    raise ValueError(f'--resume: line {k + 1} of {out} is not a result row') from None
+                os.truncate(out, offset)
+                log(f'[gate] --resume: cut the last line of {out}, which an interruption left unfinished')
+                break
+            if last and not line.endswith(b'\n'):
+                with out.open('ab') as stream:
+                    stream.write(b'\n')
+        offset += len(line)
+    return rows
 
 
 def gate_main(args):
@@ -1987,35 +3080,31 @@ def gate_main(args):
     report), appends each result to --out, then the table; exit status 0 only when clean."""
     if args.summary is not None:
         rows = [json.loads(line) for path in args.summary for line in Path(path).read_text().splitlines() if line]
-        sys.exit(0 if gate_summary(rows, print) else 1)
-    mode = 'quick' if args.quick else 'full'
-    parts = [p for p in args.parts.split(',') if p]
-    if set(parts) - set(PARTS):
-        raise ValueError(f'unknown parts {sorted(set(parts) - set(PARTS))}')
-    shard = tuple(int(v) for v in args.shard.split('/'))
+        sys.exit(0 if gate_summary(rows, print, parts=summary_parts(args.parts)) else 1)
+    mode, world, parts, shard, out = gate_settings(args)
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
-    out = Path(args.out or work / f'gate-{mode}{"" if shard == (0, 1) else f"-{shard[0]}of{shard[1]}"}.jsonl')
-    done = {json.loads(line)['id'] for line in out.read_text().splitlines() if line} if args.resume and out.exists() \
-        else set()
+
+    def log(line):
+        print(line, flush=True)
+    before = resume_rows(out, log) if args.resume and out.exists() else []
+    ctx = GateContext(args.archive, args.pool, args.supply, args.pack, work, args.threads, world).load(
+        policies=('cases' in parts or 'soak' in parts) and world == GATE_WORLDS[0])  # v2's set plays no policy
+    commit, provenance = _commit(), gate_provenance(ctx)
+    done = resume_done(before, out, commit, mode, world, provenance)
     if not args.resume:
         out.write_text('')
-    ctx = GateContext(args.archive, args.pool, args.supply, args.pack, work, args.threads).load(
-        policies='cases' in parts or 'soak' in parts)
-    commit = _commit()
     only = re.compile(args.only) if args.only else None
 
     def skip(name):
         return name in done or (only is not None and not only.search(name))
 
-    def log(line):
-        print(line, flush=True)
-
     def emit(row):
-        row = dict(row.__dict__ if hasattr(row, '__dict__') else row, commit=commit, mode=mode)
+        row = gate_row(row, commit, mode, args.only, world, provenance)
         with out.open('a') as f:
             f.write(json.dumps(row, default=str) + '\n')
-    log(f'[gate] {mode} at {commit}: parts {parts}, shard {shard[0]}/{shard[1]}, results {out}')
+    log(f'[gate] {mode}{"" if world == GATE_WORLDS[0] else " " + world} at {commit}: parts {parts}, '
+        f'shard {shard[0]}/{shard[1]}, results {out}')
     log(f'[gate] checkpoints: {", ".join(f"{k} {v[2]}" for k, v in ctx.policies.items())}')
     if 'cases' in parts:
         gate_cases_part(ctx, mode, shard, skip, emit, log)
@@ -2025,5 +3114,9 @@ def gate_main(args):
         emit(gate_threads(ctx, mode, log))
     if 'soak' in parts and GATE[mode]['soak'] and not skip('soak'):
         emit(gate_soak(ctx, mode, log))
+    if 'workers' in parts and not skip('workers'):
+        emit(gate_workers(ctx, mode, log))
+    if 'policy' in parts and not skip('policy'):
+        emit(gate_policy(ctx, mode, log))
     rows = [json.loads(line) for line in out.read_text().splitlines() if line]
-    sys.exit(0 if gate_summary(rows, log) else 1)
+    sys.exit(0 if gate_summary(rows, log, gate_expected(mode, shard, args.only, world, parts)) else 1)

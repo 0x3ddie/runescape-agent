@@ -307,6 +307,57 @@ def test_names_v1_policy_reads_a_frozen_table_kept_in_the_checkpoint(tmp_path, m
         check_names(loaded.policy)
 
 
+def test_a_rebuilt_name_table_plays_a_checkpoint_only_by_its_fingerprint_and_a_public_copy_takes_its_vectors(tmp_path,
+                                                                                                                monkeypatch):
+    """check_names: the exact table passes by its digest. A table whose every value moved one float16 step away from zero
+    (the worst such rebuild) has another digest: refused without the trained table's fingerprint, taken with it (path
+    'fingerprint'). With the fingerprint, a table with one name changed, its vectors scaled by 1.01, or its first and last
+    rows' vectors swapped is refused. The fingerprint holds no vector's values. check_names changes nothing: a policy whose
+    tables hold no vectors (a public copy's, which its loader fills) keeps them empty."""
+    import json
+    import names
+    from baseline.policy import CONTRACT, check_names, load_name_vectors, name_fingerprint
+    rng = np.random.default_rng(3)
+    kinds, labels = np.array(['npc'] * 20 + ['obj'] * 20), np.array([f'name {k}' for k in range(40)])
+    vectors = (rng.normal(size=(40, 16)) * 0.1).astype(np.float16)
+
+    def table_at(name, kinds=kinds, labels=labels, vectors=vectors):
+        path = tmp_path / f'{name}.npz'
+        np.savez(path, kind=kinds, name=labels, vector=vectors)
+        monkeypatch.setenv('RL_NAME_TABLE', str(path))
+        names.name_table.cache_clear()
+        return names.name_table()
+    table = table_at('trained')
+    model = RecurrentPPO(MaskedRecurrentPolicy, GameVecEnv(Backend(), sample()), n_steps=4, batch_size=8, seed=11,
+                         device='cpu', policy_kwargs=dict(lstm_hidden_size=16, names=table.spec, observation=OBSERVATION,
+                                                          contract=CONTRACT, net_arch=dict(pi=[16], vf=[16]),
+                                                          features_extractor_kwargs=dict(features_dim=16)))
+    load_name_vectors(model.policy, table.vectors)
+    fingerprint = json.loads(json.dumps(name_fingerprint(table)))  # as the file beside a public copy holds it
+    assert check_names(model.policy) == dict(path='digest', table=table.digest)
+    assert all(len(fingerprint[k]) == 16 for k in ('sums', 'squares', 'weighted'))
+    assert not {v for row in vectors.astype(float).tolist() for v in row} & set(fingerprint['sums'] + fingerprint['weighted'])
+    away = np.where(vectors < 0, -np.inf, np.inf).astype(np.float16)
+    stepped = np.nextafter(vectors, away)
+    assert (stepped != vectors).all() and (np.abs(stepped) > np.abs(vectors)).all()
+    other = table_at('stepped', vectors=stepped)
+    assert other.digest != table.digest
+    with pytest.raises(ValueError, match='another name table than RL_NAME_TABLE$'):
+        check_names(model.policy)
+    taken = check_names(model.policy, fingerprint=fingerprint)
+    assert (taken['path'], taken['table'], taken['trained']) == ('fingerprint', other.digest, table.digest)
+    for name, change, reason in (('renamed', dict(labels=np.array([*labels[:-1], 'name x'])), 'kinds and names'),
+                                 ('scaled', dict(vectors=(vectors.astype(np.float32) * 1.01).astype(np.float16)), '(sums|squares)'),
+                                 ('swapped', dict(vectors=vectors[[39, *range(1, 39), 0]]), 'weighted')):
+        table_at(name, **change)
+        with pytest.raises(ValueError, match=f'by its fingerprint: .*{reason}'):
+            check_names(model.policy, fingerprint=fingerprint)
+    table = table_at('trained')
+    load_name_vectors(model.policy, np.zeros(table.vectors.shape, np.float32))  # a public copy's tables
+    assert check_names(model.policy) == dict(path='digest', table=table.digest)
+    assert not model.policy.features_extractor.embedding.table.any()
+
+
 class Syncs(TorchDispatchMode):
     """Counts the operations that wait for a GPU: scalar reads and outputs whose size depends on data."""
     OPS = ('_local_scalar_dense', '_unique2', 'nonzero', 'masked_select')

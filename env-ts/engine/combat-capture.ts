@@ -10,6 +10,7 @@
  * queue entry's argument list is tagged at npc_queue and followed into ScriptRunner.init.
  * Hitpoint changes no npc_damage explains (regeneration, drains) are recorded at reconciliation.
  */
+import { eventLimit } from './resource-capture';
 type Native = any;
 export type Actor = 'agent' | 'player' | 'npc' | 'world';
 export interface CombatCaptureHost {
@@ -41,7 +42,7 @@ export interface CombatCaptureHost {
     open(player: Native): boolean;
 }
 type Life = { key: string; npc: Native; seq: number; type: number; hp: number; removed: boolean };
-type Binding = { player: Native; identity: Native; start: number; end: number; sequence: number; events: Native[];
+type Binding = { player: Native; identity: Native; start: number; end: number; limit: number; sequence: number; events: Native[];
     failure: string | null; lives: Map<Native, Life>; seqs: Map<Native, number>; agentHp: number; armedHp: number };
 type Tag = { binding: Binding; life: Life; hitter: Actor; hit: number };
 const require = (ok: unknown, message: string) => { if (!ok) throw new Error(message); };
@@ -58,7 +59,7 @@ export function installCombatCapture(host: CombatCaptureHost, maxEvents = 20000)
     const live = () => binding && !binding.failure && host.open(binding.player) ? binding : null;
     const safe = (b: Binding, fn: () => void) => { try { fn(); } catch (error) { b.failure ??= String((error as Error)?.message ?? error); } };
     function record(b: Binding, kind: string, data: Native) {
-        require(b.events.length < maxEvents, 'combat capture overflow');
+        require(b.events.length < b.limit, 'combat capture overflow');
         const tick = host.tick();
         require(Number.isSafeInteger(tick) && tick >= b.start && tick <= b.end, 'combat event outside the window');
         b.events.push(structuredClone({ sequence: ++b.sequence, tick, kind, ...data }));
@@ -211,7 +212,8 @@ export function installCombatCapture(host: CombatCaptureHost, maxEvents = 20000)
         bind(player: Native, identity: Native, start: number, end: number) {
             require(binding === null && Number.isSafeInteger(start) && Number.isSafeInteger(end) && end > start,
                 'combat capture allows one actor and a positive window');
-            binding = { player, identity: structuredClone(identity), start, end, sequence: 0, events: [], failure: null,
+            binding = { player, identity: structuredClone(identity), start, end, limit: eventLimit(maxEvents, end - start),
+                sequence: 0, events: [], failure: null,
                 lives: new Map(), seqs: new Map(), agentHp: host.agentHp(player), armedHp: host.agentHp(player) };
         },
         audit(player: Native) {

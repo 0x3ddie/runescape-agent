@@ -1,23 +1,14 @@
 """sim/hour.py, hour-v1: one character persists past the task horizon for the whole hour under the declared
 clock, death ends the hour at its tick, an unsupported step stops the trial unscored, the XP rate is the world's, and
-inventory-full responses and the merged parts are accounted as declared. native-hour-v1: the native
-episode shows hour-v1's clock, the windows sum to the audit's production, and a pass reports failed and unplayed hours."""
+inventory-full responses and the merged parts are accounted as declared."""
 import json
-from copy import deepcopy
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from baseline import config
-from baseline.native_value import audit_native_value
-from baseline.resource_task import ResourceEpisode
-from baseline.tests.test_goal_task import DECLARED
-from baseline.tests.test_native_flow import CONTAINERS, item
-from baseline.tests.test_resource_task import ARMED, CFG, raw as plain_raw
-from feedback_contract import quiet
 from sim import hour as H
-from sim.agent import A_ACT0, A_DROP0, A_STYLE0, A_WAIT
+from sim.agent import A_WAIT
 from sim.combat import ControlActor
 from sim.engine import WOODCUTTING, Unsupported, World
 
@@ -171,184 +162,6 @@ def test_merge_refuses_an_incomplete_or_mixed_run(tables, tmp_path):
     part.write_text(json.dumps(old))
     with pytest.raises(ValueError, match='different runs'):
         H.merge(tmp_path / 'a')
-
-
-START = 1000  # the native capture's start tick in these tests
-
-
-def hour_trace(productions=(), start=START, ticks=H.NATIVE['ticks']):
-    """A surviving native capture of the hour (baseline/tests/test_native_flow.py's form, every goal family declared) with
-    one production of item `base` at each (tick from arm, base), each into the next inventory slot."""
-    current, events, pending = dict(inventory=[], bank=[]), [], sorted(productions)
-    for t in range(ticks + 1):
-        if t:
-            events.append(dict(kind='tick-boundary', tick=start + t, holdings=deepcopy(current)))
-        while pending and pending[0][0] == t:
-            after = dict(current, inventory=current['inventory'] + [item(len(current['inventory']), id=pending.pop(0)[1])])
-            events.append(dict(kind='native-op', tick=start + t, before=deepcopy(current), after=deepcopy(after), opcode=4302,
-                               productionSource=True, scriptId=51, scriptName='[label,get_logs]', pc=5,
-                               stackTail=[93, after['inventory'][-1]['id'], 1], ground=[], resourceMutation=True,
-                               ownedSlotSwap=None))
-            current = after
-    terminal = dict(reason='horizon', tick=start + ticks, holdings=deepcopy(current), toolAvailable=True,
-                    lifecycle=dict(phase='alive', failure=None, deathSequence=0, respawnSequence=0, deathTick=None))
-    events.append(dict(kind='terminal', **terminal))
-    for sequence, event in enumerate(events, 1):
-        event['sequence'] = sequence
-    return dict(schema='native-resource-capture-v2', flowEvidenceVersion=1, slotSwapEvidenceVersion=1,
-                ownedContainers=deepcopy(CONTAINERS), targetScope='gathering-v1', targets=deepcopy(DECLARED),
-                identity=dict(worldBootId='boot', accountId='a', accountEpoch=1, incarnationId='p'),
-                initial=dict(inventory=[], bank=[]), last=deepcopy(current), startTick=start, endTick=start + ticks,
-                observedTick=start + ticks, events=events, terminal=terminal, failure=None, closed=True, completed=True,
-                evidenceComplete=True, lifecycleObserved=True)
-
-
-class Native:
-    """A native world and its resource control: observations at the ticks of `shown` [(tick from arm, raw)], the capture
-    `trace` (closed at the hour's end), every control operation in `calls`, and `fail` an operation that raises."""
-
-    def __init__(self, shown, trace, fail=None):
-        self.shown, self.trace, self.fail, self.k, self.calls, self.closed = shown, trace, fail, 0, [], False
-
-    def reset(self, seed, cfg):
-        self.k = 0
-        return deepcopy(self.shown[0][1])
-
-    def step(self, action):
-        self.k += 1
-        return deepcopy(self.shown[self.k][1])
-
-    def close(self):
-        self.closed = True
-
-    def control(self, operation, **kwargs):
-        self.calls.append(operation)
-        if operation == self.fail:
-            raise RuntimeError(f'{operation} failed')
-        identity = deepcopy(self.trace['identity'])
-        if operation == 'identity':
-            return dict(type='resource_identity', identity=identity)
-        if operation == 'arm':
-            return dict(type='resource_capture', identity=identity, audit=dict({k: deepcopy(self.trace[k]) for k in ARMED},
-                                                                                closed=False))
-        if operation == 'budget':
-            tick, end = START + self.shown[self.k][0], START + H.NATIVE['ticks']
-            return dict(type='resource_budget', identity=identity, budget=dict(
-                schema='resource-budget-v1', startTick=START, endTick=end, observedTick=tick, horizon=H.NATIVE['ticks'],
-                remainingTicks=end - tick, status='horizon' if tick == end else 'active'))
-        return dict(type='resource_capture', identity=identity, audit=deepcopy(self.trace))
-
-
-def test_the_native_hour_shows_hour_v1s_window_clock_for_the_same_ticks_and_decisions(tables):
-    layouts, records = H.records('wood', 1, tables)
-    task = H.hour_episode('wood', layouts[0], records[0], tables, 25)
-    actor, actions = ControlActor('random'), []
-    actor.reset(7)
-    shown, vectors, done = [(0, deepcopy(task.raw))], [task.projected], False
-    while not done:  # random legal actions: decisions of varied length, across every 300-tick window of the hour
-        actions.append(actor.act(task.projected, task))
-        obs, _, done, info = task.step(actions[-1])
-        shown.append((task.budget()[0] - task.start_tick, deepcopy(task.raw)))
-        vectors.append(obs)
-    assert info['report']['survived'] and shown[-1][0] == H.NATIVE['ticks'] and len({t // 300 for t, _ in shown}) == 21
-    world = Native(shown, hour_trace())
-    episode = H.NativeHourEpisode(ResourceEpisode(world, world.control, config.TASK_CFG, 1, 40, lambda *a, **k: None,
-                                                  goal='wood'))
-    native = [episode.reset(0)] + [episode.step(a)[0] for a in actions]
-    for sim_obs, native_obs in zip(vectors, native, strict=True):
-        assert np.array_equal(native_obs['budget_vec'], sim_obs['budget_vec'])
-        assert native_obs['task_vec'][0] == sim_obs['task_vec'][0]
-    assert episode.closed is False and episode.bound is False  # the hour closed at its horizon and released its capture
-
-
-def test_the_window_counts_sum_to_the_audits_production_per_family():
-    trace = hour_trace([(0, 1511), (1199, 1511), (1200, 1521), (2399, 1511), (4800, 1519), (6000, 1511)])
-    counts = H.window_counts(trace)
-    assert counts == {1511: [2, 1, 0, 0, 1], 1521: [0, 1, 0, 0, 0], 1519: [0, 0, 0, 0, 1]}  # the last tick in window 5
-    report = audit_native_value(trace)
-    assert {b: sum(c) for b, c in counts.items()} == {b: f['produced'] for b, f in report['families'].items()}
-
-
-KIT = [dict(slot=s, id=900 + s, count=1, name=f'kit {s}') for s in range(25)] + [dict(slot=25, id=2309, count=1, name='Bread')]
-
-
-def scripted_hour(productions, levels, every=100):
-    """[(tick from arm, raw)] of a scripted native hour, one decision every `every` ticks: the kit leaves two slots free;
-    each production adds a log the next observation shows; DROP_0 (the bread) is legal while the inventory is full and the
-    bread is held, and then drops it; a tree to chop ('Dead tree' before tick 1200, 'Tree' from it); the woodcutting base
-    level `levels` gives from each tick on."""
-    shown, dropped = [], None
-    for k, t in enumerate(range(0, H.NATIVE['ticks'] + 1, every)):
-        logs = [dict(slot=0, id=base, count=1, name='Logs') for tick, base in productions if tick < t]
-        inventory = [i for i in KIT if not (i['id'] == 2309 and dropped is not None and dropped < t)] + logs
-        mask = [0] * 96
-        mask[A_WAIT] = mask[A_ACT0] = 1
-        if len(inventory) == H.INVENTORY_SLOTS and dropped is None:
-            mask[A_DROP0], dropped = 1, t
-        level = max(v for tick, v in levels.items() if tick <= t)
-        shown.append((t, dict(plain_raw(), decision=k + 1, mask=mask, feedback=quiet(), actionNote='',
-                              inventory=[dict(i, slot=s) for s, i in enumerate(inventory)],
-                              player=dict(x=3096, z=3432, level=0, hp=10, maxHp=10),
-                              skills=[dict(name='Woodcutting', level=level, baseLevel=level, xp=level * 1000),
-                                      dict(name='Hitpoints', level=10, baseLevel=10, xp=1154)],
-                              actSel=[dict(kind='loc', id=1276, name='Dead tree' if t < 1200 else 'Tree', option='Chop down',
-                                           x=3100, z=3432, level=0, dx=4, dz=0, distance=4, steps=4, count=1,
-                                           combatLevel=0)])))
-    return shown
-
-
-class Scripted:
-    """A model that drops when it can, else chops (baseline.evaluate.Actor's interface)."""
-    observation_space = SimpleNamespace(spaces={})
-
-    def predict(self, observation, state=None, episode_start=None, deterministic=True):
-        return np.asarray(A_DROP0 if observation['mask'][A_DROP0] else A_ACT0), None
-
-
-def test_a_pass_reports_a_failed_hour_incomplete_scores_a_complete_one_and_stops_without_a_world(tmp_path, monkeypatch):
-    productions = [(150, 1511), (1250, 1511), (1450, 1511)]
-    hours = [Native(scripted_hour([], {0: 20}), hour_trace(), fail='read'),
-             Native(scripted_hour(productions, {0: 20, 1300: 21, 4900: 22}), hour_trace(productions))]
-    released = []
-
-    class Worlds:
-        def identity(self):
-            return dict(engines={'pinned': dict(tree=config.ENGINE_TREES['pinned'])})
-
-        def acquire(self, engine, timeout):
-            if len(released) == len(hours):
-                raise RuntimeError('world 3 failed to boot')
-            return dict(id=len(released) + 1, engine=engine, tree=config.ENGINE_TREES['pinned'], block=0, boot_id='b')
-
-        def release(self, world_id):
-            released.append(world_id)
-
-    def join(world, record):
-        native = hours[world['id'] - 1]
-        return native, native.control
-    def setup(transport, observation, record):  # as prepare_declared's style step records before arm
-        record('requested', action=A_STYLE0)
-        record('observed', action=A_STYLE0, observation=observation)
-        return observation
-    monkeypatch.setenv('NODE_RANDOM_EVENTS', 'false')
-    monkeypatch.setattr('baseline.world.make_episode', lambda transport, control, fixture, record: ResourceEpisode(
-        transport, control, CFG, fixture['horizon'], 40, record, setup, goal=fixture['goal']))
-    schedule = [('wait', None, 0), ('S_wood', 101, 1), ('S_wood', 101, 2), ('SH', 101, 3)]
-    result = H.native_run(tmp_path / 'pass', 'sampled1', schedule, Worlds(), join,
-                          policies=lambda name, seed: (Scripted(), dict(path=name)))
-    failed, scored, unplayed, rest = result['hours']
-    # the capture read failed at the horizon: incomplete, never scored; its capture retired and its world released
-    assert failed['status'] == 'incomplete' and 'read failed' in failed['cause'] and failed['tick'] == H.NATIVE['ticks']
-    assert 'logs' not in failed and hours[0].calls[-1] == 'retire' and hours[0].closed and released == [1, 2]
-    assert scored['status'] == 'complete' and scored['trial_seed'] == 3101001 + 1 and scored['decisions'] == 60
-    assert scored['logs_by_window'] == [1, 2, 0, 0, 0] and scored['primary'] == [1, -1, -1, -1]
-    assert scored['woodcutting']['level'] == [20, 22] and scored['woodcutting']['levels_gained_by_window'] == [0, 1, 0, 0, 1]
-    assert scored['logs_by_tree'] == {'Dead tree': 1, 'Tree': 2}
-    assert [(e['tick'], e['response']) for e in scored['full']] == [(1300, 'drop'), (1500, 'stall')]
-    assert scored['capture_events'] == H.NATIVE['ticks'] + len(productions) + 1 and scored['foreign_items'] == {}
-    # no world for the third hour: the pass stops, and that hour and the rest are not played
-    assert unplayed['status'] == rest['status'] == 'not_played' and 'failed to boot' in unplayed['cause']
-    assert result['status'] == 'stopped' and (tmp_path / 'pass' / 'results.json').exists()
 
 
 def test_the_final2_records_are_the_native_click_studys_wood_hours_on_the_final_split_only(tmp_path, monkeypatch):

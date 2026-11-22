@@ -24,7 +24,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import KVWriter, Logger
 
 from baseline import config
-from baseline.policy import MaskedRecurrentPolicy, check_names, load_name_vectors
+from baseline.policy import POPART, MaskedRecurrentPolicy, check_names, load_name_vectors
 from names import name_table
 from obs import OBSERVATION
 from sim.learn import (DeviceEnv, DeviceRecurrentPPO, DeviceRolloutBuffer, FakeEnv, HostReads, HostVecEnv, Unsupported,
@@ -459,7 +459,7 @@ def test_telemetry_only_reads():
     def learned(telemetry):
         model = build(DeviceEnv(fake(), 7), seed=7, device='cpu', **SETTINGS)
         if telemetry:
-            attach(model, seed=7)
+            attach(model)
         model.learn(3 * WORLDS * N_STEPS)
         return model
     plain, tracked = learned(False), learned(True)
@@ -473,7 +473,7 @@ def test_telemetry_after_a_step_waits_for_nothing():
     """A graphed update runs the telemetry after every replay, so accumulating a step must not size anything by its
     data (a device wait). Padded rows (goal -1) still count for no goal: the sums are those of the real rows."""
     from baseline.resource_task import GOALS
-    tracker = attach(build(DeviceEnv(fake(), 7), seed=7, device='cpu', **SETTINGS), seed=7).tracker
+    tracker = attach(build(DeviceEnv(fake(), 7), seed=7, device='cpu', **SETTINGS)).tracker
     g = torch.Generator().manual_seed(0)
     goal = torch.randint(-1, len(GOALS), (64,), generator=g)
     tracker.goals = dict(actor=goal, critic=goal.roll(5))
@@ -492,14 +492,13 @@ def test_telemetry_after_a_step_waits_for_nothing():
         assert all(torch.equal(x, y) for x, y in zip(tracker.acc[name], expected)), name
 
 
-def test_a_recovery_state_with_another_or_a_removed_treatment_is_refused():
+def test_a_recovery_state_with_a_removed_treatment_is_refused():
     from sim.train import CheckFailed, put_treatment_state
-    model = build(DeviceEnv(fake(), 3), seed=3, device='cpu', **SETTINGS)
-    assert put_treatment_state(model, None) is None
-    with pytest.raises(CheckFailed, match='treatments'):
-        put_treatment_state(model, dict(distill=dict(updates=1, sampler=torch.zeros(4, dtype=torch.uint8))))
+    assert put_treatment_state(None) is None
     with pytest.raises(CheckFailed, match='removed treatments'):
-        put_treatment_state(model, dict(distill=None, rnd=dict(step=torch.zeros(1))))
+        put_treatment_state(dict(distill=dict(updates=1, sampler=torch.zeros(4, dtype=torch.uint8))))
+    with pytest.raises(CheckFailed, match='removed treatments'):
+        put_treatment_state(dict(distill=None, rnd=dict(step=torch.zeros(1))))
 
 
 def test_the_ppo_profile_counts_device_time_once():
@@ -553,7 +552,7 @@ def test_a_resume_refuses_another_goal_set_than_its_recovery_state_trained(tmp_p
 
 
 def test_a_resume_refuses_another_task_than_its_recovery_state_trained(tmp_path):
-    """The recovery record names its task (native gap Stage 3: K's v5 and X's v11 states must not cross); a record
+    """The recovery record names its task (states of goal-activity-v5 and v11 must not cross); a record
     written before the field resumes as before."""
     from sim.train import CheckFailed, train
     common = dict(seed=1, worlds=WORLDS, n_steps=N_STEPS, batch_size=BATCH, n_epochs=1, verbose=False,
@@ -633,8 +632,9 @@ def test_each_update_saves_a_fixed_sample_that_replays_under_the_policy_that_col
 
 def test_the_in_run_segment_check_hashes_the_collecting_policy_once_per_update(tmp_path, monkeypatch):
     """The in-run check's replay takes the digest save_segments computed for the same policy (A6, after phase 1), so a
-    run hashes its policy once at the start and once per update, not twice; the replay still reads the digest back from
-    the saved file and refuses a sample another policy collected. The replay-segments command passes no digest and hashes
+    run hashes its policy once at the start and once per update, not twice, and once more at the end for latest.zip's
+    policy_sha256_at_end (no periodic checkpoint falls in two updates); the replay still reads the digest back from the
+    saved file and refuses a sample another policy collected. The replay-segments command passes no digest and hashes
     the checkpoint it is given."""
     import sim.train
     from sim.train import CheckFailed, policy_digest, replay_segments, train
@@ -643,7 +643,7 @@ def test_the_in_run_segment_check_hashes_the_collecting_policy_once_per_update(t
     monkeypatch.setattr(sim.train, 'policy_digest', lambda policy: hashed.append(policy) or policy_digest(policy))
     run = train(tmp_path / 'a', decisions=2 * worlds * steps, seed=1, worlds=worlds, n_steps=steps, batch_size=BATCH,
                 n_epochs=1, verbose=False, segments=dict(worlds=4, decisions=6))
-    assert run['segments']['updates'] == 2 and len(hashed) == 1 + 2
+    assert run['segments']['updates'] == 2 and run['checkpoint_digests'] == {} and len(hashed) == 1 + 2 + 1  # start, updates, end
     initial = RecurrentPPO.load(tmp_path / 'a' / 'initial.zip', device='cpu').policy
     first, second = (tmp_path / 'a' / row['segments']['path'] for row in run['updates'])
     assert replay_segments(first, initial, digest=policy_digest(initial))['returns_exact']
@@ -889,3 +889,77 @@ def test_the_recurrent_check_catches_a_changed_state_and_a_start_that_reads_the_
         features, states, torch.zeros_like(starts), lstm)
     monkeypatch.setattr(type(model.policy), '_process_sequence', leak)
     assert recurrent_gaps(model)[1] > ATOL
+
+
+@pytest.mark.parametrize('value_norm', [None, POPART], ids=['linear', 'popart'])
+def test_the_scaled_recurrent_check_takes_rounding_at_a_large_value_and_fails_a_wrong_row(value_norm):
+    """sim/train.py recurrent_gaps scaled, validate_free_play's, with a plain value head and a PopArt one: with
+    the value moved to about 80 before the collection (the head's bias, or PopArt's mean), the rollout passes; one stored
+    value three float32 rounding steps away (3 * 2**-17 at 80: beyond ATOL alone) passes within ATOL + RTOL x its scale.
+    One stored log-probability 1e-3 away fails as the log-probability's, its scale from the row's legal logits (the mask's
+    fill of -1e9 is not among them) and the actor's terms before them. At the same values a row moved (another column's stored states) and every row
+    after one update of the weights fail by two orders of magnitude or more, the worst row named. The unscaled check is
+    unchanged."""
+    from sim.train import ATOL, RTOL, recurrent_gaps
+    model = build(DeviceEnv(fake(), 5), seed=5, device='cpu', value_norm=value_norm, **SETTINGS)
+    with torch.no_grad():
+        head = model.policy.value_net
+        (head.mean if value_norm else head.bias).add_(80)
+    _, callback = model._setup_learn(WORLDS * N_STEPS, None)
+    model.collect_rollouts(model.env, callback, model.rollout_buffer, N_STEPS)  # 4 rows a call; the check's one call: 32
+    b = model.rollout_buffer
+    assert bool(((b._values >= 64) & (b._values < 128)).all())  # rounding steps of 2**-17
+    step, world = (b.episode_starts == 0).nonzero()[-1].tolist()  # a row that reads its stored states
+    b._values[step, world] += 3 * 2 ** -17
+    gap, reset_gap, worst, scales = recurrent_gaps(model, scaled=True)
+    assert gap > ATOL and recurrent_gaps(model) == (gap, reset_gap)  # the unscaled check would fail this row
+    assert worst['ratio'] <= 1 and (worst['output'], worst['step'], worst['column']) == ('value', step, world)
+    assert worst['scale'] >= 80 and worst['tolerance'] == ATOL + RTOL * worst['scale']
+    assert scales['value'] >= 80 and scales['log probability'] < 100
+    b.log_probs[step, world] += 1e-3
+    worst = recurrent_gaps(model, scaled=True)[2]
+    assert worst['ratio'] >= 10 and (worst['output'], worst['step'], worst['column']) == ('log probability', step, world)
+    b.log_probs[step, world] -= 1e-3
+    other = (world + 1) % WORLDS
+    for stored in (b.hidden_states_pi, b.cell_states_pi, b.hidden_states_vf, b.cell_states_vf):
+        stored[step, world] = stored[step, other]
+    worst = recurrent_gaps(model, scaled=True)[2]
+    assert worst['ratio'] >= 100 and (worst['step'], worst['column']) == (step, world)
+    model.train()  # one update: every stored row is now of other weights
+    assert recurrent_gaps(model, scaled=True)[2]['ratio'] >= 100
+
+
+def test_a_log_probability_is_held_to_the_terms_the_actor_sums_before_its_logits():
+    """sim/train.py recurrent_gaps scaled (21 November 2026): a log-probability's scale is its row's largest
+    legal |logit| and the actor's largest first-encoder-layer and LSTM gate terms. A new policy's legal logits are below
+    1 while its first encoder layer sums terms of about 15: one stored log-probability 1.5e-5 away (beyond ATOL + RTOL x
+    its logits, about 1.03e-5) passes within its scale of 10 or more; 1e-4 away it fails; and every stored row after one
+    update of the weights, and a row moved to another column's stored states, fail by two orders of magnitude or
+    more."""
+    from sim.train import ATOL, RTOL, computed_from, recurrent_gaps
+    model = build(DeviceEnv(fake(), 5), seed=5, device='cpu', **SETTINGS)
+    _, callback = model._setup_learn(WORLDS * N_STEPS, None)
+    model.collect_rollouts(model.env, callback, model.rollout_buffer, N_STEPS)
+    b = model.rollout_buffer
+    step, world = (b.episode_starts == 0).nonzero()[-1].tolist()  # a row that reads its stored states
+    o = {k: v[step, world][None] for k, v in b.observations.items()}
+    states = [s[step, world][:, None].contiguous() for s in (b.hidden_states_pi, b.cell_states_pi)]
+    with torch.no_grad(), computed_from(model.policy) as seen:
+        model.policy.get_distribution(o, states, b.episode_starts[step, world][None])
+    logits = float(torch.where(o['mask'] != 0, seen['logits'].abs(), 0).amax())
+    assert logits < 1 and ATOL + RTOL * logits < 1.5e-5
+    b.log_probs[step, world] += 1.5e-5
+    gap, _, worst, _ = recurrent_gaps(model, scaled=True)
+    assert gap > ATOL and worst['ratio'] <= 1 and worst['scale'] >= 10
+    assert (worst['output'], worst['step'], worst['column']) == ('log probability', step, world)
+    b.log_probs[step, world] += 1e-4 - 1.5e-5
+    worst = recurrent_gaps(model, scaled=True)[2]
+    assert worst['ratio'] > 1 and (worst['step'], worst['column']) == (step, world)
+    b.log_probs[step, world] -= 1e-4
+    other = (world + 1) % WORLDS
+    for stored in (b.hidden_states_pi, b.cell_states_pi, b.hidden_states_vf, b.cell_states_vf):
+        stored[step, world] = stored[step, other]
+    worst = recurrent_gaps(model, scaled=True)[2]
+    assert worst['ratio'] >= 100 and (worst['step'], worst['column']) == (step, world)
+    model.train()  # one update: every stored row is now of other weights
+    assert recurrent_gaps(model, scaled=True)[2]['ratio'] >= 100

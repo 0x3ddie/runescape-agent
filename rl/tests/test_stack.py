@@ -51,6 +51,8 @@ def test_existing_lock_is_preserved(tmp_path):
     # a demo world: the command sees the declared spectator and pace, as the world does
     ("import os; raise SystemExit(3 if (os.environ['RL_DEMO_SPECTATOR'], os.environ['RL_DEMO_PACE_MS']) == "
      "('viewer', '450') else 4)", 5, "demo"),
+    # a shell's stray demo settings reach neither the world nor the command of a stack without the demo flags
+    ("import os; raise SystemExit(5 if not {'RL_DEMO_SPECTATOR', 'RL_DEMO_PACE_MS'} & set(os.environ) else 6)", 5, "stray"),
 ])
 def test_stub_stack_ready_exit_and_timeout_reap_all(tmp_path, monkeypatch, child_code, timeout, expected):
     with socket.socket() as reservation:
@@ -66,8 +68,11 @@ def test_stub_stack_ready_exit_and_timeout_reap_all(tmp_path, monkeypatch, child
         "  self.wfile.write(json.dumps(dict(status='running',schema=1,bootId=os.environ['RL_DEMO_BOOT_ID'],tickRateMs=48,xpRate=25)).encode())\n"
         f"HTTPServer(('127.0.0.1', {port}), Handler).serve_forever()\n")
     real_owned, real_wait = stack.OwnedProcess, stack.wait_ready
-    owned = []
+    owned, environments = [], []
+    monkeypatch.setenv("RL_DEMO_SPECTATOR", "stray")  # a shell's copies: the stack's flags alone decide
+    monkeypatch.setenv("RL_DEMO_PACE_MS", "9")
     def launch(argv, **kwargs):
+        environments.append(kwargs["env"])
         if len(owned) == 0:  # the engine; the command follows
             argv = [sys.executable, str(stub)]
             if expected == "wrong_identity":
@@ -93,6 +98,8 @@ def test_stub_stack_ready_exit_and_timeout_reap_all(tmp_path, monkeypatch, child
     elif expected == "demo":
         assert stack.run(Path(sys.executable), output, timeout, [sys.executable, "-c", child_code], lockstep=True,
                          demo=dict(spectator="viewer", pace_ms=450)) == 3
+    elif expected == "stray":
+        assert stack.run(Path(sys.executable), output, timeout, [sys.executable, "-c", child_code], lockstep=True) == 5
     else:
         assert stack.run(Path(sys.executable), output, timeout, [sys.executable, "-c", child_code]) == expected
     count = 1 if expected == "wrong_identity" else 2
@@ -107,6 +114,9 @@ def test_stub_stack_ready_exit_and_timeout_reap_all(tmp_path, monkeypatch, child
     assert start["settings"][0]["RL_DEMO_BOOT_ID"]
     demo = [event for event in events if event["event"] == "demo"]
     assert (start["settings"][0].get("RL_DEMO_SPECTATOR"), len(demo)) == (("viewer", 1) if expected == "demo" else (None, 0))
+    assert start["demo"] == (dict(spectator="viewer", pace_ms=450) if expected == "demo" else None)
+    shown = [(e.get("RL_DEMO_SPECTATOR"), e.get("RL_DEMO_PACE_MS")) for e in environments]
+    assert shown == [("viewer", "450") if expected == "demo" else (None, None)] * len(environments)
 
 
 @pytest.mark.parametrize("options", [dict(), dict(lockstep=True, worlds=2), dict(lockstep=True, worlds=0, engines={"pinned": Path(".")}, blocks=1)])

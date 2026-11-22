@@ -4,15 +4,19 @@ The world's native evaluator (demo-services, loopback only) owns the task clock
 and the resource evidence. Every raw exchange is appended to a JSONL log.
 """
 import gzip
+from http.client import HTTPConnection
+import io
 import json
 import math
 import os
 from pathlib import Path
 import re
+import select
 import threading
 import time
+from urllib.error import HTTPError,URLError
 from urllib.parse import urlsplit,urlunsplit
-from urllib.request import Request,urlopen
+from urllib.request import urlopen
 
 from baseline import config
 from baseline.resource_task import ResourceEpisode
@@ -104,18 +108,50 @@ def tick_windows(rows, speed_ms, seconds=5):
 
 
 class ResourceService:
+    """A world's control client: demo-services' /status and /resource-capture on its loopback port.
+
+    Its calls share one kept-open HTTP/1.1 connection. With a new loopback connection for each call, a watch's
+    four worlds made about 100 a second; a VPN's packet filter kept state for each one and then stalled every new local
+    connect for seconds. Before a request, a kept connection that the server has closed since its last reply is
+    replaced by a new one, so nothing is sent into it. A request once sent is never sent again: a resent arm or release
+    whose first copy took effect would be refused by the engine, and the lost reply of a release is the capture's
+    only receipt. Every failure raises as urlopen raised: URLError for a connect or send that failed, HTTPError for an
+    error status, TimeoutError for a reply that does not come in TIMEOUT seconds, the drop itself for a connection
+    closed without a reply."""
+    TIMEOUT=5
+
     def __init__(self,status_url,boot_id,account_name,record,*,speed_ms,xp_rate,spectator=None):
         url=urlsplit(status_url)
         if url.scheme!='http' or url.hostname not in ('127.0.0.1','localhost','::1') or url.username or url.password or url.path!='/status' or url.query or url.fragment:
             raise ValueError('owned loopback status URL required')
         if not isinstance(boot_id,str) or not boot_id or not isinstance(account_name,str) or not re.fullmatch('[a-z0-9]{1,12}',account_name):
             raise ValueError('explicit owned boot and native account required')
-        self.status_url=status_url;self.endpoint=urlunsplit((url.scheme,url.netloc,'/resource-capture','',''))
+        self.status_url=status_url;self.netloc=url.netloc
         self.boot=boot_id;self.account=account_name;self.record=record
         self.speed_ms=speed_ms;self.xp_rate=xp_rate;self.spectator=spectator;self.samples=[];self.last_status=None
+        self.connection=HTTPConnection(url.hostname,url.port,timeout=self.TIMEOUT)
+
+    def _exchange(self,method,path,body=None):
+        """One request on the kept connection; returns the reply's JSON."""
+        sock=self.connection.sock
+        if sock is not None:  # a kept connection reads as ready only when the server closed it (no reply is due)
+            ready=select.poll();ready.register(sock,select.POLLIN)
+            if ready.poll(0):self.connection.close()  # request() opens a new one
+        try:
+            try:self.connection.request(method,path,body=body,
+                                        headers={'Content-Type':'application/json'} if body is not None else {})
+            except OSError as error:raise URLError(error)  # as urlopen: a connect or send that failed
+            response=self.connection.getresponse();data=response.read()
+        except Exception:
+            self.connection.close()
+            raise
+        if not 200<=response.status<300:
+            raise HTTPError(urlunsplit(('http',self.netloc,path,'','')),response.status,response.reason,response.headers,
+                            io.BytesIO(data))
+        return json.loads(data)
 
     def status(self):
-        with urlopen(self.status_url,timeout=5) as response:payload=json.load(response)
+        payload=self._exchange('GET','/status')
         payload=check_status(payload,boot_id=self.boot,actors=1,spectator=self.spectator,speed_ms=self.speed_ms,
                              xp_rate=self.xp_rate)
         self.record('server_clock',server=payload)
@@ -130,8 +166,7 @@ class ResourceService:
         if operation!='identity':payload['identity']=identity
         if operation=='arm':payload['horizon']=horizon
         if operation=='arm' and targets is not None:payload['targets']=targets  # certified item scope
-        request=Request(self.endpoint,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
-        with urlopen(request,timeout=5) as response:reply=json.load(response)
+        reply=self._exchange('POST','/resource-capture',json.dumps(payload).encode())
         wanted='resource_identity' if operation=='identity' else 'resource_budget' if operation=='budget' else 'resource_capture'
         if reply.get('type')!=wanted or (identity is not None and reply.get('identity')!=identity):
             raise ValueError('resource control reply mismatch')

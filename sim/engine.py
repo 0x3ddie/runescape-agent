@@ -464,11 +464,14 @@ class World:
     at most one player. `tick` is World.currentTick: scripts in a cycle see it as map_clock,
     and it advances after the cycle."""
 
-    def __init__(self, tables: Tables, seed=0, start_tick=0, npcs=None, exclusions=frozenset(), xp_rate=XP_RATE):
+    def __init__(self, tables: Tables, seed=0, start_tick=0, npcs=None, exclusions=frozenset(), xp_rate=XP_RATE,
+                 loot_outside=None):
         """npcs: the world's npc spawns (dicts as tables.meta['npcs']) in place of the tables' own, for a task that
         places its enemies per episode (sim/combat.py); every rule applies to them as to map spawns. exclusions: native
         behavior a task's declared world leaves out (EXCLUSIONS), in training and evaluation alike. xp_rate: the world's
-        XP multiplier, as NODE_XPRATE multiplies Player.addXp natively (25 in every training world)."""
+        XP multiplier, as NODE_XPRATE multiplies Player.addXp natively (25 in every training world). loot_outside: the
+        debugnames the `loot_drops` exclusion leaves out, LOOT_OUTSIDE or a part of it: a declared world whose slice
+        ports what follows an item's drop names the rest (sim/combat.py VILLAGE_V2 holds the cabbage)."""
         if type(xp_rate) is not int or xp_rate < 1:
             raise ValueError(f'xp_rate {xp_rate!r}: a positive whole multiplier')
         self.xp_rate = xp_rate
@@ -476,6 +479,9 @@ class World:
         if unknown:
             raise ValueError(f'unknown exclusions {sorted(unknown)}')
         self.exclusions = frozenset(exclusions)
+        self.loot_outside = LOOT_OUTSIDE if loot_outside is None else tuple(loot_outside)
+        if not set(self.loot_outside) <= set(LOOT_OUTSIDE):
+            raise ValueError(f'loot outside the slice is a part of LOOT_OUTSIDE, not {sorted(set(self.loot_outside) - set(LOOT_OUTSIDE))}')
         self.t = tables
         self.rng = Rng(seed)
         self.tick = start_tick
@@ -1079,7 +1085,10 @@ class World:
                 self.npc_respawn(npc)
 
     def npc_respawn(self, npc):
-        """World.addNpc after npc_del: Npc.resetEntity(true) at the spawn."""
+        """World.addNpc after npc_del: Npc.resetEntity(true) at the spawn. Its last step writes an 'npc_respawn' event
+        (npc, type, life: the new life): its varns are NPC_VARS until [ai_spawn,_] runs in the next cycle's
+        process_npc_events, so a hit on the new life in this cycle gives no XP (xp_mult 0), and sim/audit.py XpCheck
+        takes that cycle from this event. The event is a record only: nothing in the engine reads it."""
         nt = self.t.npc_types[npc.base]
         npc.type, npc.active, npc.x, npc.z = npc.base, True, npc.start_x, npc.start_z
         npc.levels = list(nt['stats'])
@@ -1090,6 +1099,7 @@ class World:
         npc.tele = True
         self._occupy(npc, True)
         self.npc_events.append(npc)
+        self.events.append((self.tick, 'npc_respawn', dict(npc=npc.nid, type=npc.type, life=npc.life)))
 
     def npc_turn(self, npc):
         if npc.active:
@@ -1525,11 +1535,17 @@ class World:
         """PlayerOps STAT_RANDOM: success when value > floor(rand * 256)."""
         return stat_random_value(p.levels[stat], low, high) > int(self.rng(R_SCRIPT, self.tick, *keys) * 256)
 
-    def add_xp(self, p, stat, xp):
-        """Player.addXp with the world XP rate; a level gained queues [advancestat] (engine queue)."""
+    def add_xp(self, p, stat, xp, cause=None):
+        """Player.addXp with the world XP rate; a level gained queues [advancestat] (engine queue). Each gain is an 'xp'
+        event: the stat, the script's amount `xp` (tenths, before the rate), the stat's XP before and after, and `cause`,
+        what the script gave it for, as sim/audit.py XpCheck finds it in the event log: dict(cause='produce', obj, src),
+        dict(cause='hit', npc, life), dict(cause='bury', obj) or dict(cause='light', obj). Every script here names one;
+        an event without one is refused by the check."""
         if xp == 0:
             return
+        was = p.stats[stat]
         p.stats[stat] = min(p.stats[stat] + xp * self.xp_rate, 2_000_000_000)
+        self.events.append((self.tick, 'xp', dict(stat=stat, xp=xp, before=was, after=p.stats[stat], **(cause or {}))))
         before, current = p.base_levels[stat], p.levels[stat]
         if p.levels[stat] == p.base_levels[stat]:
             p.levels[stat] = level_for(p.stats[stat])
@@ -2017,7 +2033,7 @@ def get_logs(world, p, loc, row, axe):
     product = world.t.obj_id(row['product'])
     if world.decide('gather', world.stat_random(p, WOODCUTTING, low, high, 2), product):
         world.mes(world.text('wc_get', product=world.t.obj_types[product]['name'].lower()))
-        world.add_xp(p, WOODCUTTING, row['productexp'])
+        world.add_xp(p, WOODCUTTING, row['productexp'], dict(cause='produce', obj=product, src=loc.type))
         world.produce(p, product, '[label,get_logs]')
         if world.decide('deplete', world.random(deplete, 3) == 0):
             respawn = world.decide('respawn', (respawn * (4000 - 1)) // 4000)  # ~scale_by_playercount, one player
@@ -2114,7 +2130,7 @@ def get_ore(fast):
     name = '[label,get_ore_fast]' if fast else '[label,get_ore_normal]'
 
     def script(world, p, loc, row):
-        c = compact(world)
+        c, rock = compact(world), loc.type  # the row's rock: the loc changes to its depleted stage before the xp
         chance = c['gem_chance']
         neck = p.worn.items[WEARPOS_FRONT]
         if neck and world.t.obj_types[neck[0]]['category'] == world.t.meta['content']['categories']['category_557'] \
@@ -2134,7 +2150,7 @@ def get_ore(fast):
             respawn = world.decide('respawn', (row['respawn'] * (4000 - 1)) // 4000)  # ~scale_by_playercount
             world.change_loc(loc, world.loc_param_or_default(loc, 'next_loc_stage_mining'), loc.shape, loc.angle, respawn)
             world.produce(p, product, name)
-            world.add_xp(p, MINING, row['exp'])
+            world.add_xp(p, MINING, row['exp'], dict(cause='produce', obj=product, src=rock))
             world.mes(world.text('mine_get', ore=row['ore']))
             return
         p_oploc(world, p, loc, 3)
@@ -2316,7 +2332,7 @@ def fish_roll(world, p, fish1, fish2):
         if world.decide('gather', world.stat_random(p, FISHING, s['success_low'], s['success_high'], 10 + k),
                         world.t.obj_id(fish)):
             world.produce(p, world.t.obj_id(fish), '[proc,fish_roll]')
-            world.add_xp(p, FISHING, s['productexp'])
+            world.add_xp(p, FISHING, s['productexp'], dict(cause='produce', obj=world.t.obj_id(fish), src=None))
             world.mes(s['productmessage'])
             return
 
@@ -2527,7 +2543,11 @@ def player_melee_attack(world, p, npc):
         maxhit = min(p.varps['com_maxhit'], world.npc_param(npc, 'max_dealt'))  # ~npc_max_dealt
         damage = world.randominc(maxhit, npc.nid, 3)
         capped = min(damage, npc.levels[NPC_HP])
-        give_combat_experience(world, p, p.varps['damagestyle'], capped, npc.vars['xp_mult'])
+        # the hit as its xp's cause (sim/audit.py XpCheck): the damage queued below lands later, or not in a closed life
+        world.events.append((world.tick, 'hit', dict(npc=npc.nid, type=npc.type, life=npc.life, source=p.name, damage=damage,
+                                                     hp=npc.levels[NPC_HP], style=p.varps['damagestyle'])))
+        give_combat_experience(world, p, p.varps['damagestyle'], capped, npc.vars['xp_mult'],
+                               dict(cause='hit', npc=npc.nid, life=npc.life))
         if capped >= 1:
             npc.heroes[p.name] = npc.heroes.get(p.name, 0) + capped
     weapon = p.worn.items[WEARPOS_RHAND][0] if p.worn.items[WEARPOS_RHAND] else None
@@ -2552,22 +2572,23 @@ def npc_defence_roll(world, npc, damagetype):
     return (stat + 9) * (bonus + 64)
 
 
-def give_combat_experience(world, p, damagestyle, damage, multiplier):
-    """[proc,give_combat_experience] for the melee styles (its special npcs are not in the area)."""
+def give_combat_experience(world, p, damagestyle, damage, multiplier, cause=None):
+    """[proc,give_combat_experience] for the melee styles (its special npcs are not in the area); `cause`: the hit's
+    (World.add_xp)."""
     base = damage * 10
     xp = lambda percent: (base * percent // 100) * multiplier // 1000
     if damagestyle == 0:
-        world.add_xp(p, ATTACK, xp(400))
+        world.add_xp(p, ATTACK, xp(400), cause)
     elif damagestyle == 1:
-        world.add_xp(p, STRENGTH, xp(400))
+        world.add_xp(p, STRENGTH, xp(400), cause)
     elif damagestyle == 2:
-        world.add_xp(p, DEFENCE, xp(400))
+        world.add_xp(p, DEFENCE, xp(400), cause)
     elif damagestyle == 3:
         for stat in (ATTACK, STRENGTH, DEFENCE):
-            world.add_xp(p, stat, xp(133))
+            world.add_xp(p, stat, xp(133), cause)
     else:
         raise Unsupported(f'combat xp for damage style {damagestyle}')
-    world.add_xp(p, HITPOINTS, xp(133))
+    world.add_xp(p, HITPOINTS, xp(133), cause)
 
 
 def npc_retaliate(world, p, npc, delay):
@@ -2849,10 +2870,11 @@ EXCLUSIONS = ('random_events', 'clue_drops', 'loot_drops')
 LOOT_OUTSIDE = ('beer', 'bolt', 'cabbage', 'goblin_armour', 'knife', 'bronze_spear', 'air_talisman')
 
 
-def loot_outside(t, obj):
-    """A loot object of LOOT_OUTSIDE, or an unidentified herb ([proc,randomherb])."""
+def loot_outside(t, obj, names=LOOT_OUTSIDE):
+    """A loot object of `names` (LOOT_OUTSIDE, or a world's part of it: World.loot_outside), or an unidentified herb
+    ([proc,randomherb])."""
     name = t.obj_types[obj]['debugname']
-    return name in LOOT_OUTSIDE or name.startswith('unidentified_')
+    return name in names or name.startswith('unidentified_')
 
 
 def trail_categories(t):
@@ -2947,7 +2969,7 @@ class DeathContext:
             if 'clue_drops' in w.exclusions and w.t.obj_types[obj]['category'] in trail_categories(w.t):
                 w.events.append((w.tick, 'excluded', dict(what='clue_drop', obj=obj, npc=npc.nid)))
                 return 0
-            if 'loot_drops' in w.exclusions and loot_outside(w.t, obj):
+            if 'loot_drops' in w.exclusions and loot_outside(w.t, obj, w.loot_outside):
                 w.events.append((w.tick, 'excluded', dict(what='loot_drop', obj=obj, npc=npc.nid)))
                 return 0
             w.obj_add(self.player(), npc.level, npc.x, npc.z, obj, count, duration)
@@ -3140,7 +3162,7 @@ def bury_bones(world, p, name):
     p.stop_action()
     yield ('delay', 0)
     obj, _ = inv_delslot(world, p, slot, 'bury')
-    world.add_xp(p, PRAYER, world.obj_param(obj, 'bone_exp'))
+    world.add_xp(p, PRAYER, world.obj_param(obj, 'bone_exp'), dict(cause='bury', obj=obj))
     world.mes(world.text('bury_done'))
     if p.afk_ready:
         p.afk_ready = False
@@ -3184,6 +3206,54 @@ def held_script(world, name):
     if name.startswith('[opheld2,') and (name in c['wield'] or name == '[opheld2,_]'):
         return wield
     return eat if name in c['eat_triggers'] else archive_script(world, name)
+
+
+# ---- field plants (general_use/scripts/pickables.rs2; player/scripts/pickup.rs2 [proc,pickup_loc_floor]) ----------
+# village-world-v2 (sim/combat.py VILLAGE_V2). The scripts read rows that only an archive with the pick content holds
+# (sim/build.py picks: draynor-nc2.npz), so their triggers name a port only over such an archive (ARCHIVE_SCRIPTS);
+# over another one a Pick stays unsupported, as before.
+PLAYER_COUNT = 1  # the players a world holds; ~scale_by_playercount (general/scripts/player_count.rs2) scales by it
+
+
+def pick(world, p, loc):
+    """[oploc2,cabbage], [oploc2,potato], [oploc2,onion] (pickables.rs2): p_arrivedelay; with no free slot the full
+    message, p_teleport onto the plant and p_delay(0); else [proc,pickup_loc_floor]: p_teleport onto the plant, p_delay(0),
+    loc_del for the respawn (scaled by ~scale_by_playercount where the script says so), inv_add of the item (a 'produce'
+    event of the proc, which owes no XP: a pick gives none), then the picked message. The anim, the sound and the
+    wealth_event change nothing the slice reads."""
+    name = world.t.loc_types[loc.type]['debugname']
+    row = world.t.meta['content']['picks'][name]
+    if p.last_movement >= world.tick:  # p_arrivedelay: a tick's wait after a step this cycle
+        yield ('delay', 0)
+    if p.inv.freespace() == 0:
+        world.mes(world.text(f'pick_full_{name}'))
+        world.teleport(p, loc.x, loc.z)
+        yield ('delay', 0)
+        return
+    world.teleport(p, loc.x, loc.z)
+    yield ('delay', 0)
+    respawn = row['respawn']
+    if row['scaled']:  # scale(sub(4000, min(playercount, 2000)), 4000, $base)
+        respawn = respawn * (4000 - min(PLAYER_COUNT, 2000)) // 4000
+    world.remove_loc(loc, respawn)
+    if p.inv.freespace() == 0:  # inv_add's overflow drops the item on the ground; nothing fills a slot in the delay
+        raise Unsupported('a pick whose item overflows a full inventory')
+    world.produce(p, world.t.obj_id(row['item']), '[proc,pickup_loc_floor]')
+    world.mes(world.text(f'pick_{name}'))
+
+
+# The OPHELDU scripts of what village-world-v2 adds to the held items: the field items, [opheldu,cabbage]
+# (skill_cooking/scripts/gnome_cooking/gnome_cooking.rs2), [opheldu,potato] and [opheldu,onion] (skill_cooking/scripts/
+# cooking_inv/scripts/stew/stew.rs2, ugthanki_kebab/ugthanki_kebab.rs2), and the highwayman's drop, [opheldu,black_cape]
+# (skill_crafting/scripts/dye_cape/dye_cape.rs2): switch_obj(last_useitem) whose cases need items the compact worlds lack,
+# so only the default branch runs (use_default). They read no archive row, but they are ported, as the picks, only over an
+# archive with the pick rows (ARCHIVE_SCRIPTS), so that over every other archive each stays unsupported as before and
+# nothing else (the C export's map of HELD included) changes.
+FIELD_USE = {'[opheldu,cabbage]': ('half_baked_batta', 'raw_chompy'),
+             '[opheldu,potato]': ('bowl_water', 'stew2', 'bowl_empty', 'raw_chompy', 'half_baked_bowl'),
+             '[opheldu,onion]': ('bowl_empty', 'bowl_tomato', 'bowl_ugthanki', 'bowl_ugthankitomato', 'bowl_oniontomato',
+                                 'bowl_onion', 'bowl_ugthankionion', 'half_baked_bowl', 'half_baked_batta'),
+             '[opheldu,black_cape]': ('reddye', 'bluedye', 'yellowdye', 'greendye', 'purpledye', 'orangedye')}
 
 
 # ---- firemaking and cooking (skill_firemaking/scripts/firemaking.rs2, skill_cooking/scripts/cooking.rs2) ----------
@@ -3292,7 +3362,7 @@ def firemaking_success(world, p, obj):
     100 + random(100) ticks, then world_delay(that count - 2) and ashes for 100 ticks, with no receiver (obj_addall).
     The fire's count runs out in a zone phase, and the world queue adds the ashes in the first phase of the next cycle."""
     world.remove_obj(obj)
-    world.add_xp(p, FIREMAKING, world.obj_param(obj.type, 'productexp'))
+    world.add_xp(p, FIREMAKING, world.obj_param(obj.type, 'productexp'), dict(cause='light', obj=obj.type))
     world.mes(world.text('fm_catch'))
     life = world.decide('burn', 100 + world.random(100, 41))
     fire = next(k for k, t in world.t.loc_types.items() if t['debugname'] == 'loc_2732')
@@ -3344,15 +3414,17 @@ def attempt_cook_item(world, p, loc):
     world.produce(p, world.t.obj_id(row['cooked' if passes else 'burnt']), '[label,cook_item]')
     world.mes(row['success' if passes else 'burn'])
     if passes:
-        world.add_xp(p, COOKING, row['exp'])
+        world.add_xp(p, COOKING, row['exp'], dict(cause='produce', obj=world.t.obj_id(row['cooked']), src=raw))
 
 
 ARCHIVE_SCRIPTS = dict(firemaking={'[opheldu,tinderbox]': tinderbox_use, '[opobj4,_category_22]': light_logs_ground},
-                       cooking={'[oplocu,_cooking_oven]': attempt_cook_item, '[oplocu,_cooking_fire]': cook_on_fire})
+                       cooking={'[oplocu,_cooking_oven]': attempt_cook_item, '[oplocu,_cooking_fire]': cook_on_fire},
+                       picks={**{f'[oploc2,{name}]': pick for name in ('cabbage', 'potato', 'onion')},
+                              **{name: use_default(cases) for name, cases in FIELD_USE.items()}})
 
 
 def archive_script(world, name):
-    """The port of a firemaking or cooking trigger over an archive that holds its rows, else None."""
+    """The port of a firemaking, cooking or pick trigger over an archive that holds its rows, else None."""
     content = world.t.meta.get('content', {})
     return next((scripts[name] for key, scripts in ARCHIVE_SCRIPTS.items() if key in content and name in scripts), None)
 

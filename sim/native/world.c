@@ -185,6 +185,7 @@ int rs_world_init(World *w, const RsPack *P, const RsLayout *L, int64_t seed, in
         return RS_FAIL_TEXT(&w->err, RS_E_CONTRACT, "unknown exclusions");
     w->xp_rate = xp_rate;
     w->excl = exclusions;
+    w->loot = RS_OF_LOOT_OUTSIDE;  /* World(loot_outside=None): LOOT_OUTSIDE; a village life of its own list sets OWN */
     w->seed = rs_seed(seed);
     w->tick = start_tick;
     w->members = (uint8_t)(P->consts->members != 0);
@@ -341,6 +342,18 @@ static int take_step(World *w, int32_t level, int32_t x, int32_t z, int32_t tx, 
         RS_TRY(rs_can_travel(w, level, x, z, 0, dz, size, extra, collision, &ok));
         if (ok) { *sdz = dz; return 0; }
     }
+    return 0;
+}
+
+/* World.teleport (engine.py): PathingEntity.teleport on the player's level, refused off the supported tiles;
+   the occupancy follows the player, the waypoints stay; no moveSpeed INSTANT (that is a teleJump's), no step taken and
+   no last_movement. */
+int rs_teleport(World *w, int32_t x, int32_t z) {
+    Player *p = &w->p;
+    if (rs_source(w->L, p->level, x, z) < 0) return RS_FAIL(&w->err, RS_E_TELEPORT_OUTSIDE, p->level, x, z);
+    rs_occupy(w, p->level, p->x, p->z, 1, 0);
+    p->x = (int16_t)x, p->z = (int16_t)z;
+    rs_occupy(w, p->level, p->x, p->z, 1, 1);
     return 0;
 }
 
@@ -1051,13 +1064,17 @@ int rs_stat_heal(World *w, int32_t stat, int32_t constant, int32_t percent, int 
     return 0;
 }
 
-/* Player.addXp with the world XP rate (engine.py): the HP event precedes [changestat], which precedes
-   [advancestat,<skill>] on the engine queue; levelup reads base_levels when it runs. */
-int rs_add_xp(World *w, int32_t stat, int32_t xp) {
+/* Player.addXp with the world XP rate (World.add_xp): the 'xp' event follows the stat, the HP event precedes
+   [changestat], which precedes [advancestat,<skill>] on the engine queue; levelup reads base_levels when it runs. */
+int rs_add_xp(World *w, int32_t stat, int32_t xp, int cause, int32_t obj, int32_t src) {
     if (xp == 0) return 0;
     Player *p = &w->p;
+    int32_t was = p->stats[stat];
     int64_t total = (int64_t)p->stats[stat] + (int64_t)xp * w->xp_rate;
     p->stats[stat] = (int32_t)(total < 2000000000 ? total : 2000000000);
+    RsEvent e = {.tick = w->tick, .kind = RS_EV_XP, .a8 = (uint8_t)stat, .b8 = (uint8_t)cause, .obj = obj, .count = xp,
+                 .v0 = was, .v1 = p->stats[stat], .v2 = src};
+    RS_TRY(rs_event(w, &e));
     int32_t before = p->base_levels[stat], current = p->levels[stat];
     if (p->levels[stat] == p->base_levels[stat]) p->levels[stat] = (int16_t)level_for(w->P, p->stats[stat]);
     p->base_levels[stat] = (int16_t)level_for(w->P, p->stats[stat]);
@@ -1773,7 +1790,7 @@ int rs_world_canon(const World *w, int64_t *buf, int cap, int *n, RsErr *err) {
         const RsTextLine *t = w->text.n ? &w->text.line[w->text.n - 1] : NULL;
         em_v(&e, w->text.n), em_v(&e, t ? t->iface : -1), em_v(&e, t ? t->com : -1);
         em_v(&e, t ? msg_text(w, t->msg) : -1);
-        em_v(&e, w->n_events);
+        em_v(&e, w->ev_base + w->n_events);   /* len(world.events): a free-play life keeps the last event */
     }
     em_end(&e);
     em_begin(&e, RS_CF_EVENT_LAST);

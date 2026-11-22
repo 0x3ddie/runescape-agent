@@ -43,10 +43,24 @@ verdict likewise. Reported rules (greedy play, hidden-tree search, the short woo
 the rules, every cell reports successes, deaths, decisions per 1,000 ticks, refusals, stalls and interface loops (each
 None where its evaluator records no such evidence).
 
+`free` reads the rows of sim.hour free (free-play-v1's evaluation) and writes free.json:
+for each policy seed and each sampled pass, never pooled, every actor's mean integer level gain and deaths a life, the
+paired differences policy - control with a 95% percentile bootstrap paired by record (baseline/compare.py
+paired_bootstrap, FREE's 10,000 resamples and seed 17017), Claims L, B and R and No rescue with every number each used;
+greedy play and the 6,000-tick read are descriptions with no claim; beside them the unpaid reads. A verdict (pass, fail,
+match) is written only for outputs that match one of FREE's frozen plans exactly (its settings, tables, seeds and the
+final checkpoint of a run with its frozen facts), of one commit with no change; any other outputs give the same numbers
+as a description, and an XP rate other than 1 the differences only. The pilot's plan is frozen (12
+November 2026); the final read's is not, until its decision budget and start digests. It plays nothing, so it runs
+again on the same rows:
+
+    .venv-sim/bin/python -m sim.gate free OUT_S101 OUT_S202 ... OUT_CONTROLS --output free.json
+
 `final4` (FINAL4, beside GATE) is the native gap study's simulator read of one Stage 4 final: sim.run goals on the
 frozen final4 records, mine only, in FINAL4's passes, written as final4.json with gate-v2's mine rule and verdict.
 """
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import gzip
 import json
@@ -615,6 +629,576 @@ def final4_json(out, checkpoint, policy_seed, records, layouts, timing):
     return result
 
 
+# ---- free-play-v1: the statistics and the verdict from the rows of sim.hour free ------------------------------------
+# A plan's settings: the world (sim/combat.py VILLAGES; free_plan_world), the record set and how it is played, each
+# compared with the outputs' own.
+FREE_PLAN_SETTINGS = ('world', 'split', 'first', 'records', 'key', 'xp_rate', 'muggers', 'ticks', 'read', 'period',
+                      'control_seed')
+FREE_PLAN = FREE_PLAN_SETTINGS + ('tables', 'run', 'start', 'pass_seeds', 'policy_seeds', 'claims')
+RELAUNCH = 1_000_000  # one relaunch from the frozen initialization at environment seed + this
+FREE_CLAIMS = ('L', 'B', 'R', 'no_rescue')
+FREE = dict(
+    statistics=dict(draws=10_000, seed=17017),  # baseline/compare.py paired_bootstrap: 95% percentile, paired by record
+    passes=('sampled1', 'sampled2'),            # the claims' passes: each must hold, never pooled; greedy is described
+    zero='random',                              # Claim L: policy - random legal play
+    references=dict(wood=('woodcutting',), fish=('fishing',), mine=('mining',),  # Claim B: each reference's own skills
+                    melee=('attack', 'strength', 'defence', 'hitpoints')),
+    timer='rotation',                           # Claim R: policy - the fixed-timer rotation
+    exploits=('chickens', 'once', 'eat'),       # No rescue
+    # The frozen plans, as FINAL4 freezes its own (records and statistics, frozen before training).
+    # A verdict (pass, fail, match) is written only for outputs that match one plan exactly (free_plan); other outputs
+    # give their numbers as a description. A plan holds FREE_PLAN: its settings, the tables' sha256, the training run's
+    # frozen facts ({fact: value} over sim/hour.py FREE['run_facts']: decisions, worlds, the learner's settings, the
+    # batch's muggers and life, the layout pool's sha256, the tables' sha256; beside them FREE['engine_facts'], the C
+    # engine and its pack's sha256, or none of the two for the Python reference: free_plan_engine), each policy seed's start ({seed: its initialization's tensor
+    # digest, policy_sha256_at_start}), the sampled passes' seeds ({sampled1: seed, sampled2: seed}; greedy plays
+    # sampled1's), the policy seeds and the claims it reads. Values are compared in the JSON form that the manifests
+    # hold (a tuple equals a list). A plan that holds a None matches no output. final: the five-seed final read (Claims
+    # L, B and R and No rescue); its records, seeds, claims and controls are fixed in advance, and a later commit may
+    # add only its decision budget and start digests, so it holds no value yet. pilot: one seed on development
+    # records, Claim L alone as a learning signal; frozen on 12 November 2026. Its digests were computed with the
+    # code's own functions: the tables' sha256 (sim/build.py DATA), the 128-layout pool's
+    # (logs/sim/world/train-128-1000-nc1.npz) and seed 77's start (sim.train train --initial-only at the plan's settings).
+    # The world: a plan frozen after the world became a recorded setting names it (`world`; final holds the key); the
+    # pilot's, frozen before (12 November 2026), names none and is village-world-v1's (free_plan_world), its values as
+    # frozen. A village-world-v2 plan names its world. wider_pilot: the pilot of village-world-v2, one seed on its
+    # development records, Claim L alone as a learning signal; frozen on 14 November 2026, its training on the C
+    # engine. Its digests were computed with the code's own functions: the tables' sha256 (sim/hour.py
+    # world_archive of village-world-v2: logs/sim/data/draynor-nc2.npz), the pool's (summary 'pool':
+    # logs/sim/world/train-128-20000-v2.npz, train indices 20,000 to 20,127), the pack's (summary 'pack', the file's
+    # sha256, exported from both without route trees) and seed 79's start (sim.train train --initial-only at the plan's
+    # settings on this Mac's C engine with that pack and 8 workers; the same digest in two runs). The pack's pin is the
+    # plan's second freeze (15 November 2026) and the one value it changed: the first launch stopped on the XP check's
+    # rule (a hit in the cycle of its npc's respawn owes no XP), and every pack was exported again at the repair (the
+    # npc_respawn event in both engines), so the first pin, train-128-20000-v2-a6c325a-ids2.pack's (3f17a1c1...), no
+    # longer opens. The pin is now train-128-20000-v2-a6c325a-ids3.pack's; a start-only run after the repair with it
+    # gives seed 79's frozen start digest.
+    # Its run pins the engine facts beside the run facts; the run's world is no run fact but the batch's (summary
+    # free_play batch_in_effect, read by free_plan_differs through sim/hour.py trained_world).
+    plans=dict(
+        final=dict.fromkeys(FREE_PLAN),
+        pilot=dict(split='development', first=4000, records=64, key=223, xp_rate=1, muggers=False, ticks=36000,
+                   read=6000, period=4500, control_seed=4253,
+                   tables='307b77a7a58327782bc25654127048968d12c9e88ef1a74c221ca60b3d6c5771',
+                   run=dict(decisions=4194304, worlds=1024, n_steps=64, batch_size=1024, n_epochs=4, learning_rate=0.0003,
+                            gae_lambda=0.95, clip_range=0.2, ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5,
+                            lstm_hidden_size=128, half_life_ticks=1000.0,
+                            value_norm=dict(method='popart', beta=0.1, min_std=0.01), muggers=False,
+                            life=('uniform', 6000, 36000),
+                            pool='1cccffbede7f2613b5baf31e9f436a22bc84202eb3ed99023c33e0cd553d9469',
+                            tables='307b77a7a58327782bc25654127048968d12c9e88ef1a74c221ca60b3d6c5771', validate=True),
+                   start={77: '96b1f9872b62bef7034b8502b227273ece84f6c0d988d50e3ccc6b8223105d65'},
+                   pass_seeds=dict(sampled1=229, sampled2=233), policy_seeds=(77,), claims=('L',)),
+        wider_pilot=dict(world='village-world-v2', split='development', first=7000, records=64, key=239, xp_rate=1,
+                         muggers=False, ticks=36000, read=6000, period=4500, control_seed=4253,
+                         tables='7dee885e663b89956f2416262582d34f8438caa3eeb6a3421b57bdad862eba19',
+                         run=dict(decisions=4194304, worlds=1024, n_steps=64, batch_size=1024, n_epochs=4,
+                                  learning_rate=0.0003, gae_lambda=0.95, clip_range=0.2, ent_coef=0.01, vf_coef=0.5,
+                                  max_grad_norm=0.5, lstm_hidden_size=128, half_life_ticks=1000.0,
+                                  value_norm=dict(method='popart', beta=0.1, min_std=0.01), muggers=False,
+                                  life=('uniform', 6000, 36000),
+                                  pool='56e2607b7a0e5a7e4a19797a13b6b61774709adf69523d7ba6faf3ced8df69bb',
+                                  tables='7dee885e663b89956f2416262582d34f8438caa3eeb6a3421b57bdad862eba19', validate=True,
+                                  engine='native',
+                                  # pack was 97640806ca29025e565bafd37bdd2fe6e3160700a47b02339761659fc08b683f, moved
+                                  # on 20 November 2026; the 34 sections are byte-equal
+                                  pack='21f147bfa83868ec5d5de456502cec7c97e2e72d875a45f337319dc5900cd04c'),
+                         start={79: 'e355680184117f730fef1d9f3c6050c60c21922ca33218c5b5c4aad35410eb6c'},
+                         pass_seeds=dict(sampled1=251, sampled2=257), policy_seeds=(79,), claims=('L',)),
+        # wider_final: five seeds of village-world-v2 on its final records, Claims L, B and R and No rescue; frozen on
+        # 16 November 2026. The records, pass and control seeds, claims and controls are the wider world's freeze of
+        # 14 November; the run is wider_pilot's, its budget the pilot's 4,194,304 decisions (in place of the earlier
+        # budget rule for this block), on the C engine with wider_pilot's pack. Each start digest was made by sim.train
+        # train --initial-only at this run's settings on this Mac's C engine with that pack and 8 workers, the same
+        # digest in two runs a seed; the same command gives seed 79's frozen start (e3556801...). A seed's tensors at
+        # its start depend on the seed and the network alone: they equal the first world's freeze dry run's.
+        wider_final=dict(world='village-world-v2', split='final', first=8000, records=256, key=241, xp_rate=1,
+                         muggers=False, ticks=36000, read=6000, period=4500, control_seed=4253,
+                         tables='7dee885e663b89956f2416262582d34f8438caa3eeb6a3421b57bdad862eba19',
+                         run=dict(decisions=4194304, worlds=1024, n_steps=64, batch_size=1024, n_epochs=4,
+                                  learning_rate=0.0003, gae_lambda=0.95, clip_range=0.2, ent_coef=0.01, vf_coef=0.5,
+                                  max_grad_norm=0.5, lstm_hidden_size=128, half_life_ticks=1000.0,
+                                  value_norm=dict(method='popart', beta=0.1, min_std=0.01), muggers=False,
+                                  life=('uniform', 6000, 36000),
+                                  pool='56e2607b7a0e5a7e4a19797a13b6b61774709adf69523d7ba6faf3ced8df69bb',
+                                  tables='7dee885e663b89956f2416262582d34f8438caa3eeb6a3421b57bdad862eba19', validate=True,
+                                  engine='native',
+                                  # pack was 97640806ca29025e565bafd37bdd2fe6e3160700a47b02339761659fc08b683f, moved
+                                  # on 20 November 2026; the 34 sections are byte-equal
+                                  pack='21f147bfa83868ec5d5de456502cec7c97e2e72d875a45f337319dc5900cd04c'),
+                         start={101: '5dc9abefeb3349d6c37cb3dcb3d97bfa52e26df027bb00ab8efd1e00d67695e5',
+                                202: '18ce6031a43d9207acd86220c12bbacdd075e728c051a8c8891058a99a011642',
+                                303: '1be77d8c94ee4f97a6221cb90e78a1f5ece4e109c278a154ef86e522dbb65293',
+                                404: '8be523c0832a682e9278ef15860e8e7ea06068d1754caf148ca43f85677f09ba',
+                                505: '7e71409a474ed3d76ec45463c0b92f6d7558b2a175348d476a93573d1dff04e9'},
+                         pass_seeds=dict(sampled1=251, sampled2=257), policy_seeds=(101, 202, 303, 404, 505),
+                         claims=('L', 'B', 'R', 'no_rescue')),
+    ),
+    statement=("No claim is about generalization: the final records are new draws from the training world's own "
+               "distribution, and new layouts and native sites are phase 4's."),
+    readings=dict(no_rescue='the return is cheap in this world', B='learns, not shown beyond one activity',
+                  R='not shown better than a timer'),
+    off_rate='description (25x, out of the training distribution)',  # any XP rate but 1: differences only, no claim
+)
+# Each claim's own controls (free_claims): named in a seed's incomplete_controls when one is not complete.
+FREE_CONTROLS = dict(L=(FREE['zero'],), B=tuple(FREE['references']), R=(FREE['timer'],), no_rescue=FREE['exploits'])
+# The settings every output of one evaluation shares: the record set, the code and the tables (sim/hour.py free_run).
+FREE_SHARED = ('task', 'rows', 'world', 'observation', 'source', 'split', 'first', 'records', 'key', 'muggers', 'xp_rate',
+               'ticks', 'read', 'control_seed')
+
+
+def free_outputs(outputs):
+    """(settings, policies, cells, evidence) of sim.hour free outputs read as one evaluation: every manifest holds the
+    same FREE_SHARED settings and tables and at least one record, each life is there once, one rotation period at most,
+    each policy seed one policy and one set of pass seeds, each checkpoint and initialization under one seed, and no
+    record whose two sampled passes share a seed; an output or a row of a changed world (sim.hour free --change) is
+    refused: it is a description of the scorecard, never an evaluation that a plan reads. policies: {seed: the
+    manifest's policy, with its pass seeds under
+    'passes'}; cells: {(actor, policy seed or None, pass or None): {record: row}}; evidence: the parts' cut last lines,
+    the lives files a manifest declares that are missing, and the unsupported lives."""
+    from sim.hour import FREE as PLAY, POLICY_ACTORS, free_rows
+    settings, policies, digests, cells, periods = None, {}, {}, {}, set()
+    evidence = dict(cut=[], missing=[])
+    for output in map(Path, outputs):
+        manifest = read(output / 'manifest.json')
+        if manifest is None:
+            raise ValueError(f'{output} holds no sim.hour free manifest')
+        if manifest.get('rows') != PLAY['rows']:
+            raise ValueError(f"{output} holds rows of revision {manifest.get('rows')}: this code reads {PLAY['rows']}")
+        if manifest.get('change') is not None:
+            raise ValueError(f"{output} holds the changed world {manifest['change'].get('name')!r}: a description of the "
+                             'scorecard, never an evaluation that a plan reads')
+        shared = dict({k: manifest.get(k) for k in FREE_SHARED}, tables=manifest['tables']['sha256'])
+        if settings is not None and shared != settings:
+            raise ValueError(f'{output} is another evaluation: {sorted(k for k in shared if shared[k] != settings[k])} differ')
+        settings = shared
+        if not (type(settings['records']) is int and settings['records'] >= 1):
+            raise ValueError(f"{output} declares {settings['records']!r} records: an evaluation reads one or more")
+        if manifest['policy'] is not None:
+            seed = manifest['policy']['seed']
+            policy = dict(manifest['policy'], passes={p['name']: p['seed'] for p in manifest['passes']})
+            known = policies.setdefault(seed, policy)
+            if known['passes'] != policy['passes']:
+                raise ValueError(f"seed {seed}'s outputs hold other pass seeds: {known['passes']} and {policy['passes']}")
+            if known != policy:
+                raise ValueError(f'two policies of seed {seed}')
+            for actor in POLICY_ACTORS:
+                digest = manifest['policy'][actor]['sha256']
+                if digests.setdefault(digest, seed) != seed:
+                    raise ValueError(f'one checkpoint ({digest[:12]}) under seeds {digests[digest]} and {seed}')
+        periods |= {manifest['period']} - {None}
+        if len(periods) > 1:
+            raise ValueError(f'rotations of {sorted(periods)} ticks: one evaluation reads one rotation (Claim R)')
+        for index in range(manifest['parts']):
+            path = output / f'lives-{index}.jsonl'
+            if not path.exists():
+                evidence['missing'].append(f'{output.name}/{path.name}')
+                continue
+            rows, short = free_rows(path)
+            evidence['cut'] += [f'{output.name}/{path.name}'] if short else []
+            for row in rows:
+                if row.get('change') is not None:
+                    raise ValueError(f"{output}/{path.name}: a life of the changed world {row['change']!r}, never a row of "
+                                     'an evaluation that a plan reads')
+                cell = cells.setdefault((row['actor'], row['policy_seed'], row['pass']), {})
+                if row['record'] in cell or not 0 <= row['record'] < settings['records']:
+                    raise ValueError(f"{output}: {row['actor']} {row['pass']} record {row['record']} twice or outside the records")
+                cell[row['record']] = row
+    for (actor, seed, p), cell in cells.items():
+        other = cells.get((actor, seed, 'sampled2'), {}) if p == 'sampled1' else {}
+        same = sorted(r for r, row in cell.items() if r in other and other[r]['seed'] == row['seed'])
+        if same:
+            raise ValueError(f'{actor} of seed {seed}: records {same} play one seed in both sampled passes')
+    evidence['unsupported'] = [dict(actor=a, policy_seed=s, pass_name=p, record=r['record'], site=r['unsupported']['file'],
+                                    line=r['unsupported']['line'], message=r['unsupported']['message'])
+                               for (a, s, p), cell in cells.items() for r in cell.values() if r['unsupported'] is not None]
+    return dict(settings, period=next(iter(periods), None)), policies, cells, evidence
+
+
+def free_frozen(plan):
+    """A plan holds a value for every key and no None at any depth (in its run facts, starts and pass seeds too), one
+    policy seed and one claim at least."""
+    unset = lambda v: v is None or isinstance(v, dict) and any(map(unset, v.values())) or \
+        isinstance(v, (list, tuple)) and any(map(unset, v))
+    return not unset(plan) and plan['policy_seeds'] not in ((), []) and plan['claims'] not in ((), [])
+
+
+def free_plan_world(plan):
+    """The world a plan reads: its `world`, held to as it is. Any plan that names none reads sim/hour.py
+    FREE['first_world'] (village-world-v1): in practice the pilot's, frozen before any other world existed, since the
+    final plan holds the key and a frozen plan holds no None."""
+    from sim.hour import FREE as PLAY
+    return plan['world'] if 'world' in plan else PLAY['first_world']
+
+
+def free_plan_engine(plan):
+    """The engine facts (sim/hour.py FREE['engine_facts']) that a plan pins: those its run holds, or, when it holds the
+    run facts alone, the Python reference's (FREE['reference_engine']: engine 'cpu', no pack), the form of the pilot's
+    plan, frozen before the C engine trained free play."""
+    from sim.hour import FREE as PLAY
+    return {k: plan['run'][k] for k in PLAY['engine_facts'] if k in plan['run']} or dict(PLAY['reference_engine'])
+
+
+def free_plan_shape(name, plan, facts, engine):
+    """Refuse a frozen plan that no output could match for its form: a world of sim/combat.py VILLAGES (or none:
+    free_plan_world); claims a tuple or list among FREE_CLAIMS, each
+    once; policy seeds a tuple or list of whole numbers; pass seeds {sampled1, sampled2} of two different whole numbers;
+    start {policy seed: digest}; run with exactly the run facts `facts`, or those and the engine facts `engine`, which
+    name the C engine and its pack's sha256 (a plan of the Python reference holds the run facts alone); every value of
+    a form that JSON holds."""
+    from sim.combat import VILLAGES
+    passes, start, bad = plan['pass_seeds'], plan['start'], []
+    claims, seeds = plan['claims'], plan['policy_seeds']
+    if free_plan_world(plan) not in VILLAGES:
+        bad.append(f'world one of {sorted(VILLAGES)}, or no world (village-world-v1: free_plan_world)')
+    if not (isinstance(claims, (tuple, list)) and set(claims) <= set(FREE_CLAIMS) and len(set(claims)) == len(claims)):
+        bad.append(f'claims a tuple or list among {list(FREE_CLAIMS)}, each once')
+    if not (isinstance(seeds, (tuple, list)) and all(type(s) is int for s in seeds) and len(set(seeds)) == len(seeds)):
+        bad.append('policy_seeds a tuple or list of different whole numbers')
+    if not (isinstance(passes, dict) and set(passes) == set(FREE['passes']) and all(type(v) is int for v in passes.values())
+            and len(set(passes.values())) == len(passes)):
+        bad.append(f'pass_seeds of {list(FREE["passes"])}, two different whole numbers')
+    if not (isinstance(start, dict) and isinstance(seeds, (tuple, list)) and set(start) == set(seeds)
+            and all(isinstance(v, str) for v in start.values())):
+        bad.append('start {policy seed: its initialization\'s tensor digest} for each policy seed')
+    if not isinstance(plan['run'], dict):
+        bad.append(f'run {{fact: value}} over {list(facts)}')
+    else:
+        expected = set(facts) | (set(engine) if set(engine) & set(plan['run']) else set())
+        if set(plan['run']) != expected:
+            bad.append(f"run without the facts {sorted(expected - set(plan['run']))} and with "
+                       f"{sorted(set(plan['run']) - expected)} beside them")
+        elif set(engine) <= set(plan['run']) and not (plan['run']['engine'] == 'native' and isinstance(plan['run']['pack'], str)):
+            bad.append("engine facts of the C engine ('native') and its pack's sha256: a plan of the Python reference holds "
+                       'the run facts alone')
+    for key, value in [*((k, plan[k]) for k in plan if k != 'run'),
+                       *((f'run.{k}', v) for k, v in (plan['run'] if isinstance(plan['run'], dict) else {}).items())]:
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError):
+            bad.append(f'{key} of a form that JSON holds, not {value!r}')
+    if bad:
+        raise ValueError(f'plan {name} is malformed: it needs {"; ".join(bad)}')
+
+
+def free_clean(code):
+    """The outputs' source is one commit with no change (no changed or untracked file, no patch)."""
+    code = code or {}
+    return code.get('commit') is not None and not code.get('changed') and not code.get('untracked') and \
+        code.get('patch') is None
+
+
+def free_plan_run(policies, code):
+    """Why no plan reads these policies, whatever its values: a run that has not completed; a checkpoint that is not
+    its run's final (latest.zip, whose tensor digest the run summary records as policy_sha256_at_end); a summary that
+    records no final digest; a start other than these three (no --init in any): the seed's own (environment seed = the
+    seed, with no --weights); the frozen initialization's file at the seed's own environment seed (--weights: a run on
+    another host trains from this Mac's file, since an initialization made there can differ in its last bits); or its
+    one relaunch from the frozen initialization (environment seed = the seed + RELAUNCH, with --weights). For each, the
+    start digest, compared with the plan's (free_plan_differs), shows the tensors were the frozen initialization's; a summary
+    that records no training tables (the fake environment; a C-engine run from before its summary recorded the archive
+    its pack was held equal to); a C-engine run whose pack does not record its own tables and pool as the inputs it was
+    exported from (summary 'pack' inputs: what ties the plan's pack to the plan's tables and pool); a run whose
+    summary records no source (an older run), whose source is not one commit with no change, or whose commit is not the
+    commit of the outputs' source `code`."""
+    runs = {s: p['run'] for s, p in sorted(policies.items())}
+    unfinished = [s for s, r in runs.items() if r['status'] != 'completed']
+    later = {s: r['checkpoint'] for s, r in runs.items() if r['checkpoint'] != 'latest.zip' or
+             r.get('policy_sha256_at_end') not in (None, policies[s]['policy'].get('policy_sha256'))}
+    undigested = [s for s, r in runs.items() if r.get('policy_sha256_at_end') is None]
+    own = lambda s, r: r.get('env_seed') == s and r.get('init') is None  # its own start, or from the frozen file
+    relaunch = lambda s, r: r.get('env_seed') == s + RELAUNCH and r.get('weights') is not None and r.get('init') is None
+    started = {s: r.get('env_seed') for s, r in runs.items() if not (own(s, r) or relaunch(s, r))}
+    untabled = {s: f"env {r.get('env')}, engine {r.get('engine')}" for s, r in runs.items()
+                if (r.get('facts') or {}).get('tables') is None}
+    exported = lambda r: {k: ((r.get('pack') or {}).get('inputs') or {}).get(k) for k in ('tables', 'pool')}
+    unproved = {s: exported(r) for s, r in runs.items() if r.get('engine') == 'native' and s not in untabled and
+                exported(r) != {k: (r.get('facts') or {}).get(k) for k in ('tables', 'pool')}}
+    unsourced = [s for s, r in runs.items() if r.get('source') is None]
+    unclean = {s: r['source'] for s, r in runs.items() if r.get('source') is not None and not free_clean(r['source'])}
+    commit = (code or {}).get('commit')
+    elsewhere = {s: r['source'].get('commit') for s, r in runs.items()
+                 if r.get('source') is not None and s not in unclean and r['source'].get('commit') != commit}
+    return ([f'a checkpoint of a run that has not completed (seeds {unfinished})'] if unfinished else []) + \
+        ([f"a checkpoint that is not its run's final ({', '.join(f'seed {s}: {c}' for s, c in later.items())})"]
+         if later else []) + \
+        ([f'a run summary that records no final checkpoint digest (policy_sha256_at_end; seeds {undigested})']
+         if undigested else []) + \
+        ([f"a run started otherwise than at its own seed or as its one relaunch from the initialization at seed + "
+          f"{RELAUNCH:,} ({', '.join(f'seed {s}: environment seed {e}' for s, e in started.items())})"] if started else []) + \
+        ([f"a run summary that records no training tables, as the fake environment's and an older C-engine run's: a plan "
+          f"pins the archive a run trained on ({', '.join(f'seed {s}: {e}' for s, e in untabled.items())})"]
+         if untabled else []) + \
+        ([f"a C-engine run whose pack does not record its tables and pool as the inputs it was exported from "
+          f"({', '.join(f'seed {s}: the pack records {e}' for s, e in unproved.items())})"] if unproved else []) + \
+        ([f'a run summary that records no source, as an older run\'s (seeds {unsourced})'] if unsourced else []) + \
+        ([f"a run trained from a source that is not one commit with no change ({', '.join(f'seed {s}: {c}' for s, c in unclean.items())})"]
+         if unclean else []) + \
+        ([f"a run trained at another commit than the outputs' {commit} ({', '.join(f'seed {s}: {c}' for s, c in elsewhere.items())})"]
+         if elsewhere else [])
+
+
+def free_plan_differs(plan, settings, policies, period=True):
+    """What of a frozen plan of its form the outputs differ in, compared in the manifests' JSON form: the settings (the
+    world, free_plan_world's; the rotation's period only when `period`), the tables, the policy seeds, each seed's pass
+    seeds, the world each seed's run trained in (sim/hour.py trained_world), the run facts, the engine facts
+    (free_plan_engine: the plan's, or the Python reference's) and each seed's start digest."""
+    from sim.hour import FREE as PLAY, engine_facts, trained_world
+    pinned = free_plan_engine(plan)
+    plan = dict(json.loads(json.dumps(plan)), world=free_plan_world(plan))
+    differ = [k for k in FREE_PLAN_SETTINGS if (period or k != 'period') and settings[k] != plan[k]]
+    differ += [] if settings['tables'] == plan['tables'] else ['tables']
+    differ += [] if set(policies) <= set(plan['policy_seeds']) else ['policy_seeds']
+    sampled = lambda passes: {p: s for p, s in passes.items() if p in FREE['passes']}
+    differ += [] if all(sampled(p['passes']) == plan['pass_seeds'] for p in policies.values()) else ['pass_seeds']
+    trained = lambda run: trained_world(run.get('batch_in_effect') or {}, (run.get('facts') or {}).get('tables'))  # noqa: E731
+    elsewhere = [s for s, p in sorted(policies.items()) if trained(p['run']) != plan['world']]
+    differ += [f'the run\'s world (seeds {elsewhere})'] if elsewhere else []
+    facts = sorted({k for p in policies.values() for k, v in plan['run'].items()
+                    if k not in PLAY['engine_facts'] and (p['run'].get('facts') or {}).get(k) != v} |
+                   {k for p in policies.values() for k, v in pinned.items() if engine_facts(p['run'])[k] != v})
+    differ += [f'run ({", ".join(facts)})'] if facts else []
+    starts = [s for s, p in sorted(policies.items()) if p['run'].get('policy_sha256_at_start') != plan['start'].get(str(s))]
+    return differ + ([f'start (seeds {starts})'] if starts else [])
+
+
+def free_plan(settings, policies, controls=True):
+    """(the name of the plan that the outputs match exactly, or None, and why they match no plan). A plan is matched when
+    it is frozen (free_frozen) and of its form (free_plan_shape), at least one policy and one control output were read,
+    no reason of free_plan_run holds, and the outputs differ from it in nothing (free_plan_differs). At an XP rate other
+    than 1, no plan: the 25x read is a description only."""
+    from sim.hour import FREE as PLAY
+    if settings['xp_rate'] != 1:
+        return None, [f"XP rate {settings['xp_rate']}: out of the training distribution"]
+    why = (['no policy output: a plan reads one at least'] if not policies else []) + \
+        (['no control output: a plan reads the controls of its records'] if not controls else []) + \
+        free_plan_run(policies, settings['source'])
+    blocked, matched = bool(why), []
+    for name, plan in FREE['plans'].items():
+        if not free_frozen(plan):
+            why.append(f'plan {name} is not frozen')
+            continue
+        free_plan_shape(name, plan, PLAY['run_facts'], PLAY['engine_facts'])
+        differ = free_plan_differs(plan, settings, policies, period=controls)
+        if differ:
+            why.append(f'not plan {name}: {", ".join(differ)} differ')
+        elif not blocked:
+            matched.append(name)
+    if len(matched) > 1:
+        raise ValueError(f'the outputs match the plans {matched}: one evaluation is read under one plan')
+    return (matched[0], []) if matched else (None, why)
+
+
+def free_plan_check(name, settings, policies, code):
+    """Why plan `name` would not read an output of sim.hour free (its --plan), before any life is played: the plan is
+    not frozen, the XP rate is not 1, the source is not one commit with no change, a reason of free_plan_run holds, or
+    the output differs from it (the rotation's period only when the output plays the rotation). The verdict step stays
+    the judge; this refuses early with its reasons. A plan of another form raises ValueError."""
+    from sim.hour import FREE as PLAY
+    if name not in FREE['plans']:
+        raise ValueError(f'no plan {name}: the plans are {sorted(FREE["plans"])}')
+    plan = FREE['plans'][name]
+    if not free_frozen(plan):
+        return [f'plan {name} is not frozen']
+    free_plan_shape(name, plan, PLAY['run_facts'], PLAY['engine_facts'])
+    differ = free_plan_differs(plan, settings, policies, period=settings['period'] is not None)
+    return ([f"XP rate {settings['xp_rate']}: out of the training distribution"] if settings['xp_rate'] != 1 else []) + \
+        ([f'the source is not one commit with no change: {code}'] if not free_clean(code) else []) + \
+        free_plan_run(policies, code) + ([f'{", ".join(differ)} differ'] if differ else [])
+
+
+def free_cell(cell, records, value=lambda r: r['gain_s'], died=lambda r: r['death'] is not None):
+    """One actor's lives in one pass: complete when every record is there and none stopped unsupported; the mean of
+    `value` (the integer level gain over S) and the deaths a life, over the lives that ended."""
+    ended = [r for r in (cell or {}).values() if r['unsupported'] is None]
+    mean = lambda v: round(sum(v) / len(v), 4) if v else None
+    return dict(lives=len(cell or {}), records=records, complete=len(ended) == records, unsupported=len(cell or {}) - len(ended),
+                mean_gain=mean([value(r) for r in ended]), deaths=sum(died(r) for r in ended),
+                deaths_a_life=mean([died(r) for r in ended]))
+
+
+def free_difference(policy, control, records, value=lambda r: r['gain_s']):
+    """The mean paired difference policy - control of `value` over the records and its 95% percentile bootstrap interval
+    (baseline/compare.py paired_bootstrap; FREE statistics), the pairs taken by record; None unless both are complete."""
+    from baseline.compare import paired_bootstrap
+    if not (free_cell(policy, records)['complete'] and free_cell(control, records)['complete']):
+        return None
+    diffs = [value(policy[r]) - value(control[r]) for r in range(records)]
+    return paired_bootstrap(diffs, draws=FREE['statistics']['draws'], seed=FREE['statistics']['seed'])
+
+
+def above_zero(difference):
+    """A claim's test of one difference: its lower bound above zero (None, incomplete, when it has none)."""
+    return dict(difference=difference, threshold=0, holds=None if difference is None else difference['low'] > 0)
+
+
+def all_of(values):
+    """True when all hold, False when one fails, else None (incomplete)."""
+    return False if any(v is False for v in values) else True if all(v is True for v in values) else None
+
+
+def free_claims(policy, controls, records):
+    """Claims L, B and R and No rescue in one pass, with every number each one used."""
+    outside = lambda own: lambda r: r['gain_s'] - sum(r['gain'].get(s, 0) for s in own)
+    claims = dict(L=above_zero(free_difference(policy, controls.get(FREE['zero']), records)))
+    refs = {}
+    for ref, own in FREE['references'].items():
+        total = above_zero(free_difference(policy, controls.get(ref), records))
+        beyond = above_zero(free_difference(policy, controls.get(ref), records, outside(own)))
+        refs[ref] = dict(own=list(own), total=total, outside=beyond, holds=all_of([total['holds'], beyond['holds']]))
+    claims['B'] = dict(references=refs, holds=all_of([r['holds'] for r in refs.values()]))
+    claims['R'] = above_zero(free_difference(policy, controls.get(FREE['timer']), records))
+    rescue = {}
+    for e in FREE['exploits']:
+        test = above_zero(free_difference(policy, controls.get(e), records))
+        rescue[e] = dict(test, matches=None if test['holds'] is None else not test['holds'])
+    matched = [r['matches'] for r in rescue.values()]
+    claims['no_rescue'] = dict(exploits=rescue, matches=True if True in matched else
+                               False if all(m is False for m in matched) else None)
+    return claims
+
+
+def unread(claim):
+    """A claim that no plan reads, its holds and matches renamed would_hold and would_match, so that no reader takes
+    them for a result."""
+    names = dict(holds='would_hold', matches='would_match')
+    return {names.get(k, k): unread(v) if isinstance(v, dict) else v for k, v in claim.items()}
+
+
+def tri(passes, key=lambda c: c['holds']):
+    """A claim over a seed's two passes, never pooled: pass when it holds in each, fail when a valid pass fails."""
+    return {True: 'pass', False: 'fail', None: 'incomplete'}[all_of([key(c) for c in passes])]
+
+
+def free_readings(words):
+    """The readings of a verdict's claim words: an exploit that matches, "the return is cheap
+    in this world"; L passes and B fails, "learns, not shown beyond one activity"; L and B pass and R fails, "not shown
+    better than a timer". Any other verdict has no reading beyond its words."""
+    r, w = FREE['readings'], words.get
+    return [r['no_rescue']] * (w('no_rescue') == 'match') + [r['B']] * (w('L') == 'pass' and w('B') == 'fail') + \
+        [r['R']] * (w('L') == 'pass' and w('B') == 'pass' and w('R') == 'fail')
+
+
+def free_reads(cell, ticks):
+    """The unpaid reads of one actor's lives in one pass (no bar, never paid). a_life: the
+    means a life of the levels gained by skill, production by family, kills by npc name, damage taken by source, food
+    eaten, eats at full hitpoints, time by activity and switches between activities. totals, over all the lives: the
+    deaths with their ticks and killers, the eats by the hitpoints before each, and the most switches in one life. An
+    activity is an XP event's cause (sim/hour.py free_reads); the ticks from the previous XP event (or arm) to an event
+    count for its activity, and those after the last to the life's end for 'none'. A switch is an XP event whose activity
+    differs from the one before it."""
+    lives = [r for r in (cell or {}).values() if r['unsupported'] is None]
+    if not lives:
+        return None
+    n, sums = len(lives), lambda rows: dict(sum((Counter(r) for r in rows), Counter()))
+    per = lambda counts: {k: round(v / n, 4) for k, v in sorted(counts.items())}
+    times, switches = Counter(), []
+    for r in lives:
+        last = 0
+        for activity, _, end, _ in r['activity']:
+            times[activity] += end - last
+            last = end
+        times['none'] += r['ticks'] - last
+        switches.append(max(0, len(r['activity']) - 1))
+    deaths = [r['death'] for r in lives if r['death'] is not None]
+    a_life = dict(levels=per(sums([r['gain'] for r in lives])), made=per(sums([r['made'] for r in lives])),
+                  kills=per(sums([r['kills'] for r in lives])), damage=per(sums([r['damage'] for r in lives])),
+                  eats=round(sum(len(r['eat_log']) for r in lives) / n, 4),
+                  eats_full=round(sum(r['eats_full'] for r in lives) / n, 4), time=per(times),
+                  switches=round(sum(switches) / n, 4))
+    totals = dict(deaths=dict(count=len(deaths), ticks=sorted(d['tick'] for d in deaths),
+                              killers=dict(Counter(d['killer'] for d in deaths))),
+                  eats_by_hp=dict(sorted(Counter(e[1] for r in lives for e in r['eat_log']).items())),
+                  switches_max=max(switches))
+    return dict(lives=n, ticks=ticks, a_life=a_life, totals=totals)
+
+
+def free_json(outputs, path):
+    """free.json from the rows of sim.hour free outputs alone: for each
+    policy seed and pass, never pooled, every actor's mean integer level gain and deaths a life, the paired differences
+    policy - each other actor, Claims L, B and R and No rescue with every number each used, the 6,000-tick read and the
+    unpaid reads; greedy and the read are descriptions with no claim. A verdict is written only when the outputs match a
+    frozen plan (free_plan), from the plan's claims over the plan's seeds: a seed's claim passes when it holds in both
+    sampled passes, fails when a valid pass fails, and is incomplete otherwise (a missing or unsupported life, or a
+    declared seed with no output), and every claim of a seed is incomplete unless its WAIT, initialization (both sampled
+    passes) and greedy lives are complete; over the seeds, a claim passes in every seed or fails in one. No rescue
+    matches when an exploit script matches in one pass or the other of one seed. A pass's claims hold only the plan's;
+    every other claim, and every claim of outputs that match no plan, is under 'described', with no word of its own
+    and its holds and matches named would_hold and would_match. A seed's incomplete_controls names each control that
+    is not complete: WAIT, its initialization and greedy (which make every word incomplete) and each read claim's own.
+    Outputs that match no plan give the verdict kind 'description'; at an XP rate other than 1, the differences only
+    and FREE's off_rate kind. Every
+    free.json holds FREE's statement, both kinds of seed, the policy's deaths a life in each verdict, and whether WAIT,
+    the initialization and greedy play are complete."""
+    settings, policies, cells, evidence = free_outputs(outputs)
+    n = settings['records']
+    controls = {a: cell for (a, s, p), cell in cells.items() if s is None and p is None}
+    plan, why = free_plan(settings, policies, controls=bool(controls))
+    if plan is not None and not free_clean(settings['source']):
+        raise ValueError(f"plan {plan} reads outputs of one commit with no change, not of {settings['source']}")
+    claimed = settings['xp_rate'] == 1
+    read = FREE['plans'][plan]['claims'] if plan else ()
+    read_value, read_died = (lambda r: r['read']['gain_s']), (lambda r: r['read']['died'])
+    describe = lambda cell: dict(free_cell(cell, n), read=free_cell(cell, n, read_value, read_died),
+                                 reads=free_reads(cell, settings['ticks']))
+    kind = 'verdict' if plan else 'description' if claimed else FREE['off_rate']
+    sampled, complete = FREE['passes'], lambda cell: free_cell(cell, n)['complete']
+    seeds = {}
+    for seed in (FREE['plans'][plan]['policy_seeds'] if plan else sorted(policies)):
+        if seed not in policies:  # a declared seed with no output
+            seeds[seed] = dict(missing=True, verdict=dict(kind=kind, **{c: 'incomplete' for c in read}, readings=[],
+                                                          deaths_a_life=None))
+            continue
+        passes = {}
+        for p in (*sampled, 'greedy'):
+            mine = cells.get(('policy', seed, p))
+            others = dict(controls, **({} if p == 'greedy' else {'initial': cells.get(('initial', seed, p))}))
+            passes[p] = dict(policy=describe(mine), initial=None if p == 'greedy' else describe(others['initial']),
+                             differences={a: free_difference(mine, c, n) for a, c in sorted(others.items())},
+                             read_differences={a: free_difference(mine, c, n, read_value) for a, c in sorted(others.items())})
+            if p in sampled and claimed:  # the plan's claims; any other is described, with no claim of its own
+                every = free_claims(mine, controls, n)
+                passes[p].update({k: v for k, v in (('claims', {c: every[c] for c in read}),
+                                                    ('described', {c: unread(every[c]) for c in every if c not in read}))
+                                  if v})
+        deaths = {p: passes[p]['policy']['deaths_a_life'] for p in passes}
+        verdict = dict(kind=kind, deaths_a_life=deaths)
+        if plan:
+            claims = [passes[p]['claims'] for p in sampled]
+            words = {c: tri([k[c] for k in claims]) for c in read if c != 'no_rescue'}
+            if 'no_rescue' in read:
+                matched = [k['no_rescue']['matches'] for k in claims]
+                words['no_rescue'] = 'match' if True in matched else 'no match' if matched == [False, False] else 'incomplete'
+            needed = [('wait', controls.get('wait')), *((f'initial {p}', cells.get(('initial', seed, p))) for p in sampled),
+                      ('greedy', cells.get(('policy', seed, 'greedy')))]
+            gaps = [name for name, cell in needed if not complete(cell)]
+            words = {c: 'incomplete' for c in words} if gaps else words  # the controls of every record, every time
+            own = [a for c in read for a in FREE_CONTROLS[c] if not complete(controls.get(a))]  # each claim's own
+            verdict = dict(kind=kind, **words, readings=free_readings(words), incomplete_controls=gaps + own,
+                           deaths_a_life=deaths)
+        seeds[seed] = dict(checkpoint=policies[seed]['policy'], initial=policies[seed]['initial'],
+                           run=policies[seed]['run'], pass_seeds=policies[seed]['passes'], passes=passes, verdict=verdict)
+    verdict = dict(kind=kind, plan=plan, why=why, seeds=sorted(seeds),
+                   deaths_a_life={s: v['verdict']['deaths_a_life'] for s, v in seeds.items()})
+    if plan:
+        each = [s['verdict'] for s in seeds.values()]
+        words = {c: 'pass' if all(v[c] == 'pass' for v in each) else 'fail' if any(v[c] == 'fail' for v in each)
+                 else 'incomplete' for c in read if c != 'no_rescue'}
+        if 'no_rescue' in read:
+            words['no_rescue'] = 'match' if any(v['no_rescue'] == 'match' for v in each) else 'no match' if \
+                all(v['no_rescue'] == 'no match' for v in each) else 'incomplete'
+        verdict.update(words, readings=free_readings(words))
+    result = dict(task=settings['task'], statement=FREE['statement'], settings=settings, rules=FREE,
+                  outputs=[str(o) for o in outputs], evidence=evidence,
+                  complete=dict(wait=complete(controls.get('wait')),
+                                initial={s: {p: complete(cells.get(('initial', s, p))) for p in sampled} for s in seeds},
+                                greedy={s: complete(cells.get(('policy', s, 'greedy'))) for s in seeds}),
+                  controls={a: describe(c) for a, c in sorted(controls.items())}, seeds=seeds, verdict=verdict)
+    text = json.dumps(result, indent=1, default=str)
+    Path(path).write_text(text + '\n', encoding='utf-8')
+    return json.loads(text)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -653,6 +1237,10 @@ def main():
     four.add_argument('--workers', type=int, default=3, help='passes at once')
     four.add_argument('--timeout', type=int, default=4 * 3600, help='seconds per pass')
     four.add_argument('--output', type=Path, required=True)
+    free = commands.add_parser('free', help='free-play-v1: the statistics and the verdict from sim.hour free rows')
+    free.add_argument('outputs', type=Path, nargs='+', help='sim.hour free outputs of one record set (a policy seed each, '
+                      'the controls once)')
+    free.add_argument('--output', type=Path, required=True, help='free.json')
     for p in (run, later):
         p.add_argument('--bun', type=Path, help='the bun binary (native check)')
         p.add_argument('--engine', action='append', default=[], metavar='NAME=CHECKOUT',
@@ -660,6 +1248,14 @@ def main():
         p.add_argument('--native-python', type=Path, default=ROOT / '.venv' / 'bin' / 'python',
                        help='the native environment\'s interpreter')
     args = parser.parse_args()
+    if args.command == 'free':
+        try:
+            result = free_json(args.outputs, args.output)
+        except ValueError as error:
+            raise SystemExit(f'[free] {error}')
+        print(json.dumps(dict(verdict=result['verdict'], complete=result['complete'], evidence=result['evidence']),
+                         indent=1))
+        return
     if args.command == 'native-trials':
         exits = native_trials(args.output, args.policy, args.checkpoint, args.sampled, args.seed, args.skills, args.records)
         print(json.dumps(exits))

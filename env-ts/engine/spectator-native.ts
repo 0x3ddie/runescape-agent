@@ -84,10 +84,20 @@ export function installNativeSpectator(name: string, routeOf: RouteOf = () => un
                 spectator.lastLevels[i] = spectator.levels[i];
             }
         },
-        spectatorOnlyNpcs(spectator, actor) {
+        unmirror(spectator) {
+            // a shared demo world's tile view after a follow: the spectator's own (empty) inventory and its own stats
+            const listener = spectator.invListeners.find(l => l.type === InvType.INV);
+            if (listener && listener.source !== spectator.uid) {
+                listener.source = spectator.uid;
+                listener.firstSeen = true;
+            }
+            for (let i = 0; i < spectator.stats.length; i++) spectator.write(new UpdateStat(i, spectator.stats[i], spectator.levels[i]));
+            sent.delete(spectator);
+        },
+        spectatorOnlyNpcs(spectator, actors) {
             let count = 0;
             for (const npc of World.npcs) {
-                if (rsbuf.hasNpc(spectator.slot, npc.nid) && !rsbuf.hasNpc(actor.slot, npc.nid)) count++;
+                if (rsbuf.hasNpc(spectator.slot, npc.nid) && !actors.some(actor => rsbuf.hasNpc(actor.slot, npc.nid))) count++;
             }
             return count;
         },
@@ -95,7 +105,7 @@ export function installNativeSpectator(name: string, routeOf: RouteOf = () => un
             player: isFlagged(tile.x, tile.z, tile.level, CollisionFlag.PLAYER) }),
         setCollision: (tile, kind) => (kind === 'npc' ? changeNpcCollision : changePlayerCollision)(1, tile.x, tile.z, tile.level, true)
     }, name);
-    const marker = installNativeMarker(name, routeOf);
+    const marker = installNativeMarker(name, routeOf, spectator.followed);
     return { ...spectator, status: () => ({ ...spectator.status(), marker: marker.status() }) };
 }
 
@@ -103,8 +113,9 @@ export function installNativeSpectator(name: string, routeOf: RouteOf = () => un
  * The click marker (engine/click-marker.ts) at the start of each tick: the agent's route-v1 record when it
  * publishes one (act-v3). act-v2 routes every walk and act in the engine and keeps no record, so its request is
  * read from the engine: the tile of its interaction target (a loc, npc or ground item), else the end of its walk.
+ * The actor is the one the spectator follows (core/spectator.ts: the one actor, or a shared demo world's view's).
  */
-function installNativeMarker(name: string, routeOf: RouteOf) {
+function installNativeMarker(name: string, routeOf: RouteOf, followed: (actors: Player[]) => Player | null) {
     const marker = clickMarker<Player>({
         request(actor) {
             const route = routeOf(actor);
@@ -124,7 +135,7 @@ function installNativeMarker(name: string, routeOf: RouteOf) {
         const players = World.players.filter(Boolean) as Player[];
         const watching = players.filter(player => player instanceof NetworkPlayer && player.username === name);
         const actors = players.filter(player => !watching.includes(player));
-        marker.update(watching, actors.length === 1 ? actors[0]! : null);
+        marker.update(watching, followed(actors));
         return processWorld.apply(this, args);
     };
     return marker;

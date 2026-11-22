@@ -12,8 +12,8 @@ def observation_space(sample):
     result = {}
     for key, value in sample.items():
         value = np.asarray(value)
-        if key == 'mask':
-            result[key] = spaces.Box(0, 1, shape=(96,), dtype=np.int8)
+        if key == 'mask':  # one entry for each action row: act-v3's 96, act-v4's 128
+            result[key] = spaces.Box(0, 1, shape=value.shape, dtype=np.int8)
         elif key.endswith(('_ids', '_op')):  # rows of the name table, hashed options
             result[key] = spaces.Box(0, 4000, shape=value.shape, dtype=np.int64)
         else:

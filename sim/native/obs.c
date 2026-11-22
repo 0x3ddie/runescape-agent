@@ -813,3 +813,24 @@ int rs_project(RsSlot *s, uint8_t *row) {
     if (o->n_choices) return RS_FAIL_TEXT(err, RS_E_NOT_PORTED, "choice_vec of dialog choices");
     return 0;
 }
+
+/* project_v6's progress (rl/obs.py level_progress) of each SKILL_ORDER skill, at its observed whole XP (stats // 10)
+   and level (baseLevel or level), into the row's progress block: 0 at 99; else (10 * xp - low) / (next - low),
+   clipped to [0, 1], with the client's table RS_OBS_LEVEL_XP (entry k: level k + 2; a level below 1 reads Python's
+   negative index, as LEVEL_XP[level - 1] does). Ints are exact in double, so the one division is Python's. */
+_Static_assert(RS_OBS_PROGRESS_N == RS_N_SKILLS, "obs-v6 progress per SKILL_ORDER skill is per engine skill");
+void rs_project_progress(const RsSlot *s, uint8_t *row) {
+    const RsRawObs *o = &s->a.obs;
+    float *pr = (float *)(row + RS_OBS_PROGRESS_OFF);
+    for (int i = 0; i < RS_N_SKILLS; i++) {
+        int32_t level = o->base_levels[i] ? o->base_levels[i] : o->levels[i];
+        if (level >= 99) {
+            pr[i] = 0.0f;
+            continue;
+        }
+        int32_t next = level - 1 < 0 ? level - 1 + 99 : level - 1;
+        int64_t low = level >= 2 ? RS_OBS_LEVEL_XP[level - 2] : 0;
+        double v = (double)(10 * (int64_t)o->xp[i] - low) / (double)(RS_OBS_LEVEL_XP[next] - low);
+        pr[i] = (float)clip(v, 0.0, 1.0);
+    }
+}

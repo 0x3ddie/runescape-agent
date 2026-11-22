@@ -1,7 +1,9 @@
 """rl/obs.py: an environment observation (item-v2, act-v3, feedback-v2) -> fixed-size arrays.
 
-obs-v5 is what a policy reads: these arrays with text-v2 (rl/feedback_contract.py), plus
-the task's budget_vec, critic_vec and goal-v3's six-entry goal_vec (baseline/resource_task.py GOAL_VEC). It is obs-v3
+obs-v5 is what a policy reads: these arrays with text-v2 (rl/feedback_contract.py), plus the task's budget_vec,
+critic_vec and goal-v3's six-entry goal_vec (baseline/resource_task.py GOAL_VEC). obs-v6 (free-play-v1 only) is
+project_v6: these arrays without task_vec's decision count, with each skill's progress to its next level after
+prog_vec's 25 entries, and no task input: no goal and no time. It is obs-v3
 with two more goal entries (cook, fire); obs-v4 is a name reserved by another draft. obs-v3 was obs-v2 with the click
 features (act-v3) in place of the place slots and compass moves, npcs within 15 tiles (the server's view distance) and
 each affordance's bank column read from the 15-tile loc and npc lists. A checkpoint records the observation, action,
@@ -23,7 +25,7 @@ import numpy as np
 from act_contract import bank_distance, banks, project_acts, project_clicks
 from feedback_contract import project_feedback
 from names import identities
-from item_contract import N_BANK_SEL, BANK_CAPACITY, MAX_BANK_PAGES, observation_contract
+from item_contract import ITEM_V3, N_BANK_SEL, BANK_CAPACITY, MAX_BANK_PAGES, observation_contract
 
 N_NPC = 8
 N_INV = 28
@@ -39,6 +41,7 @@ PLAYER_VEC = 7
 TASK_VEC = 7
 MAX_DECISIONS = 1500
 OBSERVATION = 'obs-v5'
+OBSERVATION_V6 = 'obs-v6'
 MASK = 'mask-v5'
 
 # canonical skill order for the progression vector (RS 2004 has 21 skills)
@@ -49,6 +52,20 @@ SKILL_ORDER = (
     "Farming", "Runecrafting",
 )
 PROG_VEC = len(SKILL_ORDER) + 4
+PROG_VEC_V6, TASK_VEC_V6 = PROG_VEC + len(SKILL_ORDER), TASK_VEC - 1  # obs-v6: progress added, the decision count gone
+
+
+def _level_xp():
+    """Player.ts levelExperience in tenths of XP, as the server stores it: the client's copy of the table its skills tab
+    reads (sim/engine.py LEVEL_XP is the server's; a test holds them equal). Entry k is the XP of level k + 2."""
+    table, acc = [], 0
+    for level in range(1, 100):
+        acc += int(level + 2.0 ** (level / 10.0) * 300.0)
+        table.append(acc // 4 * 10)
+    return table
+
+
+LEVEL_XP = _level_xp()
 
 
 def _clip(v: float, lo: float, hi: float) -> float:
@@ -98,14 +115,16 @@ def project(obs: dict) -> dict[str, np.ndarray]:
         if 0 <= slot < N_WORN:
             worn_ids[slot] = item_id(item)
 
-    # The inventory page: what DROP_k and DEPOSIT_k would act on.
+    # The inventory page: what DROP_k and DEPOSIT_k would act on. Its count input is the slot's own count (item-v2), or
+    # under item-v3 (the page of kinds) the kind's total over the pack.
     sel_ids = np.zeros(N_INV_SEL, dtype=np.int32)
     sel_feats = np.zeros((N_INV_SEL, 1), dtype=np.float32)
+    counted = "total" if obs["contractVersion"] == ITEM_V3 else "count"
     for i, item in enumerate((obs.get("invSel", []) or [])[:N_INV_SEL]):
         if item["slot"] == -1:
             continue
         sel_ids[i] = item_id(item)
-        sel_feats[i, 0] = float(np.log1p(item.get("count", 0)) / 5.0)
+        sel_feats[i, 0] = float(np.log1p(item.get(counted, 0)) / 5.0)
 
     # Progression: every skill's permanent level, total level, wealth, hitpoints, fullness.
     pg = np.zeros(PROG_VEC, dtype=np.float32)
@@ -169,4 +188,31 @@ def project(obs: dict) -> dict[str, np.ndarray]:
     for i, a in enumerate(obs['actSel']):
         column[i] = bank_distance(a, near)
     result['act_feats'] = np.concatenate([result['act_feats'], column], axis=1)
+    return result
+
+
+def level_progress(xp, level):
+    """A skill's progress to its next level, in [0, 1): whole XP `xp` (as observed) at base level `level`; 0 at 99."""
+    if level >= 99:
+        return 0.0
+    low = LEVEL_XP[level - 2] if level >= 2 else 0
+    return _clip((10 * xp - low) / (LEVEL_XP[level - 1] - low), 0.0, 1.0)
+
+
+def project_v6(obs: dict) -> dict[str, np.ndarray]:
+    """obs-v6 (module docstring): project() without task_vec's decision count, the time input of a native observation,
+    and with prog_vec's 25 entries followed by each SKILL_ORDER skill's level_progress. Every skill observed must carry
+    its XP."""
+    result = project(obs)
+    result['task_vec'] = result['task_vec'][1:]
+    skills = {s.get('name'): s for s in obs.get('skills', []) or []}
+    progress = np.zeros(len(SKILL_ORDER), dtype=np.float32)
+    for i, name in enumerate(SKILL_ORDER):
+        s = skills.get(name)
+        if s is None:
+            continue
+        if type(s.get('xp')) is not int:
+            raise ValueError(f'skill {name} observed without its XP: obs-v6 shows the progress to the next level')
+        progress[i] = level_progress(s['xp'], int(s.get('baseLevel') or s.get('level', 1)))
+    result['prog_vec'] = np.concatenate([result['prog_vec'], progress])
     return result

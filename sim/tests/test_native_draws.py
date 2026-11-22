@@ -28,7 +28,7 @@ from sim.engine import Rng
 from sim.search import SUPPLY, draw_supply, groves, is_normal, scarce_rows, supply_sites
 from sim.spec import START_KIT, goal_set, slot_goal
 from sim.task import draw_start, object_families, produced
-from sim.world import ORIGIN, PADDED, Layout
+from sim.world import ORIGIN, PADDED, WORLDS, Layout, world_of
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPACT_POOL = ROOT / 'logs/sim/world/train-8-nc1-derived.npz'  # never the 64-layout pool: its derived tables are huge
@@ -173,6 +173,7 @@ def write_pack(path, types, compact, supply, failing=(), keys=None, regions=True
         r['gate'] = -1
         r['kind'], r['pool_index'], r['W'], r['H'], r['T'], r['x0'], r['z0'] = kind, index, W, H, W * H, *ORIGIN
         r['seed'], r['attempt'] = layout.seed, layout.attempt
+        r['world'] = 1 + list(WORLDS).index(world_of(layout)['version'])  # the record's world
         for name, at in per_tile.items():
             r[name] = at
         start = tiles_of(layout.start)
@@ -376,8 +377,10 @@ def test_draw_errors_are_the_oracles(fixture):
 
 
 # ---- ledgers: events as RsEvent rows -----------------------------------------------------------------------------
-EVENT_KINDS = dict(agent_hp=0, pickup=1, produce=2, transfer=3, remove=4, npc_damage=5, npc_defeated=6, excluded=7)
+EVENT_KINDS = dict(agent_hp=0, pickup=1, produce=2, transfer=3, remove=4, npc_damage=5, npc_defeated=6, excluded=7, xp=8,
+                   hit=9, npc_respawn=10)
 CAUSES = {'damage': 0, 'eat': 1, 'regen': 2, 'levelup': 3, None: 4}
+XP_CAUSES = {None: 0, 'produce': 1, 'hit': 2, 'bury': 3, 'light': 4}
 WHYS = dict(eat=0, bury=1, drop=2)
 LOCATIONS = dict(inv=0, worn=1, bank=2)
 WHATS = dict(clue_drop=0, loot_drop=1)
@@ -402,7 +405,16 @@ def event_row(event):
         return (tick, k, WHYS[d['why']], 0, 0, d['obj'], d['count'], 0, 0, 0, 0)
     if kind == 'excluded':
         return (tick, k, WHATS[d['what']], 0, 0, d['obj'], 0, d['npc'], 0, 0, 0)
+    if kind == 'xp':  # stat, cause, the cause's obj or npc, amount, before, after, src (None -1) or life
+        cause = d.get('cause')
+        obj = d['npc'] if cause == 'hit' else d.get('obj', 0)
+        v2 = d['life'] if cause == 'hit' else (-1 if d['src'] is None else d['src']) if cause == 'produce' else 0
+        return (tick, k, d['stat'], XP_CAUSES[cause], 0, obj, d['xp'], d['before'], d['after'], v2, 0)
+    if kind == 'npc_respawn':  # the npc, its base type, the new life
+        return (tick, k, 0, 0, 0, d['npc'], d['type'], d['life'], 0, 0, 0)
     mine = d['source'] == AGENT
+    if kind == 'hit':
+        return (tick, k, mine, 0, 0, d['npc'], d['type'], d['life'], d['damage'], d['hp'], d['style'])
     if kind == 'npc_damage':
         return (tick, k, mine, 0, 0, d['npc'], d['type'], d['life'], d['damage'], d['hp'], d['full'])
     return (tick, k, mine, 0, 0, d['npc'], d['type'], d['life'], 0, 0, 0)
@@ -417,12 +429,10 @@ def as_error(pack, args):
 
 
 def same_error(got, expected):
-    """The C error is the oracle's class and text (a holdings mismatch drops Python's counter reprs, rs.h)."""
-    assert type(got) is type(expected), (got, expected)
-    text = str(expected)
-    if 'holdings not explained by the events' in text:
-        text = text.split(':')[0]
-    assert str(got) == text, (got, expected)
+    """The C error is the oracle's class and text, or (a check failure whose rs.h reason carries less: a holdings
+    mismatch drops Python's counter reprs) its text cut as the harness compares the two (native_harness.raised_alike)."""
+    from sim import native_harness as H
+    assert H.raised_alike(expected, got), (got, expected)
 
 
 def check_ledgers(pack, types, events, cuts, goal, enemies, target, terminal, initial, final, start, visited=0,

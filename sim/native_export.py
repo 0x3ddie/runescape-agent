@@ -17,12 +17,18 @@ packs. Sections:
 - LEVEL_XP, the click option strings and the other constants (RsConsts).
 
 The declared-world check (`declared_world`) refuses, before anything is written, pools whose reachable loc, npc or obj
-types have a trigger that names a script C does not port (RS_NP: banks, doors, stairs, imps, dark wizards) or a death
-root the compiler cannot carry. Packs are extracted private data: logs/native/ (ignored), never published.
+types have a trigger that names a script C does not port (RS_NP: banks, stairs, imps, dark wizards) or a death
+root the compiler cannot carry; an archive with script rows the C port does not run (firemaking and cooking:
+PORTED_ARCHIVE_SCRIPTS holds the picks alone); and a village-world-v2 pool over an archive without its pick rows. Each
+layout record names its world (world_of of the layout built as its pool's class), and the manifest the pools' worlds,
+the archive's content keys and the village world's own loot list. Packs are extracted private data: logs/native/
+(ignored), never published.
+
+A village-world-v2 pool is plain (no derived tables): export it with --no-trees over draynor-nc2.npz.
 
     PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native export --pool logs/sim/world/train-8-nc1-derived.npz \
         --supply-pool logs/supply/pools/train-128.npz --tables logs/sim/data/draynor-nc1.npz \
-        --output logs/native/train-8-nc1-cc0614f.pack
+        --output logs/native/train-8-nc1-a6c325a-ids2.pack
 
 With --no-trees the compact pool may also hold no derived tables (gap1-x's pool; gap1-k's keeps its derived tables, without
 the trees).
@@ -33,7 +39,6 @@ from functools import lru_cache
 import hashlib
 import inspect
 import json
-from pathlib import Path
 import re
 from types import SimpleNamespace
 import zlib
@@ -48,6 +53,18 @@ PLAYER = 'wd1a0'  # the agent's player name (GoalEpisode's default), the hero a 
 DERIVED_STATE = ('steps', 'entity_reach', 'los', 'loc_reach', 'order', 'dist', 'parent')
 DERIVED_PLAIN = ('snapshot_steps', 'sides', 'snapshot_dist')
 TREES = ('order', 'dist', 'parent', 'snapshot_dist')  # dropped by trees=False
+
+
+# the archive scripts (engine.ARCHIVE_SCRIPTS) the C port runs: an archive with other script rows is refused
+PORTED_ARCHIVE_SCRIPTS = {'picks'}
+# the rs.h ids of the oracle's use_default closures by trigger (engine.HELD's and the pick archive's FIELD_USE)
+USE_DEFAULT_IDS = {'[opheldu,_weapon_stab]': 'RS_S_USE_DEFAULT_WEAPON_STAB', '[opheldu,feather]': 'RS_S_USE_DEFAULT_FEATHER',
+                   '[opheldu,_category_22]': 'RS_S_USE_DEFAULT_CATEGORY_22', '[opheldu,cabbage]': 'RS_S_USE_DEFAULT_CABBAGE',
+                   '[opheldu,potato]': 'RS_S_USE_DEFAULT_POTATO', '[opheldu,onion]': 'RS_S_USE_DEFAULT_ONION',
+                   '[opheldu,black_cape]': 'RS_S_USE_DEFAULT_BLACK_CAPE'}
+# the obj flags of the FIELD_USE closures' cases (rs.h RS_OF_CASE_*)
+FIELD_USE_FLAGS = {'[opheldu,cabbage]': 'CASE_CABBAGE', '[opheldu,potato]': 'CASE_POTATO', '[opheldu,onion]': 'CASE_ONION',
+                   '[opheldu,black_cape]': 'CASE_BLACK_CAPE'}
 
 
 class ExportError(ValueError):
@@ -120,6 +137,7 @@ def load_pool(path, derived=None):
     with np.load(path) as data:
         if str(data['version']) not in world.WORLDS:
             raise ValueError(f"{path} holds {data['version']}, not one of {sorted(world.WORLDS)}")
+        cls = world.LAYOUT_CLASSES.get(str(data['version']), world.Layout)  # the class names the world (world_of)
         arrays = {k: data[k] for k in data.files if k in names or k.startswith('n_')}
         n = len(arrays['seed'])
         rows = [{} for _ in range(n)]
@@ -142,7 +160,7 @@ def load_pool(path, derived=None):
                 count = arrays[f'n_{name}'][k]
                 value = value[:count] if world.PADDED[name] == 0 else value[:, :count]
             row[name] = int(value) if name in ('seed', 'attempt') else value
-        layouts.append(world.Layout(**row))
+        layouts.append(cls(**row))
     return layouts, (rows if derived else None)
 
 
@@ -322,6 +340,7 @@ class Exporter:
         self.drop_rows, self.drop_ops, self.drop_roots, self.enum_rows = {}, [], [], {}
         self.drop_objs = set()
         self.wide_eat = set()  # eat rows that heal more stats than RsEatRow holds (declared_world refuses them)
+        self.loot_own = None  # the loot list of the pack's village world when it declares its own (export sets it)
 
     # -- triggers to scripts
     def script_id(self, fn):
@@ -339,10 +358,12 @@ class Exporter:
             return S['RS_S_DOOR_OPEN' if cells['turn'] == 1 else 'RS_S_DOOR_CLOSE']
         if q == 'stairs.<locals>.script':
             return S['RS_S_STAIRS_UP' if cells['name'] == '[oploc1,loc_1722]' else 'RS_S_STAIRS_DOWN']
-        if q == 'use_default.<locals>.script':
-            held = next(k for k, v in engine.HELD.items() if v is fn)
-            return S[{'[opheldu,_weapon_stab]': 'RS_S_USE_DEFAULT_WEAPON_STAB', '[opheldu,feather]': 'RS_S_USE_DEFAULT_FEATHER',
-                      '[opheldu,_category_22]': 'RS_S_USE_DEFAULT_CATEGORY_22'}[held]]
+        if q == 'use_default.<locals>.script':  # HELD's, then the pick archive's (engine.FIELD_USE)
+            held = next((k for k, v in engine.HELD.items() if v is fn), None) or \
+                next((k for k, v in engine.ARCHIVE_SCRIPTS['picks'].items() if v is fn), None)
+            if held not in USE_DEFAULT_IDS:
+                raise ExportError(f'no rs.h script id names the use script {held}')
+            return S[USE_DEFAULT_IDS[held]]
         if q == 'npc_default_retaliate.<locals>.script':
             return S['RS_S_NPC_DEFAULT_RETALIATE_AP' if cells['mode'] == engine.MODE_APPLAYER2 else 'RS_S_NPC_DEFAULT_RETALIATE']
         if q == 'flavour_timer.<locals>.script':
@@ -357,6 +378,15 @@ class Exporter:
         if not name:
             return self.script['RS_S_NONE'], -1, 0
         fn = table.get(name)
+        return (self.script['RS_S_UNKNOWN'] if fn is None else self.script_id(fn)), -1, self.s(name)
+
+    def _loc_trigger(self, name):
+        """(script, arg, name string) of a loc trigger as World.run_trigger finds its script: engine.SCRIPTS, else the
+        archive's (engine.archive_script: the pick over an archive with content.picks)."""
+        from sim import engine
+        if not name:
+            return self.script['RS_S_NONE'], -1, 0
+        fn = engine.SCRIPTS.get(name) or engine.archive_script(self.view, name)
         return (self.script['RS_S_UNKNOWN'] if fn is None else self.script_id(fn)), -1, self.s(name)
 
     def _held(self, name):
@@ -415,7 +445,7 @@ class Exporter:
             for j in range(c['RS_LTRIG_N']):
                 trig = engine._trigger_name(t, engine.APLOC1 + j % 6 + (engine.AP_TO_OP if j >= c['RS_TRIG_OP'] else 0))
                 rows['trig_script'][k, j], rows['trig_arg'][k, j], rows['trig_name'][k, j] = \
-                    self._named(lt['triggers'].get(trig), engine.SCRIPTS)
+                    self._loc_trigger(lt['triggers'].get(trig))
             loc = SimpleNamespace(type=k)
             rows['next_loc_stage'][k] = _value(self.view.loc_param, loc, 'next_loc_stage')
             rows['next_loc_stage_mining'][k] = _value(self.view.loc_param_or_default, loc, 'next_loc_stage_mining')
@@ -425,6 +455,10 @@ class Exporter:
             rows['is_loc_4030'][k] = lt['debugname'] == 'loc_4030'
             rows['supply_tree'][k] = lt['debugname'] in (world.TREE, world.OAK)
             rows['pen_gate'][k] = lt['debugname'] in world.PEN_GATE
+            pick = self.content.get('picks', {}).get(lt['debugname'])  # sim/build.py add_picks (draynor-nc2)
+            if pick is not None:
+                rows['has_pick'][k], rows['pick_scaled'][k] = 1, bool(pick['scaled'])
+                rows['pick_item'][k], rows['pick_respawn'][k] = _value(t.obj_id, pick['item']), int(pick['respawn'])
         return rows
 
     def npc_types(self, drops):
@@ -499,9 +533,11 @@ class Exporter:
         from sim.agent import TOOL_PROTECT_RE, name_of
         c, cats = self.c, self.categories
         cases = {key: inspect.getclosurevars(fn).nonlocals for key, fn in engine.HELD.items() if fn.__closure__}
+        own = self.loot_own
         flags = [('TOOL_PROTECT', bool(TOOL_PROTECT_RE.search(name_of(ot)))),
                  ('COINS', name_of(ot).lower() == 'coins'),
                  ('LOOT_OUTSIDE', engine.loot_outside(self.t, k)),
+                 ('LOOT_OUTSIDE_OWN', own is not None and engine.loot_outside(self.t, k, own)),
                  ('TRAIL', ot['category'] in engine.trail_categories(self.t)),
                  ('GLORY', ot['category'] == cats['category_557']),
                  ('POTION', ot['category'] == cats['potion']),
@@ -510,6 +546,11 @@ class Exporter:
                           ('[opheldu,_category_22]', 'CASE_CATEGORY_22')):
             cell = cases[key]
             flags.append((flag, ot['debugname'] in cell['cases'] or any(ot['category'] == cats[x] for x in cell['categories'])))
+        for key, flag in FIELD_USE_FLAGS.items():  # over an archive that resolves them only (engine.archive_script)
+            fn = engine.archive_script(self.view, key)
+            cell = inspect.getclosurevars(fn).nonlocals if fn is not None else None
+            flags.append((flag, cell is not None and (ot['debugname'] in cell['cases']
+                                                      or any(ot['category'] == cats[x] for x in cell['categories']))))
         flags += [('EQUIP_REFUSED', ot['debugname'] in ('elemental_shield', 'ibanstaff')),
                   ('WEIGHT', ot['debugname'] == 'ikov_bootsoflightness'),
                   ('FISH_EQUIPMENT', 'fish_equipment_struct' in ot['params']
@@ -685,8 +726,14 @@ class Exporter:
         out['STYLES'] = styles
         out['LEVELUP'], out['UNLOCKS'] = self.levelups()
         for key in self.c['RS_TEXT_KEYS']:  # the keys whose templates take no fill
-            if key not in ('wc_level', 'wc_get', 'mine_full', 'mine_level', 'mine_gem', 'mine_get', 'prospect_ore', 'eat'):
+            if key not in ('wc_level', 'wc_get', 'mine_full', 'mine_level', 'mine_gem', 'mine_get', 'prospect_ore', 'eat',
+                           'pick_full', 'pick'):
                 self.msg.key(c['RS_MK_TEXT'] + c[f'RS_TX_{key}'], 0, self.text(key))
+        picks = self.content.get('picks', {})  # a plant's texts, by its loc type (engine.pick)
+        for k, lt in t.loc_types.items():
+            if lt['debugname'] in picks:
+                for key in ('pick_full', 'pick'):
+                    self.msg.key(c['RS_MK_TEXT'] + c[f'RS_TX_{key}'], k, self.text(f"{key}_{lt['debugname']}"))
         for k, lt in t.loc_types.items():
             self.msg.key(c['RS_MK_NO_TRIGGER_OPLOCU'], k, self.no_trigger(lt, engine.APLOCU))
         for k, nt in t.npc_types.items():
@@ -812,6 +859,8 @@ class Exporter:
                             ('s_death_no_hero', 'a player command before npc_findhero')):
             r[field] = self.s(text)
         out['s_click'][0] = [self.s(f'{dx},{dz}') for dx, dz in agent.CLICK_OFFSETS]  # a click's meaning option
+        # a pick's produce script, interned only over an archive with the pick rows (the other packs' strings unchanged)
+        r['s_produce_pick'] = self.s('[proc,pickup_loc_floor]') if 'picks' in self.content else self.c['RS_NONE']
         r['members'] = self.view.members
         return out
 
@@ -1600,6 +1649,7 @@ def layout_record(ex, heaps, kind, index, layout, lt, derived=None, grove=-1, ke
     local = lambda x, z: (x - x0) * H + (z - z0)
     r['kind'], r['pool_index'], r['W'], r['H'], r['T'], r['x0'], r['z0'] = kind, index, W, H, W * H, x0, z0
     r['grove'], r['keep'], r['seed'], r['attempt'] = grove, keep, layout.seed, layout.attempt
+    r['world'] = 1 + list(world.WORLDS).index(world.world_of(layout)['version'])  # the layout built as its pool's class
     sources = [local(x, z) for x, z, _ in lt.meta['sources']]
     r['n_src'], r['n_start'] = len(sources), int(layout.start.sum())
     r['n_locs'], r['n_open'], r['n_npcs'], r['n_fish'] = len(layout.locs), len(layout.open_locs), len(layout.npcs), len(layout.fish)
@@ -1717,6 +1767,8 @@ def reachable(ex, compact, supply, variants=()):
             objs.add(t.obj_id(ex.content['trees'][name]['product']))
         if name in ex.compact['rocks']:
             objs.add(t.obj_id(ex.compact['rocks'][name]['output']))
+        if name in ex.content.get('picks', {}):
+            objs.add(t.obj_id(ex.content['picks'][name]['item']))
     objs |= {t.obj_id(gem) for _, gem in ex.compact['gems']}
     objs |= {t.obj_id(name) for name in ex.content['fish']}
     objs |= ex.drop_objs
@@ -1746,6 +1798,23 @@ def declared_world(ex, locs, npcs, objs, loc_rows, npc_rows, obj_rows):
 
 
 # ---- export ---------------------------------------------------------------------------------------------------------------
+def check_village(layout, tables, c):
+    """Raise unless the free-play village world that plays this compact layout (sim/combat.py village_of) fits a World
+    on it (village_npcs, rs.h rs_village_npcs): the layout's other npcs, a goblin at every chicken spawn, the start
+    group's muggers where the world places any, and the chickens, within RS_MAX_NPCS. A layout of no village world is
+    not played by free play."""
+    from sim import combat
+    village = combat.village_of(layout)
+    if village is None:
+        return
+    chickens = len(combat.camp(layout, tables))
+    muggers = combat.COMBAT['groups'][village['start_group']]['muggers'] if village.get('muggers') is not False else 0
+    count = len(layout.npcs) + chickens + muggers
+    if count > c['RS_MAX_NPCS']:
+        raise ExportError(f'layout {layout.seed}: {count} village npcs ({len(layout.npcs) - chickens} others, {chickens} '
+                          f'chickens and their goblins, {muggers} muggers), more than RS_MAX_NPCS {c["RS_MAX_NPCS"]}')
+
+
 def export(output, pool, supply_pool, tables_path, names=None, trees=True, variants=None, log=print):
     """Write the pack of a compact pool (with derived tables), a supply pool and the archive to `output`; returns its
     path. trees=False leaves out the derived state-0 trees (C then computes them) and also takes a compact pool
@@ -1755,10 +1824,12 @@ def export(output, pool, supply_pool, tables_path, names=None, trees=True, varia
     from sim import combat, engine, search
     names = names or name_table()
     t = load_tables(tables_path)
-    rows = sorted(set(engine.ARCHIVE_SCRIPTS) & set(t.meta['content']))
+    rows = sorted((set(engine.ARCHIVE_SCRIPTS) - PORTED_ARCHIVE_SCRIPTS) & set(t.meta['content']))
     if rows:  # until the C port of the phase 2 simulator port, step 5
         raise ExportError(f"{tables_path} holds the {' and '.join(rows)} rows: the oracle runs their scripts, the native port does not")
     ex = Exporter(t, names)
+    with np.load(pool) as data, np.load(supply_pool) as other:
+        worlds = dict(compact=str(data['version']), supply=str(other['version']))
     derived_keys = DERIVED_STATE + DERIVED_PLAIN if trees else tuple(k for k in DERIVED_STATE + DERIVED_PLAIN if k not in TREES)
     with np.load(pool) as data:
         plain = not trees and not set(derived_keys) & set(data.files)
@@ -1767,6 +1838,19 @@ def export(output, pool, supply_pool, tables_path, names=None, trees=True, varia
         derived = [None] * len(compact)
     elif derived is None or any(d is None for d in derived):
         raise ExportError(f'{pool} has no derived tables (sim.world pool --derived)')
+    villages = {(combat.village_of(layout) or {}).get('version') for layout in compact}
+    if len(villages) > 1:
+        raise ExportError(f'{pool} holds the layouts of more than one world')
+    village = combat.VILLAGES.get(next(iter(villages), None))
+    if village is not None and village.get('content') and village['content'] not in t.meta['content']:
+        raise ExportError(f"{pool} holds {village['version']} layouts, whose scripts read the {village['content']} rows "
+                          f"of an archive ({village['tables']}, sim/build.py): {tables_path} has none")
+    if village is not None and village.get('loot_outside') is not None:
+        if not set(village['loot_outside']) <= set(engine.LOOT_OUTSIDE):  # World's ValueError (engine.py:482)
+            raise ExportError(f"{village['version']}'s loot list is not within engine.LOOT_OUTSIDE")
+        ex.loot_own = tuple(village['loot_outside'])
+    for layout in compact:
+        check_village(layout, t, ex.c)
     supply, _ = load_pool(supply_pool)
     log(f'[native] {len(compact)} compact and {len(supply)} supply layouts')
     sections = ex.content_rows()
@@ -1809,10 +1893,9 @@ def export(output, pool, supply_pool, tables_path, names=None, trees=True, varia
     sections.update(ex.msg.sections())
     sections.update(ex.s.sections(names))  # last: every string is interned by now
     inputs = native.input_hashes(dict(tables=tables_path, pool=pool, supply_pool=supply_pool))
-    source = Path(__file__).read_bytes()
-    manifest = native.manifest(
-        inputs=inputs, names=names, exporter=dict(version=EXPORT_VERSION, sha256=hashlib.sha256(source).hexdigest()),
-        meta_sha256=t.meta_sha256,
+    manifest = native.manifest(  # its exporter (EXPORT_VERSION, this source's sha256) and ids: native.manifest
+        inputs=inputs, names=names, meta_sha256=t.meta_sha256, worlds=worlds, content=sorted(t.meta['content']),
+        loot_outside=None if ex.loot_own is None else list(ex.loot_own),
         partial=variants is not None, trees=trees,
         counts=dict(compact=len(compact), supply=len(supply), variants=sum(1 for row in rows if row[3] >= 0),
                     failing_variants=sum(1 for row in rows if row[3] < 0), strings=len(ex.s.text),

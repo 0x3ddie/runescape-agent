@@ -1,8 +1,8 @@
 """Play a policy or a control in a simulated goal task (sim/task.py).
 
     .venv-sim/bin/python -m sim.run --policy random --goal wood --episodes 20 --output logs/sim/runs/random-wood
-    .venv-sim/bin/python -m sim.run --policy checkpoint --checkpoint logs/wt/act/logs/goal/s101/latest.zip \\
-        --sampled --goal fish --episodes 20 --output logs/sim/runs/k65-s101-fish
+    .venv-sim/bin/python -m sim.run --policy checkpoint --checkpoint RUN/latest.zip \\
+        --sampled --goal fish --episodes 20 --output logs/sim/runs/fish
     .venv-sim/bin/python -m sim.run reference --split development --layouts 50 --episodes 50 --output logs/sim/runs/reference
     .venv-sim/bin/python -m sim.run goals --checkpoint RUN/latest.zip --initial RUN/initial.zip --output logs/sim/runs/eval-s101
 

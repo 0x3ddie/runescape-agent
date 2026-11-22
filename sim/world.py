@@ -78,6 +78,8 @@ L, N, K and G with -1, with counts n_locs, n_npcs, n_fish, n_open_locs.
 
     .venv-sim/bin/python -m sim.world show 1000000
     .venv-sim/bin/python -m sim.world pool --split development --count 32 --output logs/sim/world/dev.npz [--derived]
+    .venv-sim/bin/python -m sim.world pool --world village-world-v2 --split train --count 128 --first 20000 \
+        --output logs/sim/world/train-128-20000-v2.npz      # village-world-v2 (VILLAGE_WORLD), plain: no derived tables
 """
 from __future__ import annotations
 
@@ -92,7 +94,7 @@ import numpy as np
 from baseline.resource_task import GOALS
 from sim import paths
 from sim.data import FLAG_NULL, HALF, Tables
-from sim.engine import _gate_close_offset, _gate_pair
+from sim.engine import DOOR_OPEN, _gate_close_offset, _gate_pair
 
 W = H = 48
 ORIGIN = (2880, 3328)
@@ -115,7 +117,27 @@ SEARCH_WORLD = dict(WORLD, version='search-world-v1', size=(64, 64))
 # centres stand at least grove_separation apart, so trees of different groves are at least 26 - 2 x 6 = 14 tiles apart
 # (sim/search.py groves); 9-12 normal trees and 2-3 oaks shared among them. sim/search.py plays its wood goal there.
 SUPPLY_WORLD = dict(SEARCH_WORLD, version='supply-world-v1', trees=(9, 12), oaks=(2, 3), groves=(3, 3), grove_separation=26)
-WORLDS = {spec['version']: spec for spec in (WORLD, SEARCH_WORLD, SUPPLY_WORLD)}
+# village-world-v2's layouts (accepted 13 November 2026): WORLD's draws on the whole 64-tile chunk at ORIGIN with region
+# centres 20 apart and every source of a start within 60 steps, and five additions, each drawn only by this spec
+# (WORLD's layouts and their draws do not change). Every value below the accepted contents is a proposal until it is
+# frozen:
+# - a field: one region of `field_plants` plants, all of one kind drawn per seed by `field_kinds` (loc debugname,
+#   share), on distinct tiles within `field_half` of its centre; each plant has a Pick (sim/engine.py pick);
+# - a pen barrier: a pen seed's pen is closed by PEN_DOOR in place of PEN_GATE in `door_fraction` of them;
+# - a willow and a yew (trees that a low level cannot cut) in a grove, each in its own share of seeds;
+# - a highwayman (HUNTER) in `hunter_fraction` of seeds, spawned on a tile of the start component `hunter_near`
+#   (Chebyshev) from one region centre drawn among the pen's, the groves', the mine's and the field's, and only where the
+#   share of start tiles within its reach (its type's wanderrange + huntrange, Chebyshev from the spawn) lies in
+#   `hunter_share`: near some starts and not all;
+# - plants, willows and yews must be operable from the start component, and each plant's own tile walkable (the pick
+#   teleports the player onto it).
+# Its layouts are VillageLayouts, whose class names the world: its size is the search and supply worlds'. The seed decides the pen
+# (PEN_STREAM) as in WORLD, and the five draws of VARIANT_STREAM in order: door, field kind, willow, yew, highwayman.
+VILLAGE_WORLD = dict(WORLD, version='village-world-v2', size=(64, 64), by_name=True, region_separation=20, goal_steps=60,
+                     field_plants=(6, 16), field_half=3, field_kinds=(('cabbage', 0.5), ('potato', 0.25), ('onion', 0.25)),
+                     door_fraction=0.5, willow_fraction=0.5, yew_fraction=0.5,
+                     hunter_fraction=0.5, hunter_near=(4, 10), hunter_share=(0.2, 0.6))
+WORLDS = {spec['version']: spec for spec in (WORLD, SEARCH_WORLD, SUPPLY_WORLD, VILLAGE_WORLD)}
 SPLITS = dict(train=(0, 1_000_000), development=(1_000_000, 1_010_000), final=(2_000_000, 2_010_000))
 TREE, OAK = 'tree', 'oaktree'
 ROCKS = dict(copper=('copperrock1', 'copperrock2'), tin=('tinrock1',), iron=('ironrock1', 'ironrock2'))
@@ -124,10 +146,15 @@ CHICKENS = ('chicken', 'chicken_brown')
 OBSTACLES = ('loc_444', 'loc_445', 'bush1')   # Boulder 2x2, Boulder 2x2, Bush 1x1
 FENCE = dict(blockwalk=True, blockrange=False)  # a wall with no loc (paths.collision_masks shape 0)
 PEN_GATE = ('loc_1551', 'loc_1553')  # main and outer leaf of Entrana's chicken pen gate, closed
+PEN_DOOR = 'poordooropen'  # a one-leaf door, closed ([oploc1,_door_closed], doors.rs2): village-world-v2's other pen barrier
+PEN_BARRIERS = (*PEN_GATE, PEN_DOOR)  # what closes a pen, closed
+WILLOW, YEW = 'willowtree', 'yewtree'  # woodcutting levels 30 and 60 (trees.dbrow)
+HUNTER = 'highwayman'  # hunts a player of up to twice its level within its hunt range (sim/engine.py npc_hunt_all)
 WALL = 0  # shape: a straight wall
 PEN_STREAM = 1 << 20  # the PCG64 stream (seed, PEN_STREAM) decides a seed's pen; attempts use (seed, attempt)
 DISTRACT_STREAM = 1 << 21  # the stream (seed, DISTRACT_STREAM) places a development variant's additions (with_distractions)
-# Development additions for the npc cause test, each of a kind the native start sets show and the simulator plays fully.
+VARIANT_STREAM = 1 << 22  # the stream (seed, VARIANT_STREAM) draws a VILLAGE_WORLD seed's variant (_variant)
+# Development additions for a cause test, each of a kind the native start sets show and the simulator plays fully.
 # npcs: goblins, attackable npcs that fight back and are not eligible enemies (Entrana's monks and Rimmington's goblins);
 # the reference plays only one-tile npcs (a unicorn or a cow raises 'a large npc in melee' or 'a large npc approaching').
 DISTRACTIONS = dict(npcs=dict(type='goblin', count=3, near=(3, 9)))
@@ -151,9 +178,19 @@ class Layout:
     walkable: np.ndarray
     start: np.ndarray
     goal_dist: np.ndarray
+    world = None  # not a field: the declared world a subclass names (VillageLayout), else None (world_of)
 
     def arrays(self):
         return {f.name: np.asarray(getattr(self, f.name)) for f in fields(self)}
+
+
+class VillageLayout(Layout):
+    """A VILLAGE_WORLD layout: Layout's fields, and a class that names its world, since its size is the search and
+    supply worlds' (world_of). dataclasses.replace keeps the class."""
+    world = 'village-world-v2'
+
+
+LAYOUT_CLASSES = {VillageLayout.world: VillageLayout}  # a by_name world's layouts, by the world's name
 
 
 # ---- drawing --------------------------------------------------------------------------------------
@@ -167,6 +204,9 @@ class _Types:
         self.spot = npc[SPOT]
         self.chickens = [npc[n] for n in CHICKENS]
         self.gate = [loc[n] for n in PEN_GATE]
+        self.door, self.willow, self.yew = loc[PEN_DOOR], loc[WILLOW], loc[YEW]
+        self.plants = {name: loc[name] for name, _ in VILLAGE_WORLD['field_kinds']}
+        self.hunter = npc[HUNTER]
         self.size = {k: (v['width'], v['length']) for k, v in t.loc_types.items()}
 
 
@@ -208,11 +248,24 @@ def _footprint(x, z, w, l):
     return [(x + i, z + j) for i in range(w) for j in range(l)]
 
 
+def _variant(seed, spec, fenced):
+    """A VILLAGE_WORLD seed's variant (its spec's comment), drawn once per seed and not per attempt, so each share is the
+    spec's: whether its pen is closed by the door, its field's kind, a willow, a yew, a highwayman. {} for a spec without
+    a field (WORLD and the others draw nothing here)."""
+    if 'field_plants' not in spec:
+        return {}
+    u = np.random.default_rng([seed, VARIANT_STREAM]).random(5)
+    shares = np.cumsum([share for _, share in spec['field_kinds']])
+    kind = spec['field_kinds'][min(int(np.searchsorted(shares, u[1], side='right')), len(shares) - 1)][0]
+    return dict(door=bool(fenced and u[0] < spec['door_fraction']), kind=kind, willow=bool(u[2] < spec['willow_fraction']),
+                yew=bool(u[3] < spec['yew_fraction']), hunter=bool(u[4] < spec['hunter_fraction']))
+
+
 class _Draw:
     """One attempt at a layout; `layout()` is None when a check fails."""
 
-    def __init__(self, rng, types, fenced, spec):
-        self.rng, self.ty, self.fenced, self.spec = rng, types, fenced, spec
+    def __init__(self, rng, types, fenced, spec, variant=None):
+        self.rng, self.ty, self.fenced, self.spec, self.variant = rng, types, fenced, spec, variant or {}
         W, H = self.W, self.H = spec['size']
         self.water = np.zeros((W, H), bool)
         self.taken = np.zeros((W, H), bool)     # loc footprints
@@ -306,8 +359,15 @@ class _Draw:
         mine = self.centre(3, [pen] + groves)
         if mine is None:
             return False
+        self.regions = dict(pen=[pen], grove=groves, mine=[mine])
+        if self.variant and not self.draw_field([pen] + groves + [mine]):
+            return False
         trees = [self.ty.tree] * self.r(self.spec['trees']) + [self.ty.oak] * self.r(self.spec['oaks'])
         for k, tree in enumerate(trees):
+            if not self.place_loc(tree, groves[k % len(groves)], self.spec['grove_spread']):
+                return False
+        for k, tree in enumerate(t for t, here in ((self.ty.willow, self.variant.get('willow')),
+                                                       (self.ty.yew, self.variant.get('yew'))) if here):
             if not self.place_loc(tree, groves[k % len(groves)], self.spec['grove_spread']):
                 return False
         n = self.r(self.spec['rocks'])
@@ -332,27 +392,58 @@ class _Draw:
             self.draw_pen(pen)
         return True
 
+    def draw_field(self, away):
+        """The field (VILLAGE_WORLD): its own region's centre, `field_plants` plants of the variant's kind on distinct
+        free tiles within field_half of it (centrepieces, which block nothing), then the field and a tile around it kept
+        clear of later locs."""
+        h = self.spec['field_half']
+        field = self.centre(h + 1, away)
+        if field is None:
+            return False
+        self.regions['field'] = [field]
+        tiles = [(field[0] + i, field[1] + j) for i in range(-h, h + 1) for j in range(-h, h + 1)]
+        want, placed = self.r(self.spec['field_plants']), 0
+        for k in self.rng.permutation(len(tiles)):
+            x, z = tiles[int(k)]
+            if placed < want and self.free(x, z, 1, 1):
+                self.taken[x, z] = True
+                self.locs.append((self.ty.plants[self.variant['kind']], x, z, CENTREPIECE, 0))
+                placed += 1
+        self.kept[field[0] - h - 1:field[0] + h + 2, field[1] - h - 1:field[1] + h + 2] = True
+        return placed == want
+
     def draw_pen(self, pen):
         """Fences on the edges of the square of half-size pen_half around the pen centre, with a
         double gate in one side: the main leaf on a tile of that side, the outer one on its pair tile
         ([proc,get_pair_coord]), each a wall of the side's angle (0 west, 1 north, 2 east, 3 south),
-        away from the corners; open, the leaves stand outward."""
+        away from the corners; open, the leaves stand outward. A door variant (VILLAGE_WORLD) puts one door on the main
+        leaf's tile in place of both leaves."""
         r, (cx, cz) = self.r(self.spec['pen_half']), pen
         side = int(self.rng.integers(4))
         along = int(self.rng.integers(-r + 1, r - 1))  # the main leaf's place along its side
         main = ((cx - r, cz + along), (cx + along, cz + r), (cx + r, cz - along), (cx - along, cz - r))[side]
-        outer = _gate_pair(*main, side, False)
         edges = [((cx - r, z), 0) for z in range(cz - r, cz + r + 1)] + [((x, cz + r), 1) for x in range(cx - r, cx + r + 1)] \
             + [((cx + r, z), 2) for z in range(cz - r, cz + r + 1)] + [((x, cz - r), 3) for x in range(cx - r, cx + r + 1)]
+        if self.variant.get('door'):
+            self.fences += [(x, z, angle) for (x, z), angle in edges if not (angle == side and (x, z) == main)]
+            self.gate = [len(self.locs)]
+            self.locs.append((self.ty.door, *main, WALL, side))
+            return
+        outer = _gate_pair(*main, side, False)
         self.fences += [(x, z, angle) for (x, z), angle in edges if not (angle == side and (x, z) in (main, outer))]
         self.gate = [len(self.locs), len(self.locs) + 1]
         self.locs += [(self.ty.gate[0], *main, WALL, side), (self.ty.gate[1], *outer, WALL, side)]
 
     def open_locs(self, t):
         """[proc,open_gate] from the closed main leaf: each leaf's next stage, turned a quarter, at
-        the main leaf's tile moved one and two tiles outward ([proc,gate_set_close])."""
+        the main leaf's tile moved one and two tiles outward ([proc,gate_set_close]). A door: [oploc1,_door_closed]'s
+        next stage on the tile in front ([proc,door_open]), turned a quarter (sim/engine.py door)."""
         if not self.gate:
             return []
+        if len(self.gate) == 1:
+            type_id, x, z, shape, angle = self.locs[self.gate[0]]
+            dx, dz = DOOR_OPEN[shape][angle]
+            return [(t.loc_types[type_id]['params']['next_loc_stage'], x + dx, z + dz, shape, (angle + 1) % 4)]
         (main, x, z, _, angle), (outer, *_) = (self.locs[k] for k in self.gate)
         return [(t.loc_types[leaf]['params']['next_loc_stage'], x + dx, z + dz, WALL, (angle + 3) % 4)
                 for leaf, (dx, dz) in ((main, _gate_close_offset(angle, 1)), (outer, _gate_close_offset(angle, 2)))]
@@ -426,11 +517,13 @@ def _seeds(tiles_lists, within):
 
 def generate(seed, tables, spec=WORLD):
     """The layout of a seed in a declared world (WORLD, or SEARCH_WORLD): whether it has a pen (stream (seed,
-    PEN_STREAM)), then the first attempt (PCG64 stream (seed, attempt)) that passes the checks."""
+    PEN_STREAM)), then the first attempt (PCG64 stream (seed, attempt)) that passes the checks. VILLAGE_WORLD: also its
+    variant (_variant), and in a highwayman seed an attempt whose hunter finds no spawn (place_hunter) fails too."""
     types = _Types(tables)
     fenced = np.random.default_rng([seed, PEN_STREAM]).random() < spec['pen_fraction']  # once per seed, not per attempt
+    variant = _variant(seed, spec, fenced)
     for attempt in range(spec['attempts']):
-        d = _Draw(np.random.default_rng([seed, attempt]), types, fenced, spec)
+        d = _Draw(np.random.default_rng([seed, attempt]), types, fenced, spec, variant)
         d.draw_water()
         if not d.draw_fish() or not d.draw_things():
             continue
@@ -438,9 +531,41 @@ def generate(seed, tables, spec=WORLD):
         flags, flags_open, flags_snapshot = (d.collision(tables, state) for state in ('closed', 'open', 'snapshot'))
         layout = _checked(seed, attempt, flags, flags_open, flags_snapshot, d.locs, d.gate, d.open_locs(tables), d.npcs, d.fish,
                           types, tables, spec)
+        if layout is not None and variant.get('hunter'):
+            layout = place_hunter(layout, d.rng, d.regions, types, tables, spec)
         if layout is not None:
             return layout
     raise RuntimeError(f'no layout for seed {seed} in {spec["attempts"]} attempts')
+
+
+def hunter_reach(tables):
+    """Chebyshev tiles from its spawn within which the highwayman can hunt a player: its wanderrange plus its huntrange."""
+    nt = tables.npc_types[_Types(tables).hunter]
+    return nt['wanderrange'] + nt['huntrange']
+
+
+def place_hunter(layout, rng, regions, types, tables, spec):
+    """The layout with the highwayman's spawn (VILLAGE_WORLD's comment) as its last npc, or None when no tile fits: a
+    region drawn among `regions` (name -> centres, in the order pen, grove, mine, field), then the tiles of the start
+    component (sim/combat.py outside) hunter_near from its centre with no npc spawn, in an order the attempt's stream
+    draws; the first whose share of start tiles within hunter_reach lies in hunter_share."""
+    import dataclasses
+    centres = [c for name in ('pen', 'grove', 'mine', 'field') for c in regions[name]]
+    cx, cz = centres[int(rng.integers(len(centres)))]
+    lo, hi = spec['hunter_near']
+    reached = (flood(paths.step_masks(layout.flags), layout.start) >= 0) & layout.walkable
+    spawns = {(int(x), int(z)) for _, _, x, z in layout.npcs}
+    tiles = [(int(x), int(z)) for x, z in np.argwhere(reached)
+             if lo <= max(abs(x - cx), abs(z - cz)) <= hi and (int(x), int(z)) not in spawns]
+    starts, reach = np.argwhere(layout.start), hunter_reach(tables)
+    low, high = spec['hunter_share']
+    for k in rng.permutation(len(tiles)):
+        x, z = tiles[int(k)]
+        share = float(np.mean(np.max(np.abs(starts - (x, z)), axis=1) <= reach))
+        if low <= share <= high:
+            row = (len(layout.npcs) + NPC_BASE, types.hunter, x, z)
+            return dataclasses.replace(layout, npcs=np.vstack([layout.npcs, np.asarray([row], np.int32)]).astype(np.int32))
+    return None
 
 
 def _checked(seed, attempt, flags, flags_open, flags_snapshot, locs, gate, open_locs, npcs, fish, types, tables, spec):
@@ -454,11 +579,14 @@ def _checked(seed, attempt, flags, flags_open, flags_snapshot, locs, gate, open_
     loc = lambda kinds: [('loc', ty, x, z, shape, angle) for k, (ty, x, z, shape, angle) in enumerate(locs)
                          if ty in kinds and k not in gate]
     hens = [('npc', x, z) for _, ty, x, z in npcs if ty in types.chickens]
-    resources = loc({types.tree, types.oak} | {r for rocks in types.rocks.values() for r in rocks})
+    plants = set(types.plants.values())
+    resources = loc({types.tree, types.oak, types.willow, types.yew} | plants | {r for rocks in types.rocks.values() for r in rocks})
     leaves = [('loc', *locs[k]) for k in gate]
     operable = lambda flags_, things, within: all(any(within[a, b] for a, b in tiles) for tiles in _reach(flags_, things, tables))
     if not (operable(flags, resources + [('npc', x, z) for x, z in fish] + leaves, outside)
             and operable(flags_open, hens, walkable)):
+        return None
+    if not all(outside[x, z] for ty, x, z, _, _ in locs if ty in plants):  # a pick teleports the player onto its plant
         return None
     goal_dist = np.zeros((len(GOALS), W, H), np.int16)
     targets = dict(wood=[loc({types.tree})], fish=[[('npc', x, z)] for x, z in fish],
@@ -485,10 +613,11 @@ def _checked(seed, attempt, flags, flags_open, flags_snapshot, locs, gate, open_
     if start.sum() < spec['min_starts']:
         return None
     rows = lambda items: np.asarray(items, np.int32).reshape(-1, 5)
-    return Layout(seed=int(seed), attempt=attempt, flags=flags, flags_open=flags_open, flags_snapshot=flags_snapshot,
-                  locs=rows(locs), gate=np.asarray(gate or [-1, -1], np.int32), open_locs=rows(open_locs),
-                  npcs=np.asarray(npcs, np.int32).reshape(-1, 4), fish=np.asarray(fish, np.int32).reshape(-1, 2),
-                  walkable=walkable, start=start, goal_dist=goal_dist)
+    return LAYOUT_CLASSES.get(spec['version'], Layout)(
+        seed=int(seed), attempt=attempt, flags=flags, flags_open=flags_open, flags_snapshot=flags_snapshot, locs=rows(locs),
+        gate=np.asarray((list(gate) + [-1, -1])[:2] if gate else [-1, -1], np.int32), open_locs=rows(open_locs),
+        npcs=np.asarray(npcs, np.int32).reshape(-1, 4), fish=np.asarray(fish, np.int32).reshape(-1, 2), walkable=walkable,
+        start=start, goal_dist=goal_dist)
 
 
 def relocate(layout, tables, moved):
@@ -561,9 +690,12 @@ def with_distractions(layout, tables, kinds, around):
 
 
 def world_of(layout):
-    """The first declared world of the layout's size. The search and supply worlds share a size and every setting
+    """The layout's declared world when its class names it (VillageLayout), else the first declared
+    world of the layout's size among those that do not. The search and supply worlds share a size and every setting
     _checked reads (size, goal_steps, min_starts); a pool names its world (save_pool's version)."""
-    found = [spec for spec in WORLDS.values() if spec['size'] == layout.flags.shape]
+    if layout.world is not None:
+        return WORLDS[layout.world]
+    found = [spec for spec in WORLDS.values() if spec['size'] == layout.flags.shape and not spec.get('by_name')]
     if not found:
         raise ValueError(f'no declared world of size {layout.flags.shape}')
     return found[0]
@@ -830,8 +962,9 @@ def save_pool(path, layouts, derived=None, version=None):
     if len(specs) != 1:
         raise ValueError(f'a pool holds one declared world, not {sorted(specs)}')
     found = specs.pop()
-    if version is not None and WORLDS[version]['size'] != WORLDS[found]['size']:
-        raise ValueError(f'{version} layouts are not of size {WORLDS[found]["size"]}')
+    if version is not None and (WORLDS[version]['size'] != WORLDS[found]['size']
+                                or bool(WORLDS[version].get('by_name')) != bool(WORLDS[found].get('by_name'))):
+        raise ValueError(f'{version} layouts are not {found} layouts')
     out = dict(version=np.asarray(version or found), origin=np.asarray(ORIGIN, np.int32))
     for name in rows[0]:
         values = [np.asarray(r[name]) for r in rows]
@@ -854,6 +987,7 @@ def load_pool(path):
         if str(data['version']) not in WORLDS:
             raise ValueError(f"{path} holds {data['version']}, not one of {sorted(WORLDS)}")
         arrays = {k: data[k] for k in data.files}
+    cls = LAYOUT_CLASSES.get(str(arrays['version']), Layout)  # a by_name world's layouts carry its name
     names = [f.name for f in fields(Layout)]
     layouts, derived = [], []
     for k in range(len(arrays['seed'])):
@@ -863,7 +997,7 @@ def load_pool(path):
                 continue
             n = arrays[f'n_{name}'][k] if name in PADDED else None
             row[name] = value[k] if n is None else value[k][:n] if PADDED[name] == 0 else value[k][:, :n]
-        layouts.append(Layout(**{n: (int(row[n]) if n in ('seed', 'attempt') else row[n]) for n in names}))
+        layouts.append(cls(**{n: (int(row[n]) if n in ('seed', 'attempt') else row[n]) for n in names}))
         rest = {n: v for n, v in row.items() if n not in names}
         derived.append(rest or None)
     return layouts, derived
@@ -871,9 +1005,9 @@ def load_pool(path):
 
 # ---- inspection ---------------------------------------------------------------------------------------
 def render(layout, t):
-    """Rows north first: ~ water, # loc, T tree, O oak, c copper, t tin, i iron, G gate leaf, f fishing
-    coordinate, h chicken spawn, - and | fence edges (north or south, east or west), . start tile,
-    , other walkable tile."""
+    """Rows north first: ~ water, # loc, T tree, O oak, W willow, Y yew, c copper, t tin, i iron, G gate leaf, D pen
+    door, p field plant, f fishing coordinate, h chicken spawn, H highwayman spawn, - and | fence edges (north or south,
+    east or west), . start tile, , other walkable tile."""
     W, H = layout.flags.shape
     grid = [[' '] * W for _ in range(H)]
     for x in range(W):
@@ -886,7 +1020,8 @@ def render(layout, t):
             elif f & 0x88:
                 grid[z][x] = '|'
     marks = {TREE: 'T', OAK: 'O', 'copperrock1': 'c', 'copperrock2': 'c', 'tinrock1': 't', 'ironrock1': 'i', 'ironrock2': 'i',
-             PEN_GATE[0]: 'G', PEN_GATE[1]: 'G'}
+             PEN_GATE[0]: 'G', PEN_GATE[1]: 'G', WILLOW: 'W', YEW: 'Y', PEN_DOOR: 'D',
+             **{name: 'p' for name, _ in VILLAGE_WORLD['field_kinds']}}
     for type_id, x, z, _, _ in layout.locs:
         mark = marks.get(t.loc_types[int(type_id)]['debugname'])
         if mark:
@@ -894,8 +1029,9 @@ def render(layout, t):
     for x, z in layout.fish:
         grid[z][x] = 'f'
     for _, type_id, x, z in layout.npcs:
-        if t.npc_types[int(type_id)]['debugname'] in CHICKENS:
-            grid[z][x] = 'h'
+        name = t.npc_types[int(type_id)]['debugname']
+        if name in CHICKENS or name == HUNTER:
+            grid[z][x] = 'h' if name in CHICKENS else 'H'
     return '\n'.join(''.join(row) for row in reversed(grid))
 
 
@@ -904,7 +1040,11 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     show = sub.add_parser('show', help='draw one layout')
     show.add_argument('seed', type=int)
+    show.add_argument('--world', choices=(WORLD['version'], VILLAGE_WORLD['version']), default=WORLD['version'],
+                      help='the declared world whose layout to draw')
     pool = sub.add_parser('pool', help='generate and save a split')
+    pool.add_argument('--world', choices=(WORLD['version'], VILLAGE_WORLD['version']), default=WORLD['version'],
+                      help='the declared world of the layouts (the pool file records it)')
     pool.add_argument('--split', choices=SPLITS, required=True)
     pool.add_argument('--count', type=int, required=True)
     pool.add_argument('--first', type=int, default=0)
@@ -912,13 +1052,14 @@ def main():
     pool.add_argument('--derived', action='store_true', help='add the per-source trees of both states and the snapshot')
     args = parser.parse_args()
     tables = Tables.load()
+    spec = WORLDS[args.world]
     if args.command == 'show':
-        layout = generate(args.seed, tables)
+        layout = generate(args.seed, tables, spec)
         print(f'seed {layout.seed} attempt {layout.attempt}: {len(layout.locs)} locs, {len(layout.npcs)} npcs, '
               f'{int(layout.walkable.sum())} walkable, {int(layout.start.sum())} start tiles')
         print(render(layout, tables))
         return
-    layouts = [generate(seed, tables) for seed in split_seeds(args.split, args.count, args.first)]
+    layouts = [generate(seed, tables, spec) for seed in split_seeds(args.split, args.count, args.first)]
     derived = [derive(layout, tables) for layout in layouts] if args.derived else None
     print(f'[world] wrote {save_pool(args.output, layouts, derived)}: {len(layouts)} {args.split} layouts')
 

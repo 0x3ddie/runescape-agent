@@ -48,6 +48,56 @@ def test_numeric_helpers_equal_python(v, a, b, s):
     assert m.asr(a, s) == a >> s
 
 
+XP = st.integers(0, 2 * 10 ** 9)  # a stat's XP in tenths, 0 to 200,000,000 XP
+
+
+@st.composite
+def level_gains(draw):
+    """The terms free-play-v1's pay sums in one decision (sim/task.py FreePlayEpisode._account) or its report over a
+    life: one per skill of S in S's order, the change of fractional_level over a stat's XP gain (none, a decision's, a
+    life's), with S's own length."""
+    from sim.audit import fractional_level
+    from sim.task import FREE_PLAY
+    terms = []
+    for _ in FREE_PLAY['skills']:
+        before = draw(XP)
+        gain = draw(st.sampled_from([0, 0, 0]) | st.integers(1, 5000) | st.integers(1, 2 * 10 ** 9))
+        after = min(before + gain, 2 * 10 ** 9)
+        terms.append(fractional_level(after) - fractional_level(before))
+    return terms
+
+
+def bits(value):
+    return 'nan' if value != value else np.float64(value).tobytes()
+
+
+@settings(deadline=None, max_examples=2000)
+@given(level_gains() | st.lists(st.floats(), max_size=40) | st.lists(st.floats(-1e3, 1e3), min_size=3, max_size=12))
+def test_the_c_sum_of_floats_is_the_oracles_sum(terms):
+    """sim/native/pysum.h rs_py_sum (module py_sum) equals Python's own sum() of the same floats bit for bit: on the
+    level gains free-play-v1's pay sums, and on any floats (infinities and NaN among them: NaN as NaN)."""
+    assert bits(native.load().py_sum(terms)) == bits(float(sum(terms))), terms
+
+
+def test_the_loader_refuses_an_interpreter_whose_sum_is_plain(monkeypatch):
+    """The C twin sums as CPython 3.12+ sums floats (compensated): check_interpreter refuses a plain sum(), and load()
+    asks it before it builds or loads anything; this interpreter passes."""
+    import builtins
+
+    def plain(values):
+        total = 0
+        for value in values:
+            total += value
+        return total
+    native.check_interpreter()
+    with pytest.raises(RuntimeError, match='adds floats in sum.. plainly'):
+        native.check_interpreter(plain)
+    monkeypatch.setattr(native, '_MODULE', None)
+    monkeypatch.setattr(builtins, 'sum', plain)
+    with pytest.raises(RuntimeError, match='Python 3.12 or later'):
+        native.load()
+
+
 def test_the_observation_and_info_layouts_are_the_spec(module):
     """The layouts C writes (rs_gen.h, through the compiled module) are sim/spec.py's, in sim/workers.py's order."""
     from sim.spec import INFO_FIELDS, OBSERVATION_SHAPES, dtype
@@ -155,8 +205,8 @@ def test_a_pack_round_trips(tmp_path, module):
 
 
 def test_two_exports_compare_by_file_manifest_and_section(tmp_path, module):
-    """A cloud machine's export is checked against the local pack by pack_digest: equal packs compare equal,
-    and a pack with one other section and another count names only those."""
+    """sim.native info --digest --against sets another host's export against this Mac's pack by pack_digest: equal
+    packs compare equal, and a pack with one other section and another count names only those."""
     same, _ = _pack(tmp_path / 'a.pack', counts=dict(layouts=0))
     again, _ = _pack(tmp_path / 'b.pack', counts=dict(layouts=0))
     assert native.compare_digests(native.pack_digest(same), native.pack_digest(again)) == dict(
@@ -214,10 +264,60 @@ def test_damaged_stale_or_mislaid_packs_are_refused(tmp_path, module):
     with pytest.raises(module.Error) as caught:
         module.Pack(str(tmp_path / 'mislaid.pack'))
     assert str(native.as_python(caught.value)) == 'native pack: a record section was written with another struct layout'
+    with pytest.raises(ValueError, match=r'mislaid\.pack: native pack: a record section was written with another struct '
+                       r'layout; export it again'):
+        native.open_pack(tmp_path / 'mislaid.pack')
     stale, _ = _pack(tmp_path / 'stale.pack', oracle_hash='0' * 64)
     with pytest.raises(ValueError, match='another oracle'):
         native.open_pack(stale)
     assert native.open_pack(stale, allow_stale=True).n_strings == 3
+    for k, exporter in enumerate((dict(version='rs-native-export-v1', sha256='0' * 64), None)):  # another source, none
+        other, _ = _pack(tmp_path / f'exporter{k}.pack', exporter=exporter)
+        with pytest.raises(ValueError, match='another exporter'):
+            native.open_pack(other)
+        assert native.open_pack(other, allow_stale=True).n_strings == 3
+    for k, ids in enumerate(('0' * 64, None)):  # other id tables, or none recorded: no override
+        other, _ = _pack(tmp_path / f'ids{k}.pack', ids=ids)
+        with pytest.raises(ValueError, match='other ids'):
+            native.open_pack(other, allow_stale=True)
+
+
+def test_a_pack_is_refused_when_any_id_table_it_was_written_against_changes(tmp_path, module, monkeypatch):
+    """ids_hash covers each id source the record layouts do not: the library's script and section tables, rs.h's
+    contract and the order of the declared worlds. A pack written on this tree opens; with any one of the four changed
+    (two script ids swapped, two section ids swapped, one text key renumbered, two declared worlds swapped) it is
+    refused even with allow_stale."""
+    from sim import native_export, world
+    path, _ = _pack(tmp_path / 'ids.pack')
+    assert native.open_pack(path).n_strings == 3
+
+    class Swapped:  # the library with two script ids swapped
+        def __getattr__(self, name):
+            return getattr(module, name)
+
+        def scripts(self):
+            rows = module.scripts()
+            return [rows[0], rows[2], rows[1], *rows[3:]]
+
+    class Refiled(Swapped):  # the library with two section ids swapped, its scripts as they are
+        scripts = property(lambda self: module.scripts)
+
+        def constants(self):
+            out = module.constants()
+            sections = out['sections']
+            sections['STRINGS'], sections['STR_OFF'] = sections['STR_OFF'], sections['STRINGS']
+            return out
+
+    contract = dict(native_export.contract())
+    contract['RS_TX_pick'] += 1
+    declared = list(world.WORLDS.items())
+    for target, name, value in ((native, 'load', Swapped), (native, 'load', Refiled),
+                                (native_export, 'contract', lambda: contract),
+                                (world, 'WORLDS', dict([declared[1], declared[0], *declared[2:]]))):
+        with monkeypatch.context() as patch:
+            patch.setattr(target, name, value)
+            with pytest.raises(ValueError, match='other ids'):
+                native.open_pack(path, allow_stale=True)
 
 
 def test_packs_name_their_rows_and_inputs(tmp_path, module):
@@ -291,10 +391,8 @@ def test_native_batch_keeps_cpubatch_interface_and_reports_what_is_not_ported(tm
     assert 'STR_ROW' in str(native.as_python(caught.value))
     batch = native.NativeBatch(pack, 2, first=5, task='goal-activity-v5')
     assert batch.goals == ['fish', 'mine'] and batch.episodes == [0, 0] and batch.evidence == []
-    assert batch._batch.failure(1) is None and batch._batch.start(1)['seed'] is None
-    assert batch.starts[0] == dict(layout=0, tile=(0, 0), weapon='bronze_dagger', world_seed=0,
-                                   levels=dict(woodcutting=0, fishing=0, mining=0, attack=0, strength=0, defence=0,
-                                               hitpoints=0))
+    # before its first reset no world has drawn a start (RsSlot.has_start): none, as a failed draw leaves none
+    assert batch._batch.failure(1) is None and batch._batch.start(1) is None and batch.starts == [None, None]
     with pytest.raises(IndexError):
         batch._batch.start(2)
     wrong = {name: np.zeros(shape, kind) for name, (shape, kind) in fields(2).items()}

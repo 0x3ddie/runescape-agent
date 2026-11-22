@@ -9,7 +9,8 @@ from baseline import config
 from sim import build, engine, world as W
 from sim.agent import A_ACT0, A_HELD0, A_USE0, Agent
 from sim.data import Tables
-from sim.engine import COOKING, FIREMAKING, Obj, Player, Unsupported, World
+from sim.audit import XpCheck
+from sim.engine import COOKING, FIREMAKING, Obj, Player, Unsupported, World, xp_for
 from sim.task import WORLD_START_TICK
 
 FIRE, RANGE, CASTLE_RANGE = 2732, 2728, 114  # Fire, Range and Cooking range: found by name (their debugnames are loc_N)
@@ -159,6 +160,9 @@ def test_a_tinderbox_and_logs_light_a_fire_on_the_scripts_cycle(v3, site, item, 
     assert fires(world) == [(x, z)] and not ground(world, 'logs') and not p.delayed and p.target is None
     assert said(world, at)[1] == (8, 'The fire catches and the logs begin to burn.')
     assert (p.stats[FIREMAKING], p.base_levels[FIREMAKING]) == (400 * 25, 10)
+    start = [xp_for(1)] * len(p.stats)
+    start[engine.HITPOINTS] = xp_for(10)
+    assert XpCheck(v3, 25, p.name, start).observe(world.events) == [400 * 25 * (k == FIREMAKING) for k in range(len(start))]
 
 
 def test_a_light_begun_within_4_ticks_of_a_success_shows_no_message_and_rolls_on_that_tick(v3, site):
@@ -276,16 +280,21 @@ def test_a_fire_burns_for_its_count_and_leaves_ashes_a_cycle_after_it_goes(v3, s
 def test_raw_food_cooks_one_item_a_use_two_ticks_after_its_message(v3, site, raw, source, cooked, product, lines):
     """attempt_cook_item and cook_item (cooking.rs2:17-195) on a fire and on a range: the roll at the use, the source's
     cook message, p_delay(1) (PlayerOps.ts:376-380: 2 ticks), then one raw item goes and the cooked or burnt one comes
-    with its message; 30 xp at 25x only for the cooked one."""
+    with its message; 30 xp at 25x only for the cooked one, an 'xp' event whose cause is the cooked item's production."""
     world, agent, p = begin(site, [(raw, 2)], dict(cooking=1), locs=[(source, 1, 0)])
     fix(world, cook=cooked)
     at = use(agent, raw, v3.loc_types[source]['name'])
     assert said(world, at)[:2] == [(0, lines[0]), (2, lines[1])]
     assert (p.inv.total(v3.obj_id(raw)), p.inv.total(v3.obj_id(product))) == (1, 1)
     assert p.stats[COOKING] == (300 * 25 if cooked else 0)
+    xp = [('xp', dict(stat=COOKING, xp=300, before=0, after=300 * 25, cause='produce', obj=v3.obj_id(product),
+                      src=v3.obj_id(raw)))] if cooked else []
     assert [e[1:] for e in world.events if e[0] == at + 2] == [
         ('remove', dict(obj=v3.obj_id(raw), count=1, why='cook')),
-        ('produce', dict(obj=v3.obj_id(product), count=1, script='[label,cook_item]'))]
+        ('produce', dict(obj=v3.obj_id(product), count=1, script='[label,cook_item]')), *xp]
+    start = [xp_for(1)] * len(p.stats)
+    start[engine.HITPOINTS] = xp_for(10)
+    assert XpCheck(v3, 25, p.name, start).observe(world.events)[COOKING] == p.stats[COOKING]  # the cook row's amount
 
 
 def test_a_cook_waits_a_tick_after_the_walk_and_an_ordinary_item_gets_the_mesbox(v3, site):

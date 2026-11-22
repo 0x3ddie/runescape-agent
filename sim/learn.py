@@ -18,7 +18,16 @@ standard RecurrentPPO zip that baseline/evaluate.py loads. Only the rollout path
 
 sim/tests/test_learn.py proves the equivalence with SB3's own collector and buffer. FakeEnv implements the
 spec with random legal batches for tests and development. Tracker and parameter_change record read-only
-per-update telemetry; attach adds them and sim/distill.py's drift probe or self-distillation phase.
+per-update telemetry; attach adds them. The self-distillation phase (sim/distill.py) and self-imitation
+(self-imitation-v1) were removed.
+
+The goal-free study adds three learner settings, each off for the goal
+tasks, whose arithmetic then stays SB3's: free_play (a life cut by its drawn length, TERMINAL_HORIZON, bootstraps from the
+value of its last observation under that life's recurrent state; a death does not; info['goal'] is never read),
+half_life_ticks (the advantage's per-tick discount, 0.5 ** (1 / half_life_ticks) a game tick, applied as its power tau
+for a decision of tau ticks, info['decision_ticks']), and the policy's value_norm (baseline/policy.py PopArt). The model is
+built from the observation version and table of shapes the environment declares (sim/spec.py), so an obs-v6 policy
+reads no goal_vec and no budget_vec. sim/tests/test_free_play_learner.py tests them.
 """
 from __future__ import annotations
 
@@ -45,6 +54,7 @@ from baseline import config
 from baseline.adapter import observation_space
 from baseline.policy import OPTION_VOCAB
 from baseline.resource_task import GOAL_VEC, GOALS, GOAL_TARGETS
+from obs import OBSERVATION
 from sim.spec import (HORIZON_TICKS, INFO_FIELDS, N_ACTIONS, OBSERVATION_SHAPES, TERMINAL_DEATH, TERMINAL_HORIZON,
                       TERMINAL_RUNNING, dtype, goal_set, slot_goal)
 
@@ -57,6 +67,13 @@ STORE_DTYPES = {np.dtype(np.int64): torch.int32, np.dtype(np.int8): torch.int8, 
 def option_ids(name):
     """Hashed option text (act_contract.name_id, OPTION_VOCAB rows); every other *_ids is a name-table row."""
     return name.endswith('_op_ids') or name == 'fb_op'
+
+
+class Ended(NamedTuple):
+    """The lives that ended at one step (a free-play step's info['last_obs'] on the learner's device): their world rows
+    [k] and the observation each life ended on, {name: [k, ...]} in the model's dtypes."""
+    rows: torch.Tensor
+    obs: dict
 
 
 class Unsupported(RuntimeError):
@@ -79,6 +96,28 @@ class FakeState(NamedTuple):
     outcomes: jax.Array   # [B] goal outcomes so far this episode
 
 
+# FakeEnv's stand-in for obs-v6 (the real table is sim/spec.py's): obs-v5 without
+# goal_vec and budget_vec, and prog_vec wider by one progress entry for each of the seven skills of S. Its version name
+# says it is a stand-in, so no checkpoint of it passes for an obs-v6 one.
+FAKE_FREE_PLAY = 'fake-obs-v6'
+FAKE_FREE_PLAY_SHAPES = {**{k: v for k, v in OBSERVATION_SHAPES.items() if k not in ('goal_vec', 'budget_vec')},
+                         'prog_vec': (OBSERVATION_SHAPES['prog_vec'][0] + 7,)}
+
+
+class FreeState(NamedTuple):
+    """FakeEnv's free-play state: FakeState's fields, each life's drawn length in ticks and its pay so far."""
+    key: jax.Array
+    step: jax.Array
+    illegal: jax.Array
+    mask: jax.Array
+    target: jax.Array
+    decisions: jax.Array
+    ticks: jax.Array
+    outcomes: jax.Array
+    length: jax.Array   # [B] the life's drawn length in ticks, never observed
+    paid: jax.Array     # [B] float32, the life's rewards summed as paid
+
+
 class FakeEnv:
     """Random legal obs-v2 batches with simple dynamics, implementing sim/spec.py. World b asks for
     GOALS[b % 4], or for the one goal of a single-goal set (sim/spec.py goal_set). Each episode has one target action, always legal and marked in option_vec; taking it
@@ -86,24 +125,45 @@ class FakeEnv:
     its return. Each decision advances 1-3 native ticks; the episode ends at horizon_ticks, or by death
     (probability death_rate per decision), which pays back everything paid. unsupported: (step, world)
     pairs whose step reports `unsupported`; with garbage=True those worlds' next mask is empty, as a
-    simulator's meaningless observation can be. Ids are drawn below id_rows (the name table's rows)."""
+    simulator's meaningless observation can be. Ids are drawn below id_rows (the name table's rows).
+    free_play: the goal-free task's stand-in instead, as the seam with the free-play batch has it: FAKE_FREE_PLAY_SHAPES,
+    no goal (the info's `goal` is -1, which no reader may take for one), each life's length drawn uniformly from
+    life_ticks and never shown, the target action paying `gain` whenever taken (a death takes nothing back),
+    TERMINAL_HORIZON when the life's ticks reach its length, and info['last_obs']: each ended life's observation after its
+    last action, zero elsewhere, while obs is the next life's first; episode_return is the life's pay, summed as paid, and
+    outcomes its whole part (one paid skill's integer gain). settings_in_effect: these settings, as sim/workers.py
+    CpuWorkers reports a free-play batch's (None for the goal task)."""
 
     def __init__(self, n, *, id_rows, horizon_ticks=HORIZON_TICKS, death_rate=.002, unsupported=(), garbage=False,
-                 goals=GOALS):
-        goals = goal_set(goals)
-        if n % len(goals):
-            raise ValueError(f'worlds ({n}) must be a multiple of {len(goals)}: goals are per world slot')
+                 goals=GOALS, free_play=False, life_ticks=(6, 30), gain=.25):
+        self.free_play = free_play
+        if free_play:
+            if goals is not GOALS or not 1 <= life_ticks[0] <= life_ticks[1]:
+                raise ValueError('the free-play stand-in has no goals and draws life lengths from 1 tick up')
+            goals = ()
+            self.observation, self.shapes, self.last_obs = FAKE_FREE_PLAY, FAKE_FREE_PLAY_SHAPES, True
+            self.life_ticks, self.gain = tuple(life_ticks), gain
+            self.settings_in_effect = dict(observation=FAKE_FREE_PLAY, life=['uniform', *map(int, life_ticks)], gain=gain,
+                                           death_rate=death_rate)
+        else:
+            goals = goal_set(goals)
+            if n % len(goals):
+                raise ValueError(f'worlds ({n}) must be a multiple of {len(goals)}: goals are per world slot')
+            self.observation, self.shapes, self.last_obs = OBSERVATION, OBSERVATION_SHAPES, False
+            self.settings_in_effect = None
         self.n, self.id_rows, self.horizon_ticks, self.death_rate = n, id_rows, horizon_ticks, death_rate
         self.unsupported, self.garbage = tuple(unsupported), garbage
         self.goals = goals
-        self.goal = jnp.asarray([GOALS.index(slot_goal(goals, b)) for b in range(n)], jnp.int32)
-        self.cap = jnp.asarray([GOAL_TARGETS[goal] for goal in GOALS], jnp.int32)[self.goal]
+        if not free_play:
+            self.goal = jnp.asarray([GOALS.index(slot_goal(goals, b)) for b in range(n)], jnp.int32)
+            self.cap = jnp.asarray([GOAL_TARGETS[goal] for goal in GOALS], jnp.int32)[self.goal]
         # Compiled here: callers use reset and step as they are.
-        self.reset, self.step = jax.jit(self._reset), jax.jit(self._step)
+        self.reset, self.step = (jax.jit(self._reset_free), jax.jit(self._step_free)) if free_play else \
+            (jax.jit(self._reset), jax.jit(self._step))
 
     def _observe(self, key, target, decisions, ticks):
         obs = {}
-        for (name, shape), k in zip(sorted(OBSERVATION_SHAPES.items()), jax.random.split(key, len(OBSERVATION_SHAPES))):
+        for (name, shape), k in zip(sorted(self.shapes.items()), jax.random.split(key, len(self.shapes))):
             size = (self.n, *shape)
             if name == 'mask':
                 value = jax.random.bernoulli(k, .3, size) | jax.nn.one_hot(target, N_ACTIONS, dtype=bool)
@@ -155,6 +215,53 @@ class FakeEnv:
                           outcomes)
         return state, obs, reward, done, info
 
+    def _unsupported(self, state):
+        unsupported = jnp.zeros(self.n, bool)
+        for step, world in self.unsupported:
+            unsupported = unsupported.at[world].set(unsupported[world] | (state.step == step))
+        return unsupported
+
+    def _length(self, key):
+        return jax.random.randint(key, (self.n,), self.life_ticks[0], self.life_ticks[1] + 1)
+
+    def _reset_free(self, key):
+        key, k_target, k_length, k_obs = jax.random.split(key, 4)
+        zero = jnp.zeros(self.n, jnp.int32)
+        target = jax.random.randint(k_target, (self.n,), 0, N_ACTIONS)
+        obs = self._observe(k_obs, target, zero, zero)
+        return FreeState(key, jnp.int32(0), jnp.int32(0), obs['mask'], target, zero, zero, zero, self._length(k_length),
+                         jnp.zeros(self.n, jnp.float32)), obs
+
+    def _step_free(self, state, action):
+        key, k_ticks, k_death, k_target, k_length, k_last, k_obs = jax.random.split(state.key, 7)
+        offered = jnp.take_along_axis(state.mask, action[:, None], 1)[:, 0] > 0
+        death = jax.random.bernoulli(k_death, self.death_rate, (self.n,))
+        produced = (action == state.target) & ~death
+        reward = jnp.where(produced, self.gain, 0.).astype(jnp.float32)
+        outcomes, paid = state.outcomes + produced, state.paid + reward
+        decisions, ticks = state.decisions + 1, state.ticks + jax.random.randint(k_ticks, (self.n,), 1, 4)
+        cut = (ticks >= state.length) & ~death
+        done = death | cut
+        terminal = jnp.where(death, TERMINAL_DEATH, jnp.where(cut, TERMINAL_HORIZON, TERMINAL_RUNNING))
+        unsupported = self._unsupported(state)
+        info = dict(goal=jnp.full(self.n, -1), unsupported=unsupported, terminal=terminal,
+                    episode_return=jnp.where(done, paid, 0.), episode_decisions=jnp.where(done, decisions, 0),
+                    episode_ticks=jnp.where(done, ticks, 0), outcomes=jnp.where(done, jnp.floor(paid), 0),
+                    decision_ticks=ticks - state.ticks)
+        info = {name: info[name].astype(kind) for name, kind in INFO_FIELDS.items()}
+        ended = lambda value: jnp.where(done.reshape(-1, *[1] * (value.ndim - 1)), value, jnp.zeros_like(value))
+        info['last_obs'] = {k: ended(v) for k, v in self._observe(k_last, state.target, decisions, ticks).items()}
+        target = jnp.where(done, jax.random.randint(k_target, (self.n,), 0, N_ACTIONS), state.target)
+        length = jnp.where(done, self._length(k_length), state.length)
+        decisions, ticks, outcomes = (jnp.where(done, 0, value) for value in (decisions, ticks, outcomes))
+        paid = jnp.where(done, 0., paid).astype(jnp.float32)
+        obs = self._observe(k_obs, target, decisions, ticks)
+        if self.garbage:
+            obs['mask'] = jnp.where(unsupported[:, None], jnp.int8(0), obs['mask'])
+        state = FreeState(key, state.step + 1, state.illegal + jnp.sum(~offered), obs['mask'], target, decisions, ticks,
+                          outcomes, length, paid)
+        return state, obs, reward, done, info
+
 
 # ---- the environment as SB3 sees it ------------------------------------------------------------------------
 class SpecVecEnv(VecEnv):
@@ -163,26 +270,39 @@ class SpecVecEnv(VecEnv):
     constants of that program. One warm-up reset and step, from a key the run never uses again and
     a discarded state, compile both and check the observation and info layout against the spec. Keys and
     actions are committed to the JAX device, as DLPack actions are: jit compiles again for an uncommitted
-    argument (a 20-second compile per signature on Draynor)."""
+    argument (a 20-second compile per signature on Draynor).
+    The environment declares the observation version and table of shapes its observations follow (`observation`,
+    `shapes`; default obs-v5, OBSERVATION_SHAPES) and whether its steps give info['last_obs'] (`last_obs`, the free-play
+    batch); the observation space, and so the model, is built from that table, and the warm-up holds the environment to
+    it. A free-play environment also reports its settings in effect (`settings_in_effect`) for the run's record."""
     render_mode = None
 
     def __init__(self, env, seed):
         self.env, self.jax_device = env, jax.devices()[0]
+        self.observation = getattr(env, 'observation', OBSERVATION)
+        self.shapes = getattr(env, 'shapes', OBSERVATION_SHAPES)
+        self.last_obs = getattr(env, 'last_obs', False)
+        self.settings_in_effect = getattr(env, 'settings_in_effect', None)
         self._key = jax.device_put(jax.random.key(seed), self.jax_device)
         state, obs = env.reset(self._key)
         n = obs['mask'].shape[0]
         layout = lambda values: {k: (v.shape, np.dtype(v.dtype)) for k, v in values.items()}
-        expected = {name: ((n, *shape), np.dtype(dtype(name))) for name, shape in OBSERVATION_SHAPES.items()}
-        if layout(obs) != expected:
-            raise ValueError(f'the environment departs from sim/spec.py observations: {layout(obs)}')
+        observations = {name: ((n, *shape), np.dtype(dtype(name))) for name, shape in self.shapes.items()}
+        if layout(obs) != observations:
+            raise ValueError(f'the environment departs from its declared {self.observation} observations: {layout(obs)}')
         _, _, reward, done, info = env.step(state, jax.device_put(jnp.zeros(n, jnp.int32), self.jax_device))
+        info = dict(info)
+        ended = info.pop('last_obs', None)
         expected = {name: ((n,), np.dtype(kind)) for name, kind in INFO_FIELDS.items()}
         if layout(dict(reward=reward, done=done)) != dict(reward=((n,), np.dtype(np.float32)), done=((n,), np.dtype(bool))) \
                 or {k: v for k, v in layout(info).items() if k in expected} != expected:
             raise ValueError(f'the environment departs from sim/spec.py steps: {layout(info)}')
+        if (ended is not None) != self.last_obs or (ended is not None and layout(ended) != observations):
+            raise ValueError(f'the environment\'s last_obs departs from its declaration (last_obs={self.last_obs}): '
+                             f'{None if ended is None else layout(ended)}')
         self._reset, self._step = env.reset, env.step
         self.state = None
-        sample = {name: np.zeros(shape, dtype(name)) for name, shape in OBSERVATION_SHAPES.items()}
+        sample = {name: np.zeros(shape, dtype(name)) for name, shape in self.shapes.items()}
         super().__init__(n, observation_space(sample), spaces.Discrete(N_ACTIONS))
 
     def _reset_state(self):
@@ -211,7 +331,11 @@ class SpecVecEnv(VecEnv):
 class HostVecEnv(SpecVecEnv):
     """The reference path: the environment through numpy, as SB3's own collect_rollouts consumes a VecEnv
     (sim/tests/test_learn.py, and the host-copy comparison of `sim.train transfers`). A done is terminal,
-    never a time-limit truncation, so SB3 does not bootstrap at an episode end (sim/spec.py)."""
+    never a time-limit truncation, so SB3 does not bootstrap at an episode end (sim/spec.py). The exception is an
+    environment that gives last_obs (the free-play stand-in): there each ended life's info holds its
+    terminal_observation and a cut life (TERMINAL_HORIZON) is a time-limit truncation, so SB3's own collector bootstraps
+    it from that observation's value with the life's recurrent state, the independent reference of DeviceRecurrentPPO's
+    free_play bootstrap (at a constant gamma)."""
 
     def _numpy(self, obs):
         return {k: np.array(v, dtype=self.observation_space[k].dtype) for k, v in obs.items()}
@@ -224,8 +348,15 @@ class HostVecEnv(SpecVecEnv):
 
     def step_wait(self):
         self.state, obs, reward, done, info = self._step(self.state, self._actions)
+        info = dict(info)
+        ended = info.pop('last_obs', None)
         info = {k: np.asarray(v) for k, v in info.items()}
         infos = [{**{k: v[i] for k, v in info.items()}, 'TimeLimit.truncated': False} for i in range(self.num_envs)]
+        if ended is not None:
+            ended = self._numpy(ended)
+            for i in np.flatnonzero(info['terminal'] != TERMINAL_RUNNING):
+                infos[i].update(terminal_observation={k: v[i] for k, v in ended.items()},
+                                **{'TimeLimit.truncated': bool(info['terminal'][i] == TERMINAL_HORIZON)})
         return self._numpy(obs), np.array(reward), np.array(done), infos
 
 
@@ -252,10 +383,17 @@ class DeviceEnv(SpecVecEnv):
         return self._observation(self._reset_state())
 
     def step_device(self, actions):
-        """actions: int64 [B] on the device. Returns observations (model dtypes), reward, done, info: all on it."""
+        """actions: int64 [B] on the device. Returns observations (model dtypes), reward, done, info: all on it. An
+        environment's info['last_obs'] becomes Ended: the rows of the lives that ended and their last observations."""
         actions = jax.dlpack.from_dlpack(actions.to(torch.int32))
         self.state, obs, reward, done, info = self._step(self.state, actions)
-        return self._observation(obs), self._torch(reward), self._torch(done), {k: self._torch(v) for k, v in info.items()}
+        info = dict(info)
+        ended = info.pop('last_obs', None)
+        info = {k: self._torch(v) for k, v in info.items()}
+        if ended is not None:
+            rows = (info['terminal'] != TERMINAL_RUNNING).nonzero().squeeze(1)
+            info['last_obs'] = Ended(rows, {k: v.index_select(0, rows) for k, v in self._observation(ended).items()})
+        return self._observation(obs), self._torch(reward), self._torch(done), info
 
     def step_async(self, actions):
         raise NotImplementedError('DeviceRecurrentPPO steps a DeviceEnv with step_device')
@@ -276,6 +414,11 @@ class _IntegerKeyed:
         self.env, self._integer_key, self.horizon = env, integer_key, env.horizon
         self.horizons, self.targets = env.horizons, env.targets  # per goal (sim/workers.py CpuWorkers)
         self.goals = env.goals
+        # the observation version and table the batch declares, and whether its steps give last_obs (SpecVecEnv)
+        self.observation = getattr(env, 'observation', OBSERVATION)
+        self.shapes = getattr(env, 'shapes', OBSERVATION_SHAPES)
+        self.last_obs = getattr(env, 'last_obs', False)
+        self.settings_in_effect = getattr(env, 'settings_in_effect', None)  # CpuWorkers' report of a free-play batch
 
     def reset(self, key):
         return self.env.reset(int(self._integer_key(key)))
@@ -299,8 +442,17 @@ class HostDeviceEnv(DeviceEnv):
         return torch.from_numpy(np.array(value)).to(self.device)  # np.array copies: the host arrays are reused
 
     def step_device(self, actions):
+        """DeviceEnv's step_device. A free-play batch's last_obs is read on the host: only the rows of the lives that
+        ended at this step are copied to the device (Ended), not the whole table every step."""
         self.state, obs, reward, done, info = self._step(self.state, actions.to(torch.int32).cpu().numpy())
-        return self._observation(obs), self._torch(reward), self._torch(done), {k: self._torch(v) for k, v in info.items()}
+        info = dict(info)
+        ended = info.pop('last_obs', None)
+        out = {k: self._torch(v) for k, v in info.items()}
+        if ended is not None:
+            rows = np.flatnonzero(np.asarray(info['terminal']) != TERMINAL_RUNNING)
+            out['last_obs'] = Ended(torch.from_numpy(rows).to(self.device),
+                                    self._observation({k: np.asarray(v)[rows] for k, v in ended.items()}))
+        return self._observation(obs), self._torch(reward), self._torch(done), out
 
     def worker_timing(self):
         return self.host.timing()
@@ -337,14 +489,21 @@ class DeviceRolloutBuffer:
     sampling: get() draws SB3's split index from numpy's global generator and yields the same
     RecurrentDictRolloutBufferSamples (sequences, zero padding, masks, observation dtypes). Storage keeps
     the [n_steps, n_envs] layout; SB3's env-major flattening becomes an index map, not a copy. `values`
-    and `returns` are host copies for RecurrentPPO.train()'s explained variance (once per update)."""
+    and `returns` are host copies for RecurrentPPO.train()'s explained variance (once per update).
+    Goal-free play (module docstring), each off by default: half_life (ticks) discounts each step by
+    0.5 ** (decision_ticks / half_life) in place of gamma; free_play stores each step's bootstrap value of the lives cut at
+    it (`cut_values`, zero elsewhere), which their next value is in place of the next life's, and counts episodes without
+    goals."""
 
     def __init__(self, buffer_size, observation_space, action_space, hidden_state_shape, device='cpu', gae_lambda=1.,
-                 gamma=.99, n_envs=1):
+                 gamma=.99, n_envs=1, *, half_life=None, free_play=False):
         if not isinstance(action_space, spaces.Discrete):
             raise ValueError('the game policy has one Discrete(96) action')
+        if half_life is not None and not (half_life > 0 and gamma == 1):
+            raise ValueError(f'a per-tick discount has a positive half-life and replaces gamma (1), not {half_life}, {gamma}')
         self.buffer_size, self.n_envs, self.device = buffer_size, n_envs, torch.device(device)
         self.gae_lambda, self.gamma = gae_lambda, gamma
+        self.half_life, self.free_play = half_life, free_play
         self._dtypes = {k: MODEL_DTYPES[space.dtype] for k, space in observation_space.spaces.items()}
         steps, layers, envs, hidden = hidden_state_shape
         zeros = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype, device=self.device)
@@ -356,6 +515,7 @@ class DeviceRolloutBuffer:
         # [n_steps, n_envs, layers, hidden]: SB3's [n_steps, layers, n_envs, hidden] with its later swap applied.
         self.hidden_states_pi, self.cell_states_pi, self.hidden_states_vf, self.cell_states_vf = (
             zeros(steps, envs, layers, hidden) for _ in range(4))
+        self.cut_values = zeros(steps, envs) if free_play else None
         self.infos = {}
         self.reset()
 
@@ -363,7 +523,12 @@ class DeviceRolloutBuffer:
         # Every row is rewritten before get() can read it, so nothing is cleared.
         self.pos, self.full, self.generator_ready = 0, False, False
 
-    def add(self, obs, action, reward, episode_start, value, log_prob, *, lstm_states, infos=()):
+    def add(self, obs, action, reward, episode_start, value, log_prob, *, lstm_states, infos=(), cut_values=None):
+        """cut_values: free play's bootstrap values of the step's cut lives [n_envs] (zero elsewhere); none otherwise."""
+        if (cut_values is None) != (self.cut_values is None):
+            raise ValueError('a free-play buffer stores every step\'s cut values, any other none')
+        if cut_values is not None:
+            self.cut_values[self.pos].copy_(cut_values)
         for k, v in obs.items():
             self.observations[k][self.pos].copy_(v)
         self.actions[self.pos].copy_(action.reshape(self.n_envs, 1))
@@ -383,7 +548,10 @@ class DeviceRolloutBuffer:
 
     def compute_returns_and_advantage(self, last_values, dones):
         """SB3's GAE loop, operation for operation in float32: a done is terminal, last_values bootstrap the
-        rollout boundary."""
+        rollout boundary. With a per-tick discount or free play, the loop of goal-free play (cut_returns_and_advantage);
+        without either it is this one, unchanged."""
+        if self.half_life is not None or self.free_play:
+            return self.cut_returns_and_advantage(last_values, dones)
         last_values = last_values.clone().flatten()
         last_gae_lam = 0
         for step in reversed(range(self.buffer_size)):
@@ -395,6 +563,40 @@ class DeviceRolloutBuffer:
                 next_values = self._values[step + 1]
             delta = self.rewards[step] + self.gamma * next_values * next_non_terminal - self._values[step]
             last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
+            self.advantages[step] = last_gae_lam
+        self._returns = self.advantages + self._values
+
+    def discounts(self):
+        """Each stored step's discount [n_steps, n_envs]: gamma, or 0.5 ** (decision_ticks / half_life), the per-tick
+        discount 0.5 ** (1 / half_life) to the power of the step's ticks (float64, then float32)."""
+        if self.half_life is None:
+            return None
+        ticks = self.infos.get('decision_ticks')
+        if ticks is None:
+            raise ValueError('a per-tick discount reads each step\'s decision_ticks (sim/spec.py INFO_FIELDS)')
+        return torch.exp2(-ticks.to(torch.float64) / self.half_life).to(torch.float32)
+
+    def cut_returns_and_advantage(self, last_values, dones):
+        """The GAE loop of goal-free play: step t's discount g_t (discounts, else gamma), and its next value the next
+        step's where the life goes on, the cut value where it was cut (cut_values) and zero at a death:
+        delta_t = r_t + g_t (nnt_t V_t+1 + cut_t) - V_t,  A_t = delta_t + g_t lambda nnt_t A_t+1. A cut or a death still
+        ends the recursion (nnt_t = 0). With g_t = gamma and no cut it is SB3's loop's arithmetic, bit for bit."""
+        last_values = last_values.clone().flatten()
+        discounts = self.discounts()
+        last_gae_lam = 0
+        for step in reversed(range(self.buffer_size)):
+            if step == self.buffer_size - 1:
+                next_non_terminal = 1.0 - dones.to(torch.float32)
+                next_values = last_values
+            else:
+                next_non_terminal = 1.0 - self.episode_starts[step + 1]
+                next_values = self._values[step + 1]
+            gamma = self.gamma if discounts is None else discounts[step]
+            next_values = next_values * next_non_terminal
+            if self.cut_values is not None:
+                next_values = next_values + self.cut_values[step]
+            delta = self.rewards[step] + gamma * next_values - self._values[step]
+            last_gae_lam = delta + gamma * self.gae_lambda * next_non_terminal * last_gae_lam
             self.advantages[step] = last_gae_lam
         self._returns = self.advantages + self._values
 
@@ -492,11 +694,16 @@ class DeviceRolloutBuffer:
                      **{k: v[s, w].tolist() for k, v in self.infos.items()}) for s, w in zip(steps.tolist(), worlds.tolist())]
 
     def episodes(self):
-        """The episodes that ended in the steps stored so far ({info field: list}), and their counts per goal."""
+        """The episodes that ended in the steps stored so far ({info field: list}), and their counts per goal; in free
+        play the lives (no goal), all transitions together and the cut lives' bootstrap values."""
         infos = {k: v[:self.pos] for k, v in self.infos.items()}
         ended = infos['terminal'] != TERMINAL_RUNNING
-        episodes = {k: infos[k][ended].tolist() for k in ('goal', 'terminal', 'episode_return', 'episode_decisions',
-                                                           'episode_ticks', 'outcomes')}
+        keys = ('terminal', 'episode_return', 'episode_decisions', 'episode_ticks', 'outcomes')
+        if self.free_play:
+            episodes = {k: infos[k][ended].tolist() for k in keys}
+            episodes['cut_value'] = self.cut_values[:self.pos][ended].tolist()
+            return episodes, dict(transitions=[int(ended.numel())], native_ticks=int(infos['decision_ticks'].sum()))
+        episodes = {k: infos[k][ended].tolist() for k in ('goal', *keys)}
         return episodes, dict(transitions=torch.bincount(infos['goal'].reshape(-1), minlength=len(GOALS)).tolist(),
                               native_ticks=int(infos['decision_ticks'].sum()))
 
@@ -844,8 +1051,14 @@ class DeviceRecurrentPPO(RecurrentPPO):
     step_timing: None, or a dict to which each rollout adds the seconds of its parts, each part ended by a
     device synchronization (CUDA; JAX's work on the GPU included): policy (inference), environment (the
     JAX step and the DLPack handover), callbacks, buffer (storage and bookkeeping) and rollout_end (the
-    unsupported check, the last values, returns and advantages, the rollout record)."""
+    unsupported check, the last values, returns and advantages, the rollout record); in free play also bootstrap (the
+    values of the lives cut at each step).
+    Goal-free play's settings (module docstring), keyword arguments that are off by default and, off, are not saved
+    (class attributes): free_play and half_life_ticks; value_norm is the policy's (baseline/policy.py PopArt), whose
+    statistics each update moves towards its rollout's value targets before the gradient steps (fast_train only)."""
     evidence_dir = None
+    free_play = False      # the goal-free task: a cut life bootstraps from its last observation, a death does not
+    half_life_ticks = None  # the per-tick discount's half-life in game ticks, in place of gamma
     # fast_train in place of RecurrentPPO.train(): the same update without host reads inside it (a class switch like
     # baseline.policy's speed paths, never saved with a checkpoint)
     FAST_UPDATE = True
@@ -855,8 +1068,14 @@ class DeviceRecurrentPPO(RecurrentPPO):
     GRAPHED_COLLECTION = False
     step_timing = None
     tracker = None  # the read-only activation telemetry (Tracker, attach)
-    distill = None  # sim/distill.py's drift probe or self-distillation phase (attach)
     update_sizes = None  # with telemetry: per update, each parameter group's L2 change (parameter_change)
+
+    def __init__(self, *args, free_play=False, half_life_ticks=None, **kwargs):
+        if free_play:
+            self.free_play = True
+        if half_life_ticks is not None:
+            self.half_life_ticks = half_life_ticks
+        super().__init__(*args, **kwargs)
 
     def _setup_model(self):
         super()._setup_model()
@@ -864,12 +1083,12 @@ class DeviceRecurrentPPO(RecurrentPPO):
         self.rollout_buffer = DeviceRolloutBuffer(
             self.n_steps, self.observation_space, self.action_space,
             (self.n_steps, lstm.num_layers, self.n_envs, lstm.hidden_size), self.device, gamma=self.gamma,
-            gae_lambda=self.gae_lambda, n_envs=self.n_envs)
+            gae_lambda=self.gae_lambda, n_envs=self.n_envs, half_life=self.half_life_ticks, free_play=self.free_play)
         self.rollouts = []
 
     def _excluded_save_params(self):
         return [*super()._excluded_save_params(), '_last_obs', '_last_episode_starts', 'evidence_dir', 'rollouts',
-                'step_timing', 'tracker', 'distill', 'update_sizes', '_graphs', '_forward_graph']
+                'step_timing', 'tracker', 'update_sizes', '_graphs', '_forward_graph']
 
     def get_parameters(self):
         """SB3's, with a capturable Adam (GraphedSteps) saved as the stock one: capturable off and its step counters on
@@ -883,14 +1102,16 @@ class DeviceRecurrentPPO(RecurrentPPO):
         return params
 
     def train(self):
-        """SB3's RecurrentPPO.train() (with FAST_UPDATE, fast_train: the same update). Then, attached, sim/distill.py's
-        phase: the actor's distillation steps on the memory or only its drift probe. With update_sizes, the update's
+        """SB3's RecurrentPPO.train() (with FAST_UPDATE, fast_train: the same update). With update_sizes, the update's
         parameter change is recorded (read-only)."""
+        popart = self._popart()
+        if popart is not None:  # the value targets' statistics, the outputs kept: before the update that fits them
+            if not self.FAST_UPDATE:
+                raise ValueError('a normalized value target trains with fast_train (FAST_UPDATE)')
+            popart.update(self.rollout_buffer._returns)
         before = None if self.update_sizes is None else \
             {n: p.detach().clone() for n, p in self.policy.named_parameters() if p.requires_grad}
         result = self.fast_train() if self.FAST_UPDATE else super().train()
-        if self.distill is not None:
-            self.distill.run(self)
         if before is not None:
             self.update_sizes.append(parameter_change(self.policy, before))
         return result
@@ -942,6 +1163,15 @@ class DeviceRecurrentPPO(RecurrentPPO):
         self.logger.record('train/explained_variance', explained_var)
         self.logger.record('train/n_updates', self._n_updates, exclude='tensorboard')
         self.logger.record('train/clip_range', clip_range)
+        popart = self._popart()
+        if popart is not None:
+            self.logger.record('train/value_target_mean', float(popart.mean))
+            self.logger.record('train/value_target_std', float(popart.std))
+
+    def _popart(self):
+        from baseline.policy import PopArt
+        head = self.policy.value_net
+        return head if isinstance(head, PopArt) else None
 
     def _minibatch_step(self, data, clip_range):
         """RecurrentPPO.train()'s loss, backward, clip and optimizer step on one compact minibatch (CompactSamples).
@@ -954,7 +1184,11 @@ class DeviceRecurrentPPO(RecurrentPPO):
         ratio = torch.exp(log_prob - data.old_log_prob)
         policy_loss = -torch.mean(torch.min(advantages * ratio, advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)))
         clip_fraction = torch.mean((torch.abs(ratio - 1) > clip_range).float())
-        value_loss = torch.mean((data.returns - values) ** 2)
+        error = data.returns - values
+        popart = self._popart()
+        if popart is not None:  # the normalized target's error, (G - mean) / std - n(h), is the error over std
+            error = error / popart.std
+        value_loss = torch.mean(error ** 2)
         entropy_loss = -torch.mean(entropy)
         loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
         with torch.no_grad():
@@ -987,8 +1221,14 @@ class DeviceRecurrentPPO(RecurrentPPO):
         return time.perf_counter()
 
     def collect_rollouts(self, env, callback, rollout_buffer, n_rollout_steps):
-        """RecurrentPPO.collect_rollouts with the environment, the policy and the buffer on one device."""
+        """RecurrentPPO.collect_rollouts with the environment, the policy and the buffer on one device. An asynchronous
+        environment (sim/real.py RealEnv: agents that decide when they are due) collects the rollout itself."""
+        if getattr(env, 'asynchronous', False):
+            return env.collect(self, callback, rollout_buffer, n_rollout_steps)
         assert isinstance(env, DeviceEnv) and isinstance(rollout_buffer, DeviceRolloutBuffer) and not self.use_sde
+        if self.free_play != env.last_obs:  # the free-play batch and the free-play learner come together
+            raise ValueError(f'a free-play learner (here {self.free_play}) bootstraps a cut life from its last observation, '
+                             f'which only the free-play batch gives (here {env.last_obs})')
         self.policy.set_training_mode(False)
         n_steps = 0
         rollout_buffer.reset()
@@ -999,7 +1239,7 @@ class DeviceRecurrentPPO(RecurrentPPO):
         start = self.num_timesteps
         timing = self.step_timing
         if timing is not None:
-            for part in ('policy', 'environment', 'callbacks', 'buffer', 'rollout_end'):
+            for part in ('policy', 'environment', 'callbacks', 'buffer', 'rollout_end') + (('bootstrap',) if self.free_play else ()):
                 timing.setdefault(part, 0.)
             t = self._mark()
 
@@ -1021,6 +1261,11 @@ class DeviceRecurrentPPO(RecurrentPPO):
                 part('policy')
                 new_obs, rewards, dones, infos = env.step_device(actions)
                 part('environment')
+                ended = infos.pop('last_obs', None)
+                cut_values = None
+                if self.free_play:
+                    cut_values = self._cut_values(ended, infos['terminal'], lstm_states)
+                    part('bootstrap')
                 self.num_timesteps += env.num_envs
                 callback.update_locals(locals())
                 if not callback.on_step():
@@ -1028,7 +1273,7 @@ class DeviceRecurrentPPO(RecurrentPPO):
                 part('callbacks')
                 n_steps += 1
                 rollout_buffer.add(self._last_obs, actions, rewards, self._last_episode_starts, values, log_probs,
-                                   lstm_states=self._last_lstm_states, infos=infos)
+                                   lstm_states=self._last_lstm_states, infos=infos, cut_values=cut_values)
                 self._last_obs = new_obs
                 self._last_episode_starts = dones.to(torch.float32)
                 self._last_lstm_states = lstm_states
@@ -1045,6 +1290,21 @@ class DeviceRecurrentPPO(RecurrentPPO):
         part('rollout_end')
         callback.on_rollout_end()
         return True
+
+    def _cut_values(self, ended, terminal, lstm_states):
+        """Free play: [n_envs] the value of each cut life's last observation (TERMINAL_HORIZON), zero for every other
+        world, a death included. The value is the critic's from the life's own recurrent state, the one its last
+        action's step produced (lstm_states, before the next step's reset), with no episode start: SB3 RecurrentPPO's
+        time-limit bootstrap. One policy call on the ended rows; a step where no life ended makes none."""
+        values = torch.zeros(self.n_envs, device=self.device)
+        rows, obs = ended
+        if len(rows):
+            h, c = lstm_states.vf
+            state = (h.index_select(1, rows).contiguous(), c.index_select(1, rows).contiguous())
+            with torch.no_grad():
+                value = self.policy.predict_values(obs, state, torch.zeros(len(rows), device=self.device)).flatten()
+            values[rows] = torch.where(terminal.index_select(0, rows) == TERMINAL_HORIZON, value, torch.zeros_like(value))
+        return values
 
     def _check_supported(self, buffer, start, error=None):
         evidence = buffer.unsupported()
@@ -1070,6 +1330,14 @@ class DeviceRecurrentPPO(RecurrentPPO):
         for ret, length in zip(episodes['episode_return'], episodes['episode_decisions']):
             self.ep_info_buffer.append(dict(r=ret, l=length))
         self.logger.record('rollout/native_ticks', counts['native_ticks'])
+        if self.free_play:  # lives, no goals: their ends by reason and their pay
+            ends = Counter(episodes['terminal'])
+            self.logger.record('rollout/lives', len(episodes['terminal']))
+            self.logger.record('rollout/deaths', ends[TERMINAL_DEATH])
+            self.logger.record('rollout/cut_lives', ends[TERMINAL_HORIZON])
+            if episodes['episode_return']:
+                self.logger.record('rollout/life_return', float(np.mean(episodes['episode_return'])))
+            return
         for index, goal in enumerate(GOALS):
             mine = [i for i, g in enumerate(episodes['goal']) if g == index]
             self.logger.record(f'rollout/{goal}_transitions', counts['transitions'][index])
@@ -1080,17 +1348,9 @@ class DeviceRecurrentPPO(RecurrentPPO):
                                    Counter(episodes['terminal'][i] for i in mine)[TERMINAL_DEATH])
 
 
-def attach(model, *, seed=0, telemetry=True, memory=None, distill=False, distill_strata=None):
-    """Read-only telemetry (Tracker, with each update's parameter change) and, with `memory` (a sim/distill.py memory),
-    its drift probe after every update; with `distill` its self-distillation phase too, limited to `distill_strata` when
-    given. An optimizer-step hook accumulates the telemetry after each of the policy optimizer's steps."""
-    if memory is not None:
-        from sim.distill import Distill
-        if distill_strata is not None and not distill:
-            raise ValueError('distill_strata choose the strata of the distillation phase: they need distill')
-        model.distill = Distill(memory, model, seed, train=distill, strata=distill_strata)
-    elif distill:
-        raise ValueError('self-distillation needs a memory')
+def attach(model, *, telemetry=True):
+    """Read-only telemetry (Tracker, with each update's parameter change). An optimizer-step hook accumulates the
+    telemetry after each of the policy optimizer's steps."""
     model.tracker = Tracker(model.policy) if telemetry else None
     model.update_sizes = [] if telemetry else None
 
@@ -1104,8 +1364,8 @@ def attach(model, *, seed=0, telemetry=True, memory=None, distill=False, distill
 @contextmanager
 def step_hooks_suspended(optimizer):
     """The optimizer's step post-hooks (the run's step count, telemetry, a replay's snapshots: register_step_post_hook)
-    off for the steps inside: sim/distill.py's own steps, and a CUDA graph's capture (GraphedSteps, which runs them after
-    each replay instead, run_step_hooks)."""
+    off for the steps inside a CUDA graph's capture (GraphedSteps, which runs them after each replay instead,
+    run_step_hooks)."""
     hooks, optimizer._optimizer_step_post_hooks = optimizer._optimizer_step_post_hooks, OrderedDict()
     try:
         yield
@@ -1118,19 +1378,26 @@ def run_step_hooks(optimizer):
         hook(optimizer, (), {})
 
 
-def build(env, *, seed, device, **changes):
-    """baseline/train.build_model's fresh model (config.LEARNER, names-v1, obs-v5) as a DeviceRecurrentPPO.
-    changes: explicit departures from config.LEARNER (the GPU batching), reported by the caller."""
-    from baseline.policy import CONTRACT, MaskedRecurrentPolicy, load_name_vectors
+def build(env, *, seed, device, free_play=False, half_life_ticks=None, value_norm=None, **changes):
+    """baseline/train.build_model's fresh model (config.LEARNER, names-v1) as a DeviceRecurrentPPO, reading the
+    observation version and table that `env` declares (obs-v5 for the goal tasks).
+    changes: explicit departures from config.LEARNER (the GPU batching), reported by the caller. free_play, half_life_ticks
+    and value_norm (baseline/policy.py POPART): goal-free play's settings (DeviceRecurrentPPO), off by default."""
+    from baseline.policy import MaskedRecurrentPolicy, load_name_vectors, run_contract
+    from item_contract import ITEM_V2
     from names import name_table
-    from obs import OBSERVATION
     unknown = set(changes) - set(config.LEARNER)
     if unknown:
         raise ValueError(f'not a config.LEARNER setting: {sorted(unknown)}')
     learner = deepcopy(config.LEARNER)
     learner.update(changes)
     table = name_table()
-    learner['policy_kwargs'].update(names=table.spec, observation=OBSERVATION, contract=CONTRACT)
-    model = DeviceRecurrentPPO(MaskedRecurrentPolicy, env, seed=seed, device=device, **learner)
+    # the contract the policy records: item-v2's CONTRACT, or with the item contract of an env that declares another
+    learner['policy_kwargs'].update(names=table.spec, observation=env.observation,
+                                    contract=run_contract(getattr(env, 'item_contract', ITEM_V2)))
+    if value_norm is not None:
+        learner['policy_kwargs']['value_norm'] = dict(value_norm)
+    model = DeviceRecurrentPPO(MaskedRecurrentPolicy, env, seed=seed, device=device, free_play=free_play,
+                               half_life_ticks=half_life_ticks, **learner)
     load_name_vectors(model.policy, table.vectors)
     return model

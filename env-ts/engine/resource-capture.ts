@@ -38,7 +38,7 @@ export interface ResourceCaptureHost {
 type Snapshot = { inventory: {slot:number; id:number; count:number}[]; bank: {slot:number; id:number; count:number}[] };
 type Binding = { player: Native; identity: ResourceIdentity; scope: string; targets: Native[] | null;
     initial: Snapshot; last: Snapshot;
-    start: number; end: number; observedTick: number; boundaryTick: number; sequence: number; events: Native[];
+    start: number; end: number; limit: number; observedTick: number; boundaryTick: number; sequence: number; events: Native[];
     failure: string | null; closed: boolean; completed: boolean;
     monitor: LifecycleMonitor|null; unsubscribe: (()=>void)|null; terminal: Native; ownedContainers:Native };
 type Context = { opcode: number; scriptId: number; scriptName: string; pc: number;
@@ -56,6 +56,12 @@ export function readExistingResourceGround(gameMap:Native,zoneIndex:number,local
     const zone=zones.get(zoneIndex);
     return zone ? zone.getObjsUnsafe(localCoord) : [];
 }
+
+/** Native ticks of one game hour: a capture's event bound is counted per started hour of its window. */
+export const HOUR_TICKS = 6000;
+/** A window's event bound: maxEvents per started game hour, so every window of up to an hour keeps maxEvents and a
+ * long life (one tick-boundary event a tick, beside its other events) gets the same room an hour. */
+export const eventLimit = (maxEvents: number, ticks: number) => maxEvents * Math.max(1, Math.ceil(ticks / HOUR_TICKS));
 
 export function installResourceCapture(host: ResourceCaptureHost, maxEvents=20000) {
     require(host.enabled() && !host.production() && host.actorCount() === 0 && !installations.has(host.world),
@@ -115,7 +121,7 @@ export function installResourceCapture(host: ResourceCaptureHost, maxEvents=2000
     }
     function record(b:Binding,kind:string,data:Native){
         gate(b);
-        require(b.events.length<maxEvents, 'resource capture overflow');
+        require(b.events.length<b.limit, 'resource capture overflow');
         b.events.push(clone({sequence:++b.sequence,tick:host.tick(),kind,...data}));
     }
     function reconcile(b:Binding){
@@ -296,7 +302,7 @@ export function installResourceCapture(host: ResourceCaptureHost, maxEvents=2000
             const chosen=host.useScope?.(scope) ?? null;
             produces=scope==='logs' ? (script:unknown)=>script===host.productionScript : chosen!.isProductionScript;
             const b:Binding={player,identity:clone(identity),scope,targets:scope==='logs'?null:clone(chosen!.targets),
-                initial:null!,last:null!,start,end:start+horizon,
+                initial:null!,last:null!,start,end:start+horizon,limit:eventLimit(maxEvents,horizon),
                 observedTick:start,boundaryTick:start,sequence:0,events:[],failure:null,closed:false,completed:false,
                 monitor:null,unsubscribe:null,terminal:null,ownedContainers:ownedContainers(player)};
             containers.set(invs.inventory,b);containers.set(invs.bank,b);

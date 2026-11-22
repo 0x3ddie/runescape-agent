@@ -10,7 +10,7 @@ export const MAX_DECISIONS = 1500; // truncate on LEARNER steps (protocol: done=
 export const MAX_EPISODE_TICKS = 20000;
 
 export interface TaskCfg {
-    contract?: 'item-v2'; // required by reset: physical inventory and bank pages (core/items.ts)
+    contract?: 'item-v2' | 'item-v3'; // required by reset: physical pages, or item-v3's page of kinds (core/items.ts)
     actTargets?: 'act-v3'; // required by reset: what a player could click, and the clicks (core/affordances.ts, core/clicks.ts)
     lifecycle?: 'episodic-v1' | 'continuous-v1'; // experimental account continuity
     maxRespawnTicks?: number; // authoritative wait bound; failure is not a reset
@@ -22,6 +22,7 @@ export interface TaskCfg {
     seedItems?: string; // "name:count,name:count" via ::give (spawn curriculum)
     kit?: 'starter' | 'none'; // engine only: 'none' grants no starter kit and banks nothing; seedItems is the inventory
     setStats?: string; // "mining:30,fishing:25" via ::setstat (start-state curriculum)
+    startHp?: number; // engine only: the life's current hitpoints after setStats, 1..the hitpoints' base (free-play-v12, v13)
     persistLevels?: boolean; // skip ::minme so levels carry across episodes
     maxDecisions?: number; // truncate after this many LEARNER steps (default MAX_DECISIONS)
     maxEpisodeTicks?: number; // truncate after this much GAME TIME (default MAX_EPISODE_TICKS)

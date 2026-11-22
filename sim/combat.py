@@ -19,14 +19,18 @@ horizon, else 0 (sim/task.py pays each kill as it is certified and settles to th
 healing pay nothing.
 
 `reference_action` is a checked test instrument (feasibility and task-design measurements), never a source of labels.
+
+village-world-v1 Stage A, free-play-v1's first world (VILLAGE, draw_village, village_life), is this world with the
+layout's chickens added and muggers a declared setting. village-world-v2, its second (VILLAGE_V2), is the same on
+sim/world.py VILLAGE_WORLD layouts, which add a field, door pens, a willow, a yew and a highwayman; it holds no muggers.
 """
 import numpy as np
 
 from sim import paths
 from act_contract import CLICK_ROWS
 from sim.agent import A_ACT0, A_CLOSE_IF, A_DIALOG_CONTINUE, A_HELD0, A_WAIT
-from sim.engine import HITPOINTS, NPC_HP, WEARPOS_RHAND, Rng
-from sim.world import ORIGIN, PEN_GATE, flood, split_seeds
+from sim.engine import HITPOINTS, LOOT_OUTSIDE, NPC_HP, WEARPOS_RHAND, Rng
+from sim.world import ORIGIN, PEN_GATE, VILLAGE_WORLD, flood, split_seeds, world_of
 
 COMBAT = dict(
     version='sustained-combat-v1', task='goal-activity-v3',
@@ -114,11 +118,12 @@ def camp(layout, tables):
     return [(int(x), int(z)) for _, ty, x, z in layout.npcs if int(ty) in chickens]
 
 
-def draw_combat(key, slot, episode, layout, start, tables, group=None, region=None):
+def draw_combat(key, slot, episode, layout, start, tables, group=None, region=None, place_muggers=True):
     """The combat part of episode `episode` of world slot `slot` (module docstring), after task.draw_start's `start` on
     `layout`: group (`group` replaces its draw), hitpoints at arm, food (debugnames in inventory order), whether the
-    weapon starts worn, and mugger spawn tiles (local). `region`: outside(layout), if the caller has it. Keyed draws
-    (engine.Rng on (key, slot, episode, purpose)), as draw_start's."""
+    weapon starts worn, and mugger spawn tiles (local; none drawn without `place_muggers`, a world that holds no muggers:
+    the other draws have purposes of their own, so they are the same either way). `region`: outside(layout), if the
+    caller has it. Keyed draws (engine.Rng on (key, slot, episode, purpose)), as draw_start's."""
     h = Rng(key).prefix(slot, episode)
     draw = lambda *k: Rng.draw(h, *k)
     pick = lambda lo, hi, *k: lo + int(draw(*k) * (hi - lo + 1))
@@ -130,7 +135,7 @@ def draw_combat(key, slot, episode, layout, start, tables, group=None, region=No
     hp = max(1, min(base, hp))
     food = [COMBAT['food'][int(draw(R_FOOD, i) * len(COMBAT['food']))] for i in range(pick(*spec['food'], R_FOOD_N))]
     muggers = []
-    if spec['muggers']:
+    if spec['muggers'] and place_muggers:
         region = outside(layout) if region is None else region
         tiles = camp(layout, tables)
         cx, cz = np.mean(tiles, axis=0)
@@ -163,6 +168,94 @@ def combat_npcs(layout, tables, muggers):
 def kit(weapon, food):
     """The inventory at reset: the tools, the drawn food, then the weapon (carried; a worn start wields it in setup)."""
     return [*COMBAT['tools'], *((name, 1) for name in food), (weapon, 1)]
+
+
+# ---- village-world-v1 Stage A, free-play-v1's world ------------------------------------------------------------------
+# The melee task's world (combat_npcs: the fishing spots, a goblin at every chicken spawn, the muggers) with the layout's
+# chickens added at their own spawns, on compact-world-v1 layouts. Muggers are a declared setting with no default:
+# `muggers` True places them by the danger group's rule, False places none. The start (levels, tile, weapon,
+# hitpoints, food, a worn weapon) is the same draw in both forms: task.draw_start, then draw_combat in `start_group`
+# (proposal: the danger group's hitpoints, food and worn draws, the draws step A's melee world used), whose mugger tiles
+# are kept only with muggers. The food comes only from the start kit (kit()); the exclusions are the melee task's.
+VILLAGE = dict(version='village-world-v1', stage='A', layouts='compact-world-v1', start_group='danger',
+               exclusions=COMBAT['exclusions'])
+# village-world-v2 (accepted 13 November 2026): the same world on its own
+# layouts (sim/world.py VILLAGE_WORLD), whose highwayman is a layout npc that combat_npcs passes through, so it spawns
+# in every life of a layout that holds one. It holds no muggers (`muggers` must be False). The cabbage is in its declared
+# world: `loot_outside` is LOOT_OUTSIDE without it; its fields' picks and the use scripts of the field items and of the
+# highwayman's cape (sim/engine.py FIELD_USE) run over an archive with the pick rows (`content`: sim/build.py picks, the
+# archive `tables`); the cabbage's Eat runs over any archive; no npc of this world drops a cabbage. The start draw, the
+# kit and the other exclusions are VILLAGE's.
+VILLAGE_V2 = dict(version='village-world-v2', layouts=VILLAGE_WORLD['version'], start_group='danger',
+                  exclusions=COMBAT['exclusions'], muggers=False, loot_outside=tuple(n for n in LOOT_OUTSIDE if n != 'cabbage'),
+                  content='picks', tables='draynor-nc2.npz')
+VILLAGES = {v['version']: v for v in (VILLAGE, VILLAGE_V2)}
+
+
+def village_of(layout):
+    """The free-play world (VILLAGES) that plays the layout's declared world, or None."""
+    name = world_of(layout)['version']
+    return next((v for v in VILLAGES.values() if v['layouts'] == name), None)
+
+
+def check_village(village, tables, muggers):
+    """Refuse what a free-play world cannot play: muggers other than True or False, muggers where it holds none, and an
+    archive without the content its scripts read."""
+    if type(muggers) is not bool:
+        raise ValueError('village-world-v1 Stage A places muggers or not: pass True or False')
+    if muggers and village.get('muggers') is False:
+        raise ValueError(f"{village['version']} holds no muggers: pass False")
+    content = village.get('content')
+    if content and content not in tables.meta.get('content', {}):
+        raise ValueError(f"{village['version']} plays over an archive with the {content} rows ({village['tables']}, "
+                         'sim/build.py), not this one')
+
+
+def village_npcs(layout, tables, muggers):
+    """The world's npc spawns (World's `npcs`): combat_npcs (in village-world-v2 the layout's highwayman with the fishing
+    spots), then the layout's chickens at their spawns, with nids in that order."""
+    ids = {v['debugname']: k for k, v in tables.npc_types.items()}
+    rows = combat_npcs(layout, tables, muggers)
+    chickens = [(int(ty), int(x), int(z)) for _, ty, x, z in layout.npcs if int(ty) in (ids['chicken'], ids['chicken_brown'])]
+    return rows + [dict(nid=len(rows) + k, type=ty, x=ORIGIN[0] + x, z=ORIGIN[1] + z, level=0,
+                        size=tables.npc_types[ty]['size']) for k, (ty, x, z) in enumerate(chickens)]
+
+
+def draw_village(key, slot, episode, layouts, tables, muggers, layout=None, region=None):
+    """A free-play start in the world that plays the drawn layout's (village_of: VILLAGE or VILLAGE_V2): task.draw_start's
+    dict with the drawn hitpoints, food, worn weapon and mugger tiles under 'village' (no tiles without muggers; none drawn
+    in a world that holds none). `muggers` must be True or False, and False in village-world-v2."""
+    from sim.task import draw_start
+    if type(muggers) is not bool:
+        raise ValueError('village-world-v1 Stage A places muggers or not: pass True or False')
+    start = draw_start(key, slot, episode, layouts, layout=layout)
+    village = village_of(layouts[start['layout']])
+    if village is None:
+        raise ValueError(f"free play plays the layouts of {[v['layouts'] for v in VILLAGES.values()]}")
+    if muggers and village.get('muggers') is False:
+        raise ValueError(f"{village['version']} holds no muggers: pass False")
+    c = draw_combat(key, slot, episode, layouts[start['layout']], start, tables, group=village['start_group'], region=region,
+                    place_muggers=village.get('muggers') is not False)
+    start['village'] = dict(c, muggers=c['muggers'] if muggers else [], placed=muggers)
+    return start
+
+
+def village_life(start, layout, lt, tables, xp_rate, length, cfg=None):
+    """A started free-play life (sim/task.py FreePlayEpisode) of a draw_village start in a fresh world on `layout`, whose
+    LayoutTables is `lt`, at `xp_rate`, `length` native ticks long, in the world that plays the layout's (village_of): its
+    exclusions and its loot outside the slice."""
+    from sim.engine import World
+    from sim.task import WORLD_START_TICK, FreePlayEpisode
+    v, village = start['village'], village_of(layout)
+    if village is None:
+        raise ValueError(f"free play plays the layouts of {[w['layouts'] for w in VILLAGES.values()]}")
+    check_village(village, tables, v['placed'])
+    world = World(lt, seed=start['world_seed'], start_tick=WORLD_START_TICK, npcs=village_npcs(layout, tables, v['muggers']),
+                  exclusions=village['exclusions'], xp_rate=xp_rate, loot_outside=village.get('loot_outside'))
+    task = FreePlayEpisode(world, length, xp_rate, cfg)
+    task.start(start['tile'], start['weapon'], start['levels'], kit=kit(start['weapon'], v['food']), hp=v['hp'],
+               wield=v['worn'])
+    return task
 
 
 # ---- the reference controller: a test instrument --------------------------------------------------------------

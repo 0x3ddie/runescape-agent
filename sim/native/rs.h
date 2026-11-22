@@ -136,13 +136,27 @@
 /* ---- capacities (fatal RS_E_OVERFLOW beyond them) -------------------------------------------------------------- */
 #define RS_MAX_W 64
 #define RS_MAX_T (RS_MAX_W * RS_MAX_W)
-#define RS_MAX_LOCS 64            /* loc slots: map locs (<= 31 per pool layout) plus live or referenced added locs */
+#define RS_MAX_LOCS 64            /* loc slots: map locs plus live or referenced added locs (the exporter refuses a layout
+                                     of more map locs; train-128-20000-v2: 19-39 map locs, 41 with open stages) */
 #define RS_MAX_ZONES 64           /* 8x8 zones of a 64x64 layout */
 #define RS_ZONE_CAP 32            /* locs listed in one zone */
 #define RS_MAX_NPCS 16
-#define RS_MAX_OBJS 128           /* ground objs alive at once (drops last 200-300 ticks) */
+#define RS_MAX_OBJS 255           /* ground objs alive at once. free-play-v1 holds at most 177 under any legal
+                                     play, each obj charged to the drop or death that last set its timer (a stack
+                                     merge resets it): 100 from deaths in a death drop's 200 ticks (6 chickens die at
+                                     most 4 times, 6 goblins at most 2, and in village-world-v1 a mugger, in
+                                     village-world-v2 a highwayman, at most 2; 3, 2 and 2 objs a death) and 77 drop
+                                     decisions in a dropped obj's 300 (a drop needs 24 stacks; each drop or take is a
+                                     decision of 2 ticks or more; a picked item enters the inventory, not the
+                                     ground). 255 is the most that n_objs, obj_order, scan_objs and RsRef.slot
+                                     (uint8_t) can count and index */
 #define RS_MAX_REQS 128           /* requests in all queues of a world (player and npcs) */
-#define RS_MAX_EVENTS 4096        /* world.events of one episode (combat: about one per hit) */
+#define RS_RESPAWN_LIVES 4096     /* lives of one npc the free-play XP check records (XpCheck.respawned): a respawn
+                                     takes at least respawnrate * 3999 // 4000 ticks after a death (49 for a chicken),
+                                     so a 36,000-tick life holds under 750 lives of one npc; a life past it overflows */
+#define RS_MAX_EVENTS 4096        /* world.events held at once: a goal episode's (a hit writes its hit event, up to
+                                     4 xp events and npc_damage; the largest measured episode held 475), a free-play
+                                     step's (free_settle drops a step's events once settled) */
 #define RS_CHAT_RING 64           /* chat lines one cycle may append before the agent captures them */
 #define RS_TEXT_LOG 32            /* settext calls in one cycle (drained by the agent every tick) */
 #define RS_PATH_MAX 25            /* paths.MAX_WAYPOINTS */
@@ -156,7 +170,8 @@
 #define RS_SCAN_LOCS RS_MAX_LOCS
 #define RS_SCAN_NPCS RS_MAX_NPCS
 #define RS_SCAN_OBJS RS_MAX_OBJS
-#define RS_AFF_CAP 640            /* affordance entries before choose_affordances: (locs + npcs) x 5 options + objs */
+#define RS_AFF_CAP ((RS_SCAN_LOCS + RS_SCAN_NPCS) * 5 + RS_SCAN_OBJS) /* affordance entries before choose_affordances:
+                                     (locs + npcs) x 5 options + objs */
 #define RS_KILL_LIVES 256         /* (npc, life) rows of the kill ledger */
 #define RS_SUPPLY_LOGS 256
 #define RS_GROVE_MAX 8            /* rows of one grove (3-5 in train-128) */
@@ -269,6 +284,21 @@ typedef enum {
     X(RS_E_AUDIT_REMOVAL, EXC_AUDIT, "removal of items not held", "")                                /* audit:93 */ \
     X(RS_E_AUDIT_HOLDINGS, EXC_AUDIT, "{0} holdings not explained by the events", "c")               /* audit:100 */ \
     X(RS_E_AUDIT_GOAL_ITEMS, EXC_AUDIT, "goal items held that production does not account for", "") /* audit:107 */ \
+    /* free-play-v1's checks (audit.py XpCheck and check_stats, task.py FreePlayEpisode; XpCheck's texts name the
+       event or the cause by its stat and tick, not Python's dict repr) */ \
+    X(RS_E_AUDIT_XP, EXC_AUDIT, "xp event at tick {0} (stat {1}): {2}", "iic")                     /* XpCheck._fail */ \
+    X(RS_E_AUDIT_XP_OWED, EXC_AUDIT, "{0} at tick {1} has no xp event", "ci")                      /* XpCheck._owed */ \
+    X(RS_E_AUDIT_RESPAWN, EXC_AUDIT, "a second npc_respawn of npc {0} life {1} at tick {2}", "iii")   /* XpCheck.observe */ \
+    X(RS_E_AUDIT_XP_HELD, EXC_AUDIT, "stat {0} holds {1} XP, its checked events {2}", "iii")       /* task _account */ \
+    X(RS_E_AUDIT_XP_STATS, EXC_AUDIT, "stat {0}: {1} XP from start to end, {2} in its events", "iii") /* check_stats */ \
+    X(RS_E_AUDIT_PAID, EXC_AUDIT, "paid differs from the fractional level gain", "")               /* task report */ \
+    X(RS_E_FREE_CUT, EXC_RUNTIME, "the agent's limits cut a free-play life (free_play_cfg)", "")   /* task step */ \
+    X(RS_E_CLOSED_LIFE, EXC_RUNTIME, "step on a closed life", "")                                  /* task step */ \
+    /* village-world-v2's (engine.py World.teleport, pick, door) */ \
+    X(RS_E_TELEPORT_OUTSIDE, EXC_UNSUPPORTED, "a teleport to {0},{1},{2}, outside the supported tiles", "iii") /* :1740 */ \
+    X(RS_E_PICK_OVERFLOW, EXC_UNSUPPORTED, "a pick whose item overflows a full inventory", "")     /* :3235 */ \
+    X(RS_E_DOOR_SHAPE, EXC_UNSUPPORTED, "a door of shape {0}", "i")                                 /* :2188 */ \
+    X(RS_E_DOOR_DIAGONAL, EXC_UNSUPPORTED, "a diagonal door that moves the player out of its way (p_teleport)", "") /* :2192 */ \
     /* native only */ \
     X(RS_E_OVERFLOW, EXC_RUNTIME, "native capacity {0} exceeded", "c") \
     X(RS_E_MSG_MISSING, EXC_RUNTIME, "native message table lacks key {0} fill {1}", "ii") \
@@ -446,7 +476,10 @@ enum { RS_LTRIG_N = 12 };
     S(int32_t, next_loc_stage_mining) S(int32_t, mining_rock_empty) /* loc_param_or_default (RS_NONE: None) */ \
     S(int16_t, tree_row) S(int16_t, rock_row) /* rows by debugname, -1 none */ \
     S(uint8_t, is_loc_4030) S(uint8_t, supply_tree) /* debugname loc_4030; tree or oaktree (SupplyTracker) */ \
-    S(uint8_t, pen_gate) S(uint8_t, pad)
+    S(uint8_t, pen_gate) S(uint8_t, pad) \
+    S(uint8_t, has_pick) S(uint8_t, pick_scaled) S(int16_t, pad1) /* the archive's content.picks row of the debugname
+                                  (only over an archive with that content: sim/build.py add_picks) */ \
+    S(int32_t, pick_item) S(int32_t, pick_respawn) /* its item (RS_NONE: not an obj) and respawn ticks */
 RS_RECORD(RsLocType, RS_LOC_TYPE_FIELDS)
 
 enum { RS_NPCK_OTHER = 0, RS_NPCK_CHICKEN, RS_NPCK_GOBLIN, RS_NPCK_MUGGER, RS_NPCK_SPOT };
@@ -491,7 +524,13 @@ enum {
     RS_OF_FISH_EQUIPMENT = 1 << 12,   /* fish_equipment_struct param or fly_fishing_rod/fishing_rod/big_net */
     RS_OF_NET = 1 << 13,              /* debugname 'net' (use_on_saltfish) */
     RS_OF_ARROWS = 1 << 14, RS_OF_BOLTS = 1 << 15, RS_OF_BOW = 1 << 16, RS_OF_CROSSBOW = 1 << 17,
-    RS_OF_UNBANKABLE = 1 << 18
+    RS_OF_UNBANKABLE = 1 << 18,
+    /* cases of the field items' and the highwayman's cape's use scripts (engine.py FIELD_USE), set only over an archive
+       whose content holds 'picks' (engine.archive_script resolves them there alone) */
+    RS_OF_CASE_CABBAGE = 1 << 19, RS_OF_CASE_POTATO = 1 << 20, RS_OF_CASE_ONION = 1 << 21,
+    RS_OF_CASE_BLACK_CAPE = 1 << 22,
+    RS_OF_LOOT_OUTSIDE_OWN = 1 << 23 /* engine.loot_outside over the list of the pack's village world when it declares
+                                        its own (sim/combat.py VILLAGES loot_outside); 0 in a pack of no such world */
 };
 #define RS_OBJ_TYPE_FIELDS(S, A) \
     S(uint8_t, present) S(uint8_t, stackable) S(uint8_t, members) S(uint8_t, dummyitem) \
@@ -590,7 +629,8 @@ enum {
     X(mine_gem) /* gem obj id */ X(mine_get) /* rock row */ X(prospect_start) X(prospect_empty) \
     X(prospect_ore) /* rock row */ X(fish_fail_net) X(fish_fail_fishing_rod) X(fish_no_bait) X(fish_full) \
     X(fish_cast) X(fish_level5) X(under_attack) X(fighting_other) X(equip_space) X(eat) /* food obj id */ \
-    X(eat_heal) X(bury_dig) X(bury_done) X(pickup_no_space) X(select_option) X(weakened)
+    X(eat_heal) X(bury_dig) X(bury_done) X(pickup_no_space) X(select_option) X(weakened) \
+    X(pick_full) /* plant loc type: pick_full_<debugname> */ X(pick) /* plant loc type: pick_<debugname> */
 #define RS_TEXT_ENUM(k) RS_TX_##k,
 typedef enum { RS_TEXT_KEYS(RS_TEXT_ENUM) RS_N_TEXT_KEYS } RsTextKey;
 #undef RS_TEXT_ENUM
@@ -661,6 +701,8 @@ enum { RS_LAYOUT_COMPACT = 0, RS_LAYOUT_SUPPLY, RS_LAYOUT_VARIANT };
 #define RS_LAYOUT_REC_FIELDS(S, A) \
     S(int32_t, kind) S(int32_t, pool_index) S(int32_t, W) S(int32_t, H) S(int32_t, T) S(int32_t, x0) S(int32_t, z0) \
     S(int32_t, grove) S(int32_t, keep) /* variants: their key */ \
+    S(int32_t, world)          /* 1 + sim/world.py WORLDS index of world_of(layout), the layout built as its pool's
+                                  class (LAYOUT_CLASSES); 0 is refused at open (records start zeroed) */ \
     S(int64_t, seed) S(int64_t, attempt) \
     S(int32_t, n_src) S(int32_t, n_start) S(int32_t, n_locs) S(int32_t, n_open) S(int32_t, n_npcs) S(int32_t, n_fish) \
     A(int32_t, gate, 2) \
@@ -729,6 +771,8 @@ typedef struct { int32_t off, k; int64_t count; } RsLate;
     S(int32_t, s_message1) S(int32_t, s_objbox1) S(int32_t, s_doubleobjbox) S(int32_t, s_bank_main) \
     S(int32_t, s_produce_get_logs) S(int32_t, s_produce_ore_normal) S(int32_t, s_produce_ore_fast) \
     S(int32_t, s_produce_fish_roll) /* the produce events' script names (GATHERING_SCRIPTS members) */ \
+    S(int32_t, s_produce_pick) /* '[proc,pickup_loc_floor]' (a pick's; owes no XP); RS_NONE over an archive without
+                                  content.picks, so other packs' strings are unchanged */ \
     S(int32_t, s_death_no_hero) /* 'a player command before npc_findhero' (engine.py) */ \
     S(int32_t, members)        /* World.members: meta['environment']['members'] */
 RS_RECORD(RsConsts, RS_CONSTS_FIELDS)
@@ -737,6 +781,8 @@ RS_RECORD(RsConsts, RS_CONSTS_FIELDS)
 typedef struct {
     const RsLayoutRec *rec;
     int32_t index, kind, W, H, T, x0, z0;
+    int32_t world, village;    /* the record's world (1 + WORLDS index) and the village world that plays it
+                                  (sim/combat.py village_of: VILLAGES index, -1 none; rs_gen.h RS_DECLARED_VILLAGE) */
     int32_t n_src, n_start, n_locs, n_open, n_npcs, n_fish, n_camp, n_outside, n_groves, n_sites;
     const int32_t *flags_boot;
     const uint8_t *steps_boot, *steps_snap, *sides;
@@ -806,7 +852,7 @@ enum { RS_PORT = 1, RS_SUB = 2, RS_NP = 3 };
     X(RS_S_PROSPECT, "prospect", RS_PORT) \
     X(RS_S_GATE_OPEN_MAIN, "gate.<locals>.script", RS_PORT) X(RS_S_GATE_OPEN_OUTER, "gate.<locals>.script", RS_PORT) \
     X(RS_S_GATE_CLOSE_MAIN, "gate.<locals>.script", RS_PORT) X(RS_S_GATE_CLOSE_OUTER, "gate.<locals>.script", RS_PORT) \
-    X(RS_S_DOOR_OPEN, "door.<locals>.script", RS_NP) X(RS_S_DOOR_CLOSE, "door.<locals>.script", RS_NP) \
+    X(RS_S_DOOR_OPEN, "door.<locals>.script", RS_PORT) X(RS_S_DOOR_CLOSE, "door.<locals>.script", RS_PORT) \
     X(RS_S_STAIRS_UP, "stairs.<locals>.script", RS_NP) X(RS_S_STAIRS_DOWN, "stairs.<locals>.script", RS_NP) \
     X(RS_S_BOOTH_USE, "booth_use", RS_NP) X(RS_S_BOOTH_QUICK, "booth_quick", RS_NP) \
     /* npc ops */ \
@@ -846,7 +892,15 @@ enum { RS_PORT = 1, RS_SUB = 2, RS_NP = 3 };
     X(RS_S_NPC_DEATH, "npc_death", RS_SUB) \
     X(RS_S_NPC_DEFAULT_ATTACK, "npc_default_attack", RS_PORT) \
     X(RS_S_DARK_WIZARD_ATTACK, "dark_wizard_water_attack", RS_NP) \
-    X(RS_S_HIGHWAYMAN_APPROACH, "highwayman_approach", RS_NP)
+    X(RS_S_HIGHWAYMAN_APPROACH, "highwayman_approach", RS_PORT) \
+    /* village-world-v2 (appended: packs store these ids, so none before them moves). The field's pick, a loc op
+       (engine.py), and the default use scripts of the field items and the highwayman's cape
+       (engine.py FIELD_USE): over an archive with content.picks only (engine.archive_script) */ \
+    X(RS_S_PICK, "pick", RS_PORT) \
+    X(RS_S_USE_DEFAULT_CABBAGE, "use_default.<locals>.script", RS_PORT) \
+    X(RS_S_USE_DEFAULT_POTATO, "use_default.<locals>.script", RS_PORT) \
+    X(RS_S_USE_DEFAULT_ONION, "use_default.<locals>.script", RS_PORT) \
+    X(RS_S_USE_DEFAULT_BLACK_CAPE, "use_default.<locals>.script", RS_PORT)
 #define RS_SCRIPT_ENUM(id, qualname, status) id,
 typedef enum { RS_SCRIPTS(RS_SCRIPT_ENUM) RS_N_SCRIPTS } RsScript;
 #undef RS_SCRIPT_ENUM
@@ -974,27 +1028,34 @@ typedef struct {
     Frame script;              /* p.script and its state (mode) */
 } Player;
 
-/* world.events (engine.py): typed, append-only, tick-nondecreasing. */
+/* world.events (engine.py): typed, append-only, tick-nondecreasing. RS_EV_NPC_RESPAWN (World.npc_respawn's last
+   step): an npc life respawned in this cycle, before its [ai_spawn,_] runs. */
 enum {
     RS_EV_AGENT_HP = 0, RS_EV_PICKUP, RS_EV_PRODUCE, RS_EV_TRANSFER, RS_EV_REMOVE, RS_EV_NPC_DAMAGE,
-    RS_EV_NPC_DEFEATED, RS_EV_EXCLUDED
+    RS_EV_NPC_DEFEATED, RS_EV_EXCLUDED, RS_EV_XP, RS_EV_HIT, RS_EV_NPC_RESPAWN
 };
 enum { RS_HP_DAMAGE = 0, RS_HP_EAT, RS_HP_REGEN, RS_HP_LEVELUP, RS_HP_NONE };   /* agent_hp cause */
 enum { RS_WHY_EAT = 0, RS_WHY_BURY, RS_WHY_DROP };                              /* remove why */
 enum { RS_LOCN_INV = 0, RS_LOCN_WORN, RS_LOCN_BANK };                           /* transfer src/dst */
 enum { RS_EXCL_CLUE = 0, RS_EXCL_LOOT };                                        /* excluded what */
+enum { RS_XPC_NONE = 0, RS_XPC_PRODUCE, RS_XPC_HIT, RS_XPC_BURY, RS_XPC_LIGHT };  /* xp cause (World.add_xp) */
 typedef struct {
     int32_t tick;
     uint8_t kind;
-    uint8_t a8;      /* agent_hp: cause; transfer: src; remove: why; excluded: what; npc_*: source is the player */
-    uint8_t b8;      /* transfer: dst */
+    uint8_t a8;      /* agent_hp: cause; transfer: src; remove: why; excluded: what; npc_* and hit: source is the
+                        player; xp: stat */
+    uint8_t b8;      /* transfer: dst; xp: cause (RS_XPC_*) */
     uint8_t has_source; /* agent_hp: source npc nid present (not None) */
-    int32_t obj;     /* produce/pickup/remove/transfer/excluded obj; npc_*: npc nid */
-    int32_t count;   /* produce/pickup/remove/transfer count; agent_hp: planned; npc_*: type */
-    int32_t v0;      /* produce: script name string; transfer: to; agent_hp: before; npc_*: life; excluded: npc */
-    int32_t v1;      /* agent_hp: after; npc_damage: damage */
-    int32_t v2;      /* agent_hp: source nid; npc_damage: hp before */
-    int32_t v3;      /* npc_damage: full */
+    int32_t obj;     /* produce/pickup/remove/transfer/excluded obj; npc_* and hit: npc nid; xp: the cause's obj
+                        (produce, bury, light) or npc nid (hit), 0 without a cause */
+    int32_t count;   /* produce/pickup/remove/transfer count; agent_hp: planned; npc_* and hit: type; xp: the
+                        script's amount (tenths, before the rate) */
+    int32_t v0;      /* produce: script name string; transfer: to; agent_hp: before; npc_* and hit: life; excluded:
+                        npc; xp: the stat's XP before */
+    int32_t v1;      /* agent_hp: after; npc_damage and hit: damage; xp: the stat's XP after */
+    int32_t v2;      /* agent_hp: source nid; npc_damage and hit: hp before; xp: produce's src (loc type, raw obj,
+                        -1 for None) or hit's life, else 0 */
+    int32_t v3;      /* npc_damage: full; hit: damage style */
 } RsEvent;
 
 typedef struct { int32_t tick, msg; } RsChatLine;
@@ -1103,6 +1164,8 @@ typedef struct World {
     uint32_t seed;             /* Rng.seed = rs_seed(world_seed) */
     int32_t tick, xp_rate;
     uint8_t excl;              /* RS_EXCLUDE_* bits of World.exclusions (rs_gen.h, engine.EXCLUSIONS order) */
+    uint32_t loot;             /* the RsObjType flag of World.loot_outside: RS_OF_LOOT_OUTSIDE (the default list), or
+                                  RS_OF_LOOT_OUTSIDE_OWN for a life of a village world that declares its own */
     uint8_t members, has_player, pending_login;
     /* collision: live flags without entity bits, tiles where they differ from boot, occupancy */
     int32_t flags[RS_MAX_T];
@@ -1133,9 +1196,12 @@ typedef struct World {
     Req req[RS_MAX_REQS];
     int16_t req_free, req_dead;                   /* free list; unlinked-during-pass list */
     uint32_t next_serial;
-    /* text and evidence */
+    /* text and evidence: world.events is ev[0 .. n_events) after ev_base settled events a free-play life dropped
+       (task.c rs_free_settle; 0 in every goal task), so len(world.events) = ev_base + n_events and an event's index
+       in world.events is ev_base + its position here */
     ChatLog chat;
     TextLog text;
+    int64_t ev_base;
     int32_t n_events;
     RsEvent ev[RS_MAX_EVENTS];
     RsPathCache pc;
@@ -1303,7 +1369,7 @@ typedef struct {               /* GoalEpisode (task.py) */
     int32_t kills;             /* certified kills so far (audit.kills over every event since arm) */
 } Episode;
 
-enum { RS_START_SHORT = 0, RS_START_COMBAT, RS_START_SUPPLY };
+enum { RS_START_SHORT = 0, RS_START_COMBAT, RS_START_SUPPLY, RS_START_VILLAGE };
 typedef struct {               /* draw_start / draw_combat / draw_supply records (CpuBatch.starts[b]) */
     int32_t kind, layout;      /* RS_START_*; pool layout index (compact or supply pool) */
     int16_t tile_x, tile_z;    /* absolute */
@@ -1317,6 +1383,8 @@ typedef struct {               /* draw_start / draw_combat / draw_supply records
                                                        injects a start): the pool layout's, or for a scarce supply
                                                        start rs_variant_find's. rec is set for every start, not only
                                                        supply ones, so rs_episode_begin reads one field. */
+    int32_t length;            /* village (free-play-v1): the life's length (draw_life), 0 for other starts */
+    uint8_t placed;            /* village: muggers placed (the batch's setting; n_muggers 0 without them) */
 } RsStart;
 
 typedef struct {               /* SupplyTracker (search.py); discovered is unused by v5 and not kept */
@@ -1328,7 +1396,9 @@ typedef struct {               /* SupplyTracker (search.py); discovered is unuse
     int64_t cells;             /* Tracker.cells is never read by CpuBatch: not kept */
 } RsSupply;
 
-enum { RS_TASK_V2 = 2, RS_TASK_V3 = 3, RS_TASK_V5 = 5 };  /* goal-activity-v2/v3/v5 (v4 search is refused) */
+/* goal-activity-v2/v3/v5 (v4 search is refused) and free-play-v1 (sim/task.py FreePlayEpisode) */
+enum { RS_TASK_V2 = 2, RS_TASK_V3 = 3, RS_TASK_V5 = 5, RS_TASK_FREE = 16 };
+enum { RS_LIFE_FIXED = 0, RS_LIFE_UNIFORM = 1 };          /* free-play life lengths (sim/task.py check_life) */
 typedef struct {
     int32_t task;              /* RS_TASK_* */
     int32_t n, first;          /* worlds in this batch, global slot of world 0 */
@@ -1338,11 +1408,41 @@ typedef struct {
     /* the agent's cfg (CpuBatch.cfg, TASK_CFG unless given): paceJitterTicks, decisionPoints, maxDecisions and
        maxEpisodeTicks, with agent.py's defaults for absent keys */
     int32_t pace_jitter, decision_points, max_decisions, max_episode_ticks;
+    /* the worlds' XP rate (World.xp_rate): RS_ENGINE_XP_RATE for the goal tasks (World's default), free-play-v1's
+       setting (1 or 25, sim/task.py FREE_PLAY) for it; free-play-v1's muggers (0 or 1) and life-length distribution
+       (life_kind RS_LIFE_*, life_lo, life_hi: ('fixed', lo) or ('uniform', lo, hi)) */
+    int32_t xp_rate, muggers, life_kind, life_lo, life_hi;
     /* threads that step the batch's worlds in contiguous slices (batch.c's pool; 0 or 1:
        the caller alone). Worlds share nothing mutable, so the results do not depend on it; an error is the lowest
        failing world's, as the sequential loop raises it. */
     int32_t threads;
 } RsConfig;
+
+/* A free-play-v1 life's accounts (sim/task.py FreePlayEpisode, sim/audit.py XpCheck, sim/combat.py fights), settled
+   step by step from the event cursor `checked` (an index of world.events: ev_base + position), after which the settled
+   events leave the World's buffer (rs_free_settle), so a life of any length fits RS_MAX_EVENTS events a step. */
+typedef struct {
+    int32_t length;            /* the life's ticks from arm */
+    int32_t arm_stats[21]; int16_t arm_levels[21];
+    double start_level[RS_FREE_N_SKILLS], level[RS_FREE_N_SKILLS];  /* fractional levels over S at arm, settled */
+    int32_t xp[21];            /* XpCheck.xp: each stat's checked XP */
+    int64_t gained[21];        /* the xp events' gains since arm (check_stats) */
+    int64_t checked;           /* the next unsettled event (index of world.events) */
+    int32_t n_lit;             /* XpCheck.lit (a light's logs put down): no light is ported, so always 0 */
+    /* XpCheck.respawned's keys: bit life of row npc set at that npc life's npc_respawn event (a second one raises
+       RS_E_AUDIT_RESPAWN); the tick a hit compares with is its own tick's (rs_free_xp_check: a life whose respawn
+       was earlier is not in its respawn cycle) */
+    uint8_t respawned[RS_MAX_NPCS][RS_RESPAWN_LIVES / 8];
+    int32_t kills;             /* npcs this agent defeated (npc_defeated with its source) */
+    /* fights' summary over the window (events from arm with tick < the terminal tick), as rs_fights reads it:
+       per npc nid, the life fights last saw (life[npc], has), the life of its last row (row_life, -1 none), and
+       kill_lives' last damaged life (hit_life, -1 none) */
+    int32_t eats, eaten, eat_gain, regen_gain, levelup_gain, aggressed;
+    int32_t life_seen[RS_MAX_NPCS], row_life[RS_MAX_NPCS], hit_life[RS_MAX_NPCS];
+    uint8_t has_life[RS_MAX_NPCS];
+    uint8_t defeat_unhit;      /* kill_lives' 'an npc defeated without a hit' in the window: raised at the life's end,
+                                  where fights(task) raises it */
+} RsFree;
 
 typedef struct RsSlot {        /* one world slot of the batch */
     /* set once by rs_batch_new, never cleared: the run's inputs, which every episode of the slot reads */
@@ -1356,6 +1456,9 @@ typedef struct RsSlot {        /* one world slot of the batch */
     Agent a;
     Episode ep;
     RsStart start;
+    uint8_t has_start;         /* start holds the current episode's start (rs_episode_begin sets it); 0 from a reset
+                                  and from each draw until its episode begins, so a failed draw leaves no start, as
+                                  CpuBatch's starts[b] is None */
     RsSupply supply;
     int32_t slot;              /* global slot = first + b */
     int32_t goal;              /* the slot's goal (GOALS index) */
@@ -1365,9 +1468,16 @@ typedef struct RsSlot {        /* one world slot of the batch */
     int32_t fail_decision, fail_tick, fail_action;  /* task.decisions, world.tick (mid-cycle), the action */
     int64_t cycles;            /* world cycles the slot has run, setup ones included (sim/bench.py's count of
                                   World.cycle calls); never reset, read by the benchmark (Batch.cycles) */
-    _Alignas(8) uint8_t obs[RS_OBS_BYTES]; /* the last projected observation (packed row, RS_OBS_OFFSET) */
+    RsFree fp;                 /* free-play-v1's accounts (rs_episode_begin zeroes them) */
+    _Alignas(8) uint8_t obs[RS_OBS_ROW_BYTES]; /* the last projected observation (packed row, RS_OBS_OFFSET; obs-v6's
+                                                  progress at RS_OBS_PROGRESS_OFF) */
     int32_t n_late, n_late_next;           /* the late log1p features of obs, and of the projection being built */
     RsLate late[RS_LATE_CAP], late_next[RS_LATE_CAP];
+    /* free-play-v1's info['last_obs']: a done step's observation at the life's end (obs, before the auto-reset
+       replaces it) and its late features, kept until the next step of the slot */
+    uint8_t has_last;
+    int32_t n_late_last;
+    RsLate late_last[RS_LATE_CAP];
 } RsSlot;
 
 /* Where a step writes: the arrays of sim/workers.py fields(n) for this batch's n worlds, C-contiguous, each the base
@@ -1377,7 +1487,11 @@ typedef struct RsSlot {        /* one world slot of the batch */
    outcomes and facts are 0; an unsupported world has unsupported 1, its goal, its last projected observation
    (RsSlot.obs) and 0 in every other field (reward, done, decision_ticks, made and kills included). */
 typedef struct {
-    void *obs[RS_OBS_N_KEYS];          /* RS_OBS_* order, row bytes RS_OBS_NBYTES[k] */
+    void *obs[RS_OBS_N_KEYS];          /* RS_OBS_* order, row bytes RS_OBS_NBYTES[k] (obs-v5) */
+    /* free-play-v1 (v6 set): obs-v6's arrays (RS_OBS6_* order, row bytes RS_OBS6_NBYTES[k]) in place of obs, and
+       info['last_obs'] in the same table: each done world's observation at its life's end, 0 in every other row */
+    uint8_t v6;
+    void *obs6[RS_OBS6_N_KEYS], *last6[RS_OBS6_N_KEYS];
     void *info[RS_INFO_N];             /* RS_INFO_* order (bool as uint8) */
     int32_t *made, *kills, *facts;     /* [n][3], [n], [n][RS_N_FACTS] */
     float *reward;
@@ -1607,6 +1721,7 @@ int rs_can_travel(World *w, int32_t level, int32_t x, int32_t z, int32_t dx, int
                   int32_t collision, int *ok);
 /* World.process_movement for the player (collision 0, extra 0) and for an npc (engine.py). */
 int rs_process_movement_player(World *w);
+int rs_teleport(World *w, int32_t x, int32_t z);  /* World.teleport (engine.py) */
 int rs_process_movement_npc(World *w, Npc *n, int32_t collision, int32_t extra);
 /* Locs (engine.py). Lifecycle, add/remove/change/revert, LOC_ADD (Unsupported RS_E_LOC_ADD_OUTSIDE). */
 void rs_set_lifecycle(World *w, int slot, int32_t duration);
@@ -1692,9 +1807,10 @@ int64_t rs_random(const World *w, int64_t n, int nkeys, const int64_t *keys);
 int64_t rs_randominc(const World *w, int64_t n, int nkeys, const int64_t *keys);
 /* PlayerOps STAT_RANDOM (engine.py): its bool (cannot fail). */
 int rs_stat_random(const World *w, int32_t stat, int32_t low, int32_t high, int nkeys, const int64_t *keys);
-/* Player.addXp with the XP rate (engine.py): levels, the levelup agent_hp event, changestat and the
-   [advancestat] engine queue request. */
-int rs_add_xp(World *w, int32_t stat, int32_t xp);
+/* Player.addXp with the XP rate (World.add_xp): the 'xp' event right after the stat (its cause RS_XPC_*, the cause's
+   obj or npc nid, and its src or life: RsEvent), then levels, the levelup agent_hp event, changestat and the
+   [advancestat] engine queue request. An amount of 0 does nothing. */
+int rs_add_xp(World *w, int32_t stat, int32_t xp, int cause, int32_t obj, int32_t src);
 /* STAT_SUB / STAT_ADD / STAT_HEAL (engine.py), cause RS_HP_* for the heal's evidence. */
 int rs_stat_sub(World *w, int32_t stat, int32_t constant, int32_t percent);
 int rs_stat_add(World *w, int32_t stat, int32_t constant, int32_t percent);
@@ -1882,6 +1998,25 @@ int rs_audit(const RsSlot *s, RsAudit *out, RsErr *err);
    eaten (eats + eats_without_gain), eat_gain, regen_gain, levelup_gain, aggressed, eats_without_gain. kill_lives'
    AuditError can raise. */
 int rs_fights(const RsSlot *s, int32_t out[6], RsErr *err);
+/* ---- free-play-v1 (task.c; sim/task.py FreePlayEpisode, sim/combat.py VILLAGE, sim/vec.py _step_free) */
+/* draw_village (combat.py) and draw_life (task.py) for the slot: draw_start on the compact pool, draw_combat in the
+   village's start group (its R_GROUP draw skipped; the mugger tiles drawn, and kept only when cfg->muggers), the life
+   length (R_LIFE) from cfg's distribution; kind RS_START_VILLAGE. */
+int rs_draw_village(const RsPack *P, const RsConfig *cfg, int64_t key, int32_t slot, int32_t episode, RsStart *out,
+                    RsErr *err);
+/* village_npcs (combat.py): rs_combat_npcs of the start (its placed muggers), then the layout's chickens in layout
+   order, nids following (RS_E_OVERFLOW past RS_MAX_NPCS). */
+int rs_village_npcs(const RsPack *P, const RsStart *start, RsNpcSpawn out[RS_MAX_NPCS], int *n, RsErr *err);
+/* audit.fractional_level (the engine's level table, RsConsts.level_xp, capped at 99). */
+double rs_fractional_level(const RsPack *P, int32_t xp);
+/* XpCheck.observe (sim/audit.py) of s->w.ev[first..n), tick by tick, from s->fp.xp at s->cfg->xp_rate: each xp event
+   against its cause and the tables, each cause's owed XP; s->fp.xp and gained follow (AuditError RS_E_AUDIT_XP*). */
+int rs_free_xp_check(RsSlot *s, int32_t first, int32_t n);
+/* Agent.truncated (agent.py): the agent's own limits reached. */
+int rs_agent_truncated(const Agent *a);
+/* obs-v6's progress block (rl/obs.py project_v6's level_progress per SKILL_ORDER skill) into the packed row. */
+void rs_project_progress(const RsSlot *s, uint8_t *row);
+
 /* CpuBatch._facts (vec.py): info['facts'] of the step that closes an episode (EPISODE_FACTS order). */
 int rs_facts(const RsSlot *s, const RsAudit *report, int32_t facts[RS_N_FACTS], RsErr *err);
 /* GoalEpisode.project's task inputs (task.py): budget_vec, critic_vec, goal_vec into the packed row. */

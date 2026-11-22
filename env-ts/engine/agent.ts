@@ -15,11 +15,11 @@
 //      were about to observe.
 
 import { randomUUID } from 'node:crypto';
-import { ACT_WALK_TILES, affordanceKey, actAction, checkActContract, heldAction, publishAffordances, useAction,
+import { ACT_WALK_TILES, affordanceKey, actAction, checkActContract, publishAffordances,
     type Affordance } from '../core/affordances';
 import { ENTITY, ROUTE_RECORD, TILE, clickSlot, clickSlots, clientFlags, locArrival, sceneBase, tryMove, type Arrival,
     type RouteRecord } from '../core/clicks';
-import { walkMap } from '../reach';
+import { keptWalkMap as walkMap } from './walk-cache'; // reach.ts walkMap, its fills kept (walk-cache.ts)
 import { TextCapture, describeAction, feedback, type ActionMeaning, type EndReason, type OptionEnd, type Snapshot } from '../core/feedback';
 import { continuityOptions, continuityEnvelope, checkContinuity, type ContinuityOptions } from '../core/continuity';
 import { monitorLifecycle, type LifecycleMonitor } from './lifecycle';
@@ -28,8 +28,10 @@ import InvType from '../../vendor/rs-sdk/server/engine/src/cache/config/InvType.
 import Component from '../../vendor/rs-sdk/server/engine/src/cache/config/Component.js';
 import LocType from '../../vendor/rs-sdk/server/engine/src/cache/config/LocType.js';
 import { replacePlayerForReset } from './reset-isolation';
-import { ItemPages, checkItemContract, matchItem, type Item } from '../core/items';
+import { foodCount, heldKinds, offersEat, tookFrom } from './batch';
+import { ITEM_CONTRACT, ITEM_KINDS, ITEM_WIDE, ItemPages, checkItemContract, keptPick, matchItem, type Item } from '../core/items';
 import ObjType from '../../vendor/rs-sdk/server/engine/src/cache/config/ObjType.js';
+import NpcType from '../../vendor/rs-sdk/server/engine/src/cache/config/NpcType.js';
 import CategoryType from '../../vendor/rs-sdk/server/engine/src/cache/config/CategoryType.js';
 import DbRowType from '../../vendor/rs-sdk/server/engine/src/cache/config/DbRowType.js';
 import DbTableType from '../../vendor/rs-sdk/server/engine/src/cache/config/DbTableType.js';
@@ -65,17 +67,24 @@ import {
     A_USE0,
     A_WITHDRAW0,
     N_ACTIONS,
+    N_ACTIONS_V4,
     N_INV_SEL,
-    optionLabelFor
+    TOOL_PROTECT_RE,
+    optionLabelFor,
+    pageEntry
 } from '../core/actions';
 import { monitorDeath, type DeathMonitor } from './death';
 import { ACT_STALL_TICKS, K_TICKS, NAV_STALL_TICKS, OPTION_HARD_TIMEOUT_TICKS, type TaskCfg, isTruncated, SPAWN_TOLERANCE_TILES } from '../core/budgets';
-import { MASK_CONTRACT, buildMask } from '../core/mask';
+import { MASK_CONTRACT, MASK_WIDE, buildMask } from '../core/mask';
+import { selectHeldWide } from '../core/wide';
 import { keepWaiting } from '../core/decision-points';
 import { farSpawn, jitterWorld, worldFromTele } from '../core/world';
 import { findLongPath } from '../../vendor/rs-sdk/sdk/pathfinding';
 import { requireRecoveryPlacementProfile } from '../core/recovery-placement';
 import { demoSettings } from '../core/spectator';
+import type { SharedClock } from '../core/lockstep-clock';
+import { activeProfile } from './tick-profile';
+import { HurtTicks } from './hurt';
 import { actCandidates, buildObs, opIndexOf, scanNpcs, scanWorld, SKILL_NAMES, type EngineCandidate,
     type ScanResult } from './observe';
 
@@ -106,8 +115,14 @@ const CONTINUITY_WORLD_BOOT_ID = process.env.RL_DEMO_BOOT_ID || randomUUID();
 // TICK_TRACE_TILES after every tick of the decision. Evidence for that check, never a policy input.
 const TICK_TRACE = !!process.env.RL_TICK_TRACE;
 const TICK_TRACE_TILES = 20;
-// Milliseconds a lockstep demo world waits after each tick (scripts/stack.py --demo-pace-ms); 0 elsewhere.
+// Milliseconds a one-agent lockstep demo world waits after each tick (scripts/stack.py --demo-pace-ms); 0 elsewhere. A
+// shared demo world paces its clock instead (core/lockstep-clock.ts), so its agents never wait on their own.
 const DEMO_PACE_MS = demoSettings(process.env)?.paceMs ?? 0;
+// A shared world (engine-env RL_SHARED_AGENTS, engine/batch.ts shared-lockstep-v1): its ticks come from the shared clock.
+let sharedClock: SharedClock | null = null;
+export function useSharedClock(clock: SharedClock): void {
+    sharedClock = clock;
+}
 // Where a reset without spawnTele starts: Lumbridge, beside the castle.
 const LUMBRIDGE_TELE = '0,50,50,22,22';
 
@@ -176,6 +191,13 @@ export class EngineAgent {
     private itemPages = new ItemPages();
     private readonly refusedTargets = new Map<string, number>();
     private lastObservation: Record<string, any> | null = null;
+    /** shared-lockstep-v1 facts of the current life: Eats that took the item, Drops that took an item that offers Eat,
+     * the killers at a death */
+    private eats = 0;
+    private foodDrops = 0;
+    private toolDrops = 0; // facts.tool_drops: the life's Drops that took an item TOOL_PROTECT_RE names (a read, paid nothing)
+    private readonly hurt = new HurtTicks(); // facts.hurt: the armed life's missing hitpoints, tick by tick (engine/hurt.ts)
+    private killers: string[] = [];
     /** the scanned thing behind each published actSel slot */
     private actTargets: EngineCandidate[] = [];
     /** the held item picked with USE_k, as the client's "Use" cursor holds it */
@@ -221,7 +243,12 @@ export class EngineAgent {
         const tutorial = VarPlayerType.getByName('tutorial');
         if (!tutorial) throw new Error('admit: tutorial varp unavailable');
         player.setVar(tutorial.id, 1000);
-        this.death = monitorDeath(player, PlayerStat.HITPOINTS, () => World.currentTick);
+        this.killers = [];
+        this.death = monitorDeath(player, PlayerStat.HITPOINTS, () => World.currentTick, () => {
+            // the npcs whose target is the player at the moment its hitpoints reach 0 (shared-lockstep-v1 facts)
+            this.killers = [...scanNpcs(player, 16)].filter(n => (n as unknown as { target?: unknown }).target === player)
+                .map(n => NpcType.get(n.type)?.name ?? `npc ${n.type}`);
+        });
         this.incarnationId = randomUUID();
         this.lifecycle = null;
         this.continuityFailure = null;
@@ -293,10 +320,13 @@ export class EngineAgent {
             // A demo world (core/spectator.ts) also waits after each tick, so its
             // watching client receives the tick and sees it at a viewable pace.
             for (let i = 0; i < n; i++) {
-                World.advance(1);
+                if (sharedClock) await sharedClock.tick(this);
+                else World.advance(1);
+                this.hurt.tick(this.player.levels[PlayerStat.HITPOINTS] ?? 0, this.player.baseLevels[PlayerStat.HITPOINTS] ?? 0,
+                               !this.death.dead && this.isAdmitted());
                 this.keepAlive();
                 if (TICK_TRACE) this.traceTick();
-                if (DEMO_PACE_MS) await new Promise(r => setTimeout(r, DEMO_PACE_MS));
+                if (DEMO_PACE_MS && !sharedClock) await new Promise(r => setTimeout(r, DEMO_PACE_MS));
             }
             return;
         }
@@ -362,7 +392,10 @@ export class EngineAgent {
 
     async reset(seed: number, cfg: TaskCfg = {}): Promise<Record<string, any>> {
         checkItemContract(cfg); // reject an unknown contract before changing the account
-        checkActContract(cfg);
+        this.hurt.end(); // the life before is over; the next counts from the batch's arm (armHurt)
+        // act-v3's check of the act targets; the item contract, item-v2 or item-v3, is checkItemContract's. (core/
+        // affordances.ts, which the simulator's archives pin (sim/build.py pins), keeps its own item-v2 test.)
+        checkActContract({ ...cfg, contract: ITEM_CONTRACT });
         const nextContinuity = continuityOptions(cfg as TaskCfg & { lifecycle?: unknown; maxRespawnTicks?: unknown }, process.env.RL_CONTINUITY_EXPERIMENT);
         this.unbindLifecycle(); // caller must archive continuityAudit before explicit hard reset
         this.continuity = nextContinuity;
@@ -380,11 +413,14 @@ export class EngineAgent {
             state ^= state << 13; state >>>= 0; state ^= state >>> 17; state ^= state << 5; state >>>= 0;
             return state % (jitter + 1);
         };
-        this.itemPages.reset();
+        this.itemPages.reset(cfg.contract);  // checked above (checkItemContract)
         this.using = null;
         this.latestRoute = this.decisionRoute = null;
         this.refusedTargets.clear();
         this.lastObservation = null;
+        this.eats = 0;
+        this.foodDrops = 0;
+        this.toolDrops = 0;
         this.decision = 0;
         this.charged = 0;
         this.episodeTicks = 0;
@@ -446,6 +482,17 @@ export class EngineAgent {
                 const stat = SKILL_BY_NAME.get((name ?? '').trim().toLowerCase());
                 const level = parseInt(lvl ?? '', 10);
                 if (stat !== undefined && Number.isFinite(level)) this.player.setLevel(stat, level);
+            }
+        }
+        // the start record's drawn hitpoints (free-play-v12, v13): the current level lowered as the engine's own stat_sub
+        // lowers one (PlayerOps STAT_SUB: levels[stat], then changeStat), the base left as setStats set it
+        if (cfg.startHp !== undefined) {
+            const base = this.player.baseLevels[PlayerStat.HITPOINTS];
+            if (!Number.isInteger(cfg.startHp) || cfg.startHp < 1 || cfg.startHp > base)
+                throw new Error(`reset: startHp ${cfg.startHp} outside 1..${base}`);
+            if (cfg.startHp !== this.player.levels[PlayerStat.HITPOINTS]) {
+                this.player.levels[PlayerStat.HITPOINTS] = cfg.startHp;
+                this.player.changeStat(PlayerStat.HITPOINTS);
             }
         }
 
@@ -541,24 +588,32 @@ export class EngineAgent {
     private projectItems(obs: Record<string, any>, scan: ScanResult): void {
         obs.bankOpen = this.bankIsOpen();
         this.itemPages.project(obs, obs.bankOpen ? this.inventoryItems(InvType.getId('bank')) : []);
-        // A picked item that has left its slot (eaten, burnt, banked) is no longer in hand.
-        const picked = this.using && this.inventoryItems(InvType.INV).find(i => i.slot === this.using!.slot);
-        if (this.using && (picked?.id !== this.using.id || obs.bankOpen)) this.using = null;
+        // A picked item that has left its slot (eaten, burnt, banked) is no longer in hand; under item-v3 the pick is of
+        // the kind and follows its first slot (keptPick).
+        this.using = keptPick(this.using, this.inventoryItems(InvType.INV), this.itemPages.contract, obs.bankOpen);
         obs.using = this.using ? { ...this.using } : null;
         // Only what the player can walk up to: the fewer steps of a side with no wall between
         // and a tile beside it (a bank booth is used across its counter; the wall-free side
         // of Falador's booths is 19 steps round the back). A loc that cannot be used from
         // where the walk ends (a tree behind a fence) is refused after one attempt.
         const p = this.player;
+        const tWalk = performance.now();
         const walk = walkMap(p.level, p.x, p.z, ACT_WALK_TILES);
+        activeProfile?.add('obs:items:walk', performance.now() - tWalk);
         const refused = (a: Affordance) => (this.refusedTargets.get(affordanceKey(a)) ?? -1) > World.currentTick;
         const steps = (c: EngineCandidate) => {
             const [side, beside] = [c.kind === 'loc' ? walk.operable(c.x, c.z) : -1, walk.approach(c.x, c.z)];
             return side < 0 ? beside : beside < 0 ? side : Math.min(side, beside);
         };
+        const tAct = performance.now();
         this.actTargets = publishAffordances(obs, actCandidates(scan), steps, refused);
+        // item-v4: its pack options take up to 16 rows (core/wide.ts); publishAffordances lists act-v3's 8
+        if (this.itemPages.contract === ITEM_WIDE) obs.heldSel = selectHeldWide(obs.invSel, obs.using);
+        activeProfile?.add('obs:items:act', performance.now() - tAct);
+        const tClicks = performance.now();
         // act-v3's clicks: natively every target lies in the declared world; `open` reads the live collision.
         obs.clicks = clickSlots(p.x, p.z, (x, z) => routefinder.collisionFlags.get(x, z, p.level));
+        activeProfile?.add('obs:items:clicks', performance.now() - tClicks);
         const attacker = scan.npcs.find(n => (n.npc as any).target === p);
         obs.style = this.styleFacts();
         // Evidence for checks and logs, not a policy input (rl/obs.py does not read it).
@@ -576,10 +631,11 @@ export class EngineAgent {
         const script = ScriptProvider.getByName(`[label,${label}]`);
         if (!script) throw new Error(`missing game banking script: ${label}`);
         // Execute the actual game's capacity, unbankable-item, and note conversion rules.
-        // Item copies with the same ID are fungible; requested quantity is selected-stack count.
-        this.player.executeScript(ScriptRunner.init(script, this.player, null,
-            [selected!.slot, withdraw ? 1 : selected!.count]), true);
-        return `${label}: slot ${selected!.slot} id ${selected!.id} requested ${withdraw ? 1 : selected!.count}`;
+        // Item copies with the same ID are fungible; requested quantity is selected-stack count, or under item-v3 and v4 the
+        // kind's total (the page entry is the whole kind; bank_deposit takes up to that many over all slots).
+        const requested = withdraw ? 1 : [ITEM_KINDS, ITEM_WIDE].includes(this.itemPages.contract) ? selected!.total! : selected!.count;
+        this.player.executeScript(ScriptRunner.init(script, this.player, null, [selected!.slot, requested]), true);
+        return `${label}: slot ${selected!.slot} id ${selected!.id} requested ${requested}`;
     }
 
     private posKey(): string {
@@ -699,10 +755,11 @@ export class EngineAgent {
     }
 
     private mask(obs: Record<string, any>): number[] {
-        obs.maskVersion = MASK_CONTRACT;
+        const wide = this.itemPages.contract === ITEM_WIDE;  // item-v4: act-v4's 128 rows under mask-v6
+        obs.maskVersion = wide ? MASK_WIDE : MASK_CONTRACT;
         obs.heldVersion = HELD_CONTRACT;
         if (this.continuity && obs.lifecycle?.phase === 'dying') {
-            const mask = new Array(N_ACTIONS).fill(0); mask[0] = 1; return mask;
+            const mask = new Array(wide ? N_ACTIONS_V4 : N_ACTIONS).fill(0); mask[0] = 1; return mask;
         }
         return buildMask(obs, {
             allowedActions: this.cfg.allowedActions
@@ -1038,18 +1095,22 @@ export class EngineAgent {
         // Only actions legal in the published observation reach the game.
         if (!this.lastObservation?.mask?.[action]) return 'action not legal in published observation';
         if (this.itemPages.turn(action)) return 'item page changed';
+        // a page family's entry: act-v3's rows give action - base; act-v4's second groups give entries 8..15 (pageEntry),
+        // legal only under mask-v6, which act-v3's 96-row mask never publishes
+        const entry = pageEntry(action);
+        const at = (base: number) => entry !== null && entry.base === base ? entry.k : -1;
         if (action >= A_WITHDRAW0 && action < A_WITHDRAW0 + N_INV_SEL) return this.itemTransfer(action - A_WITHDRAW0, true);
-        if (action >= A_DEPOSIT0 && action < A_DEPOSIT0 + N_INV_SEL) return this.itemTransfer(action - A_DEPOSIT0, false);
-        if (action >= A_DROP0 && action < A_DROP0 + N_INV_SEL) {
-            const selected = this.lastObservation?.invSel?.[action - A_DROP0];
+        if (at(A_DEPOSIT0) >= 0) return this.itemTransfer(at(A_DEPOSIT0), false);
+        if (at(A_DROP0) >= 0) {
+            const selected = this.lastObservation?.invSel?.[at(A_DROP0)];
             const current = this.inventoryItems(InvType.INV).find(i => i.slot === selected?.slot);
             return matchItem(current, selected) ? this.dropSlot(selected.slot) : 'drop: stale selection';
         }
 
         if (action === 0) return 'wait';
 
-        if (useAction(action)) {
-            const selected = this.lastObservation?.invSel?.[action - A_USE0];
+        if (at(A_USE0) >= 0) {
+            const selected = this.lastObservation?.invSel?.[at(A_USE0)];
             const current = this.inventoryItems(InvType.INV).find(i => i.slot === selected?.slot);
             if (!selected || !matchItem(current, selected)) return 'use: stale selection';
             this.using = { slot: selected.slot, id: selected.id, name: selected.name };
@@ -1059,8 +1120,8 @@ export class EngineAgent {
             this.using = null;
             return 'use: put back';
         }
-        if (this.using && heldAction(action)) {
-            const target = this.lastObservation?.heldSel?.[action - A_HELD0];
+        if (this.using && at(A_HELD0) >= 0) {
+            const target = this.lastObservation?.heldSel?.[at(A_HELD0)];
             const using = this.using;
             this.using = null;
             return target ? this.useOnHeld(target.slot, using) : 'use: slot empty';
@@ -1070,8 +1131,8 @@ export class EngineAgent {
 
         if (actAction(action)) return this.act(action, scan);
 
-        if (heldAction(action)) {
-            const selected = this.lastObservation?.heldSel?.[action - A_HELD0];
+        if (at(A_HELD0) >= 0) {
+            const selected = this.lastObservation?.heldSel?.[at(A_HELD0)];
             const current = this.inventoryItems(InvType.INV).find(i => i.slot === selected?.slot);
             return selected && matchItem(current, selected) ? this.opHeld(selected.slot, exactly(selected.option))
                 : 'held: stale selection';
@@ -1119,6 +1180,11 @@ export class EngineAgent {
         // What the policy chose, read from the observation it chose from: the slot may hold
         // another thing in the next one.
         const meaning: ActionMeaning = describeAction(this.lastObservation, action);
+        const entry = pageEntry(action)?.k ?? -1;  // a page family's entry (act-v3's row - base; act-v4's second group)
+        const eating = meaning.family === 'held' && meaning.option === 'Eat' && !this.using
+            ? this.lastObservation?.heldSel?.[entry] ?? null : null;
+        const dropping = meaning.family === 'drop' && meaning.option === 'Drop'
+            ? this.lastObservation?.invSel?.[entry] ?? null : null;
         const before = this.snapshot();
         const lifecycleAtStart = this.continuity ? this.continuousState() : null;
         const deadAtStart = lifecycleAtStart ? lifecycleAtStart.phase === 'dying' : this.death.dead || !this.isAdmitted();
@@ -1139,7 +1205,10 @@ export class EngineAgent {
                     this.endOption('superseded', false);
                     this.option = null;
                 }
-                actionNote = this.dispatch(action, scanWorld(this.player));
+                const tScan = performance.now();
+                const dispatchScan = scanWorld(this.player);
+                activeProfile?.add('dispatch:scan', performance.now() - tScan);
+                actionNote = this.dispatch(action, dispatchScan);
             }
         } catch (e) {
             actionNote = `error: ${(e as Error)?.message ?? e}`;
@@ -1166,14 +1235,27 @@ export class EngineAgent {
             }
         }
         const tTickMs = Date.now() - tTick0;
+        if (eating) { // an Eat that took the item from its slot
+            const now = this.inventoryItems(InvType.INV).find(i => i.slot === eating.slot);
+            if (!now || now.id !== eating.id || now.count < eating.count) this.eats++;
+        }
+        if (dropping && tookFrom(dropping, this.inventoryItems(InvType.INV).find(i => i.slot === dropping.slot))) {
+            if (offersEat(ObjType.get(dropping.id).iop)) this.foodDrops++; // a Drop that took an item that offers Eat
+            if (TOOL_PROTECT_RE.test(String(dropping.name ?? ''))) this.toolDrops++; // or one mask-v5 protects as a tool
+        }
 
         const tObs0 = Date.now();
         const lifecycleNow = this.continuity ? this.continuousState() : null;
         const dead = lifecycleNow ? lifecycleNow.phase === 'dying' : this.death.dead || !this.isAdmitted();
         if (dead || (lifecycleNow && lifecycleAtStart && lifecycleNow.deathSequence !== lifecycleAtStart.deathSequence)) this.option = null;
         const truncated = (this.continuity || !dead) && isTruncated({ charged: this.charged, episodeTicks: this.episodeTicks }, this.cfg);
+        const part = activeProfile ? (name: string, t0: number) => activeProfile!.add(`obs:${name}`, performance.now() - t0)
+            : null; // RL_TICK_PROFILE: the observation's parts
+        let tPart = performance.now();
         const scan = scanWorld(this.player);
+        part?.('scan', tPart); tPart = performance.now();
         const obs = buildObs(this.player, scan, { decision: this.decision, done: lifecycleNow ? truncated : dead || truncated, truncated, isDead: dead });
+        part?.('build', tPart); tPart = performance.now();
         // Settle completion now. Reading `option !== null`
         // reported an option busy for one step after it finished, so a level-up
         // arrived mid-option here and after it in Chromium, where imitation then
@@ -1181,6 +1263,7 @@ export class EngineAgent {
         // so a place a walk just found no route to is already gone.
         const busyAfter = !dead && this.optionBusy();
         this.projectItems(obs, scan);
+        part?.('items', tPart); tPart = performance.now();
         if (lifecycleNow) obs.lifecycle = lifecycleNow;
         obs.deathTick = lifecycleNow ? lifecycleNow.deathTick : this.death.deathTick;
         obs.action = action;
@@ -1191,15 +1274,95 @@ export class EngineAgent {
         // Evidence for checks, logs and the spectator, not a policy input (rl/obs.py does not read it).
         obs.route = this.decisionRoute;
         if (TICK_TRACE) { obs.tickTrace = this.tickTrace; this.tickTrace = []; }
+        tPart = performance.now();
         obs.mask = this.mask(obs);
+        part?.('mask', tPart); tPart = performance.now();
         obs.feedback = feedback(meaning, before, this.snapshot(), busyAfter, this.optionEnd,
                                 this.text.publish(World.currentTick), this.dialogText());
+        part?.('feedback', tPart);
         obs.charged = this.charged;
         this.lastMaskSum = (obs.mask as number[]).reduce((a: number, b: number) => a + b, 0);
         const tObsMs = Date.now() - tObs0;
 
         obs.timing = { dispatch: tDispatchMs, tick: tTickMs, obs: tObsMs, total: Date.now() - tStep0 };
         return obs;
+    }
+
+    /** n ticks of the world (the shared clock's in a shared world): a first join's login (shared-lockstep-v1). */
+    async waitWorldTicks(n: number): Promise<void> {
+        await this.waitTicks(n);
+    }
+
+    /** The engine's own XP (tenths) and base levels of every stat, read from the player. */
+    pay(): { xp: number[]; base: number[] } {
+        return { xp: Array.from(this.player.stats), base: Array.from(this.player.baseLevels) };
+    }
+
+    /** The cheap life facts of shared-lockstep-v1 (batch.ts FACT_FIELDS): hitpoints, the worn weapon, Eats, the death
+     * and its killers, the item kinds held in the pack or worn (heldKinds), the pack's items that offer Eat (foodCount),
+     * and the life's Drops that took one or a tool. */
+    facts(): Record<string, any> {
+        const p = this.player;
+        const weapon = p.getInventory(InvType.WORN)?.get(3); // the weapon slot
+        const slots = (inv: any) => inv ? Array.from({ length: inv.capacity }, (_, slot) => inv.get(slot)) : [];
+        return { hp: [p.levels[PlayerStat.HITPOINTS] ?? 0, p.baseLevels[PlayerStat.HITPOINTS] ?? 0],
+            weapon: weapon ? { id: weapon.id, name: ObjType.get(weapon.id).debugname ?? '' } : null, eats: this.eats,
+            death: this.death.dead ? { tick: this.death.deathTick, killers: [...this.killers] } : null,
+            held: heldKinds([slots(p.getInventory(InvType.INV)), slots(p.getInventory(InvType.WORN))]),
+            food: foodCount(slots(p.getInventory(InvType.INV)), id => ObjType.get(id).iop), food_drops: this.foodDrops,
+            tool_drops: this.toolDrops, hurt: this.hurt.facts() };
+    }
+
+    /** The life starts (the batch's reset item is over, its setup included): facts.hurt counts from 0. */
+    armHurt(): void {
+        this.hurt.arm();
+    }
+
+    get dead(): boolean {
+        return this.death.dead;
+    }
+
+    /** prepare_declared's check: the inventory is exactly cfg.seedItems, nothing worn, base levels exactly setStats. */
+    declaredStartProblem(cfg: TaskCfg): string | null {
+        const want = new Map<number, number>();
+        for (const pair of (cfg.seedItems ?? '').split(',').filter(Boolean)) {
+            const [name, count] = pair.split(':');
+            const id = ObjType.getId((name ?? '').trim());
+            want.set(id, (want.get(id) ?? 0) + Math.max(1, parseInt(count ?? '1', 10) || 1));
+        }
+        const have = new Map<number, number>();
+        for (const item of this.inventoryItems(InvType.INV)) have.set(item.id, (have.get(item.id) ?? 0) + item.count);
+        if (want.size !== have.size || [...want].some(([id, n]) => have.get(id) !== n))
+            return `declared inventory differs: ${JSON.stringify([...have])}`;
+        if (this.inventoryItems(InvType.WORN).length) return 'something is worn at the declared start';
+        for (const pair of (cfg.setStats ?? '').split(',').filter(Boolean)) {
+            const [name, level] = pair.split(':');
+            const stat = SKILL_BY_NAME.get((name ?? '').trim().toLowerCase());
+            if (stat === undefined || this.player.baseLevels[stat] !== parseInt(level ?? '', 10))
+                return `declared ${name} level differs: ${stat === undefined ? 'unknown' : this.player.baseLevels[stat]}`;
+        }
+        return null;
+    }
+
+    /** The held slot that offers Wield of the item named `name` (an engine debug name), or -1. */
+    wieldSlot(obs: Record<string, any>, name: string): number {
+        const id = ObjType.getId(name);
+        return (obs.heldSel ?? []).findIndex((h: any) => h && h.id === id && h.option === 'Wield');
+    }
+
+    /** Leave the world without a save (shared-lockstep-v1): no logout, no save file. */
+    leave(): void {
+        if (this.closed) return;
+        this.closed = true;
+        this.hurt.end();
+        clearInterval(this.heartbeat);
+        try {
+            this.unbindLifecycle();
+        } catch {
+            /* the world may already have dropped it */
+        }
+        World.newPlayers.delete(this.player);
+        World.removePlayerWithoutSave(this.player);
     }
 
     close(): void {

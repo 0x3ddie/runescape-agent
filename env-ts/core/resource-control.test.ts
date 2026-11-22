@@ -1,5 +1,5 @@
 import {expect,test} from 'bun:test';
-import {resourceControl,resourceControlHttp} from './resource-control';
+import {MAX_RESOURCE_HORIZON,resourceControl,resourceControlHttp} from './resource-control';
 
 function fixture(){
     const player={},identity={worldBootId:'boot',accountId:'actor',accountEpoch:1,incarnationId:'p1'};
@@ -20,6 +20,13 @@ test('identity and exact arm/read/archive protocol work without choosing actions
     for(const operation of ['read','retire','release'])f.control({...f.base,operation,identity:f.identity});
     expect(f.state.calls).toEqual(['arm:100','read','retire','release']);
 });
+test('an arm takes every horizon up to MAX_RESOURCE_HORIZON, a 36,000-tick life and 150,000 included',()=>{
+    const f=fixture();
+    for(const horizon of [1,10_000,10_001,36_000,MAX_RESOURCE_HORIZON])
+        f.control({...f.base,operation:'arm',identity:f.identity,horizon});
+    expect(f.state.calls).toEqual(['arm:1','arm:10000','arm:10001','arm:36000','arm:150000']);
+    expect(MAX_RESOURCE_HORIZON).toBe(150_000);  // baseline/resource_task.py MAX_HORIZON (sim/tests/test_watch.py holds both)
+});
 test('budget route returns only clock fields with the same incarnation guard',()=>{
     const f=fixture();
     const result=f.control({...f.base,operation:'budget',identity:f.identity});
@@ -27,7 +34,7 @@ test('budget route returns only clock fields with the same incarnation guard',()
     expect(result.budget.remainingTicks).toBe(50);expect(f.state.calls).toEqual(['budget']);
     expect(()=>f.control({...f.base,operation:'budget',identity:{...f.identity,accountEpoch:2}})).toThrow();
 });
-for(const override of [{bootId:'other'},{accountName:'other'},{horizon:0},{horizon:10001},
+for(const override of [{bootId:'other'},{accountName:'other'},{horizon:0},{horizon:150_001},
     {horizon:1.5},{operation:'teleport'},{extra:1},{identity:{worldBootId:'boot',accountId:'actor',accountEpoch:1,incarnationId:'old'}}]){
     test(`reject invalid resource control ${JSON.stringify(override)}`,()=>{
         const f=fixture();expect(()=>f.control({...f.base,operation:'arm',identity:f.identity,horizon:100,...override})).toThrow();

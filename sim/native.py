@@ -24,12 +24,14 @@ The exporter that writes a pool set's pack from the archive and the pools is sim
 
     PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native build
     PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native export --pool logs/sim/world/train-8-nc1-derived.npz \
-        --supply-pool logs/supply/pools/train-128.npz --tables logs/sim/data/draynor-nc1.npz --output logs/native/train-8-nc1-cc0614f.pack
+        --supply-pool logs/supply/pools/train-128.npz --tables logs/sim/data/draynor-nc1.npz --output logs/native/train-8-nc1-a6c325a-ids3-item3.pack
     PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native pack-info logs/native/train-<hash>.pack
     PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native diff --pool logs/sim/world/train-8-nc1-derived.npz ...  (the
         equivalence harness, sim/native_harness.py)
     PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native gate [--quick]  (the release gate, sim/native_harness.py)
-    PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native bench --pack logs/native/train-8-nc1-cc0614f.pack ...  (throughput,
+    PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native free-soak --pack PACK --pool POOL --output DIR  (free-play-v1's
+        soak in lockstep with the Python reference, sim/native_harness.py)
+    PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native bench --pack logs/native/train-8-nc1-a6c325a-ids3-item3.pack ...  (throughput,
         sim/native_bench.py)
     PYTHONPATH=.:rl .venv-sim/bin/python -m sim.native env --engines cpu,native ...  (both engines through the training
         workers, timed and compared, sim/native_bench.py)
@@ -50,24 +52,45 @@ import struct
 import subprocess
 import sys
 import sysconfig
+from types import SimpleNamespace
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 # The default pack of the gate, the bench and the native tests (sim/tests PACK): train-8-nc1-rv2's inputs exported again,
-# with trees (9 November 2026), the oracle with the firemaking and cooking scripts; the pack is of
-# draynor-nc1.npz, over which they do not run. Kept as evidence, each stale on this tree: train-8-nc1-5c14c8b.pack and
-# train-8-nc1-p2.pack (the same inputs at two earlier phase 2 states), train-8-nc1-gap1.pack
-# (at the native gap study's Stage 3 freeze) and rv2 (M's records name it).
-PACK = ROOT / 'logs' / 'native' / 'train-8-nc1-cc0614f.pack'
-SOURCE = Path(__file__).with_name('native')
+# with trees, by the exporter with the respawn fix (15 November 2026: an npc life's npc_respawn event and the XP check's
+# respawn cycle), with the record layouts of village-world-v2's C port (each layout record names its world), by the
+# exporter whose source it records and against the ids it records ("-ids3": rs.h's RS_EV_NPC_RESPAWN;
+# open_pack checks both; the ids hash covers the section table since 13 November); the pack is of draynor-nc1.npz, over
+# which firemaking, cooking and the field's Pick do not run. Kept as evidence, each refused on this tree:
+# train-8-nc1-a6c325a-ids2.pack (the same inputs before the respawn fix: the oracle and ids of 13 November),
+# train-8-nc1-a6c325a-ids.pack (the same pack, its ids without the section table),
+# train-8-nc1-a6c325a-worlds.pack (the same inputs and record layouts, its manifest without the exporter check and the
+# ids), train-8-nc1-a6c325a.pack (the record
+# layouts before the port), train-8-nc1-e2a61c1.pack (the free-play oracle: XP events, free-play-v1, obs-v6),
+# train-8-nc1-cc0614f.pack (the phase 2 port's oracle), train-8-nc1-5c14c8b.pack and train-8-nc1-p2.pack (the same inputs
+# under the phase 2 contracts, at two earlier commits), train-8-nc1-gap1.pack (at an earlier study's freeze) and rv2
+# (older run records name it).
+# The -item3 exports (20 November 2026) are the -ids3 packs' inputs exported again after item-v3 changed three ORACLE
+# files (rl/obs.py, rl/item_contract.py, rl/act_contract.py): their 34 sections are byte-equal to the -ids3 ones; their
+# manifests' oracle record differs, so the -ids3 packs are refused on this tree.
+PACK = ROOT / 'logs' / 'native' / 'train-8-nc1-a6c325a-ids3-item3.pack'
+# village-world-v2's default pack (the gate's v2 world set, the bench): its training pool (logs/sim/world/train-128-20000-v2.npz,
+# plain) over draynor-nc2.npz without trees, exported again as PACK was (15 November 2026; its 13 November export,
+# -ids2, is refused on this tree)
+PACK_V2 = ROOT / 'logs' / 'native' / 'train-128-20000-v2-a6c325a-ids3-item3.pack'
+# SIM_NATIVE_SOURCE: a copy of sim/native/ to build in its place, for tests only (a copy with another rs.h limit, built
+# in a subprocess into its own SIM_BUILD; sim/tests/test_native_free_play.py); the library tag digests the copy's files.
+SOURCE = Path(os.environ.get('SIM_NATIVE_SOURCE') or Path(__file__).with_name('native'))
+# The exporter whose source a pack records (manifest 'exporter') and open_pack checks against this tree's.
+EXPORTER = Path(__file__).with_name('native_export.py')
 FLAGS = ('-O2', '-std=c11', '-ffp-contract=off', '-fno-fast-math', '-fPIC')
 # The extension alone is also built with link-time optimization: calls between its files (rs_tile, rs_wm, the walk
 # reads, can_travel) inline as calls within one file do. It changes no operation (the FLAGS above hold at compile
 # time, so no a*b+c is fused); the tests' partial builds keep FLAGS alone. SIM_NATIVE_LTO=0 builds without it (a
 # toolchain without the LTO plugin), under its own library tag.
 LINK = ('-flto',)
-# Elsewhere than macOS (a Linux x86_64 cloud machine, gcc through LDSHARED): glibc declares batch.c's pthread calls under
+# Elsewhere than macOS (Linux x86_64, gcc through LDSHARED): glibc declares batch.c's pthread calls under
 # strict -std=c11 only with a feature macro (pack.c sets the same value itself, as does Python.h's pyconfig.h); an
 # undeclared call fails the build instead of linking as one returning int; and libm is linked by name (floor is a call
 # on baseline x86-64). None of them changes an operation, and macOS keeps the flags its release gate passed with.
@@ -89,8 +112,9 @@ DT_BYTES, DT_RECORD = 0, 11
 C_TYPES = {'uint8_t': 'u1', 'int8_t': 'i1', 'uint16_t': '<u2', 'int16_t': '<i2', 'uint32_t': '<u4', 'int32_t': '<i4',
            'uint64_t': '<u8', 'int64_t': '<i8', 'double': '<f8', 'float': '<f4'}
 # rs.h RS_TASK_*; v4 (search) refused. v11 is v5 with bindings (sim/combat.py BOUND) that NativeBatch checks in Python,
-# so C runs it as v5.
-TASKS = {'goal-activity-v2': 2, 'goal-activity-v3': 3, 'goal-activity-v5': 5, 'goal-activity-v11': 5}
+# so C runs it as v5. free-play-v1 (sim/task.py FREE_PLAY) is RS_TASK_FREE.
+TASKS = {'goal-activity-v2': 2, 'goal-activity-v3': 3, 'goal-activity-v5': 5, 'goal-activity-v11': 5, 'free-play-v1': 16}
+FREE_TASK = 'free-play-v1'
 
 
 class NotPorted(RuntimeError):
@@ -113,7 +137,7 @@ def generated_header():
     import feedback_contract
     import item_contract
     import obs as rl_obs
-    from sim import agent, combat, data, engine, paths, search, spec, task, vec
+    from sim import agent, combat, data, engine, paths, search, spec, task, vec, world
 
     if not agent.N_ACTIONS == spec.N_ACTIONS == rl_obs.N_ACTIONS:
         raise ValueError('the action tables of sim/agent.py, sim/spec.py and rl/obs.py disagree')
@@ -130,6 +154,12 @@ def generated_header():
 
     def table(ctype, name, values):
         out.append(f'static const {ctype} {name}[{len(values)}] RS_GEN_UNUSED = {{{", ".join(map(_c, values))}}};')
+
+    def strings(name, values):  # C string literals (json escapes are C's for these ASCII texts)
+        if not all(v.isascii() for v in values):
+            raise ValueError(f'{name}: a C string table holds ASCII only')
+        out.append(f'static const char *const {name}[{len(values)}] RS_GEN_UNUSED = '
+                   f'{{{", ".join(json.dumps(v) for v in values)}}};')
 
     def names(prefix, items, start=0):
         for k, item in enumerate(items, start):
@@ -163,7 +193,7 @@ def generated_header():
     section('engine (sim/engine.py:24-117, 2078-2079)')
     for name in ('APNPC1', 'APNPCU', 'APOBJ1', 'APLOC1', 'APLOCU', 'AP_TO_OP', 'XP_RATE', 'WALK_BLOCKED', 'AFK_EVENTRATE',
                  'NPC_ACTIVE_RADIUS', 'WEARPOS_FRONT', 'WEARPOS_RHAND', 'WEARPOS_QUIVER', 'NOMOVE', 'STACK_LIMIT',
-                 'LOC_DURATION', 'WALL_STRAIGHT', 'WALL_DIAGONAL', 'STAB', 'SLASH', 'CRUSH', 'RANGED_STYLE',
+                 'LOC_DURATION', 'WALL_STRAIGHT', 'WALL_DIAGONAL', 'PLAYER_COUNT', 'STAB', 'SLASH', 'CRUSH', 'RANGED_STYLE',
                  'MAGIC_STYLE', 'NPC_ATTACK', 'NPC_DEFENCE', 'NPC_STRENGTH', 'NPC_HP', 'NPC_MAGIC'):
         define(f'RS_{name}', getattr(engine, name))
     define('RS_AFK_CHANCE1', float(engine.AFK_CHANCE1))
@@ -258,6 +288,35 @@ def generated_header():
     define('RS_HORIZON_TICKS', spec.HORIZON_TICKS)
     for name in ('TERMINAL_RUNNING', 'TERMINAL_HORIZON', 'TERMINAL_DEATH'):
         define(f'RS_{name}', getattr(spec, name))
+    # the door scripts' offsets (engine.py DOOR_OPEN, DOOR_CLOSE): row k * 4 + angle, k 0 a straight wall, 1 a diagonal
+    if list(engine.DOOR_OPEN) != [engine.WALL_STRAIGHT, engine.WALL_DIAGONAL] or list(engine.DOOR_CLOSE) != list(engine.DOOR_OPEN):
+        raise ValueError('engine.DOOR_OPEN and DOOR_CLOSE name other shapes than the C door')
+    for name in ('DOOR_OPEN', 'DOOR_CLOSE'):
+        rows = [o for shape in getattr(engine, name).values() for o in shape]
+        table('int8_t', f'RS_{name}_DX', [o[0] for o in rows])
+        table('int8_t', f'RS_{name}_DZ', [o[1] for o in rows])
+    section('free-play-v1 (sim/task.py FREE_PLAY, draw_life; sim/combat.py VILLAGES, village_of, draw_village)')
+    define('RS_R_LIFE', task.R_LIFE)
+    free = [engine.SKILLS.index(s) for s in task.FREE_PLAY['skills']]
+    define('RS_FREE_N_SKILLS', len(free))
+    table('int8_t', 'RS_FREE_SKILLS', free)  # S, in FREE_PLAY's order (the pay's sum order)
+    # a layout record's world (rs.h RsLayoutRec.world: 1 + its sim/world.py WORLDS index) and the village world that
+    # plays it (combat.village_of: its VILLAGES index, -1 none); each village world's start group, exclusions, whether
+    # it places muggers (and so lets a batch ask for them), whether it declares its own loot list, and draw_village's
+    # refusal texts
+    declared, villages = list(world.WORLDS), list(combat.VILLAGES.values())
+    define('RS_N_DECLARED', len(declared))
+    define('RS_N_VILLAGES', len(villages))
+    table('int8_t', 'RS_DECLARED_VILLAGE', [next((i for i, v in enumerate(villages) if v['layouts'] == name), -1)
+                                            for name in declared])
+    table('int8_t', 'RS_VILLAGE_GROUP', [combat.GROUPS.index(v['start_group']) for v in villages])
+    table('uint8_t', 'RS_VILLAGE_EXCLUSIONS', [bits(v['exclusions']) for v in villages])
+    table('uint8_t', 'RS_VILLAGE_PLACE_MUGGERS', [v.get('muggers') is not False for v in villages])
+    table('uint8_t', 'RS_VILLAGE_OWN_LOOT', [v.get('loot_outside') is not None for v in villages])
+    strings('RS_VILLAGE_NO_MUGGERS', [f"{v['version']} holds no muggers: pass False" for v in villages])
+    out.append(f'#define RS_VILLAGE_NONE {json.dumps("free play plays the layouts of " + str([v["layouts"] for v in villages]))}')
+    define('RS_ENGINE_XP_RATE', engine.XP_RATE)  # World's default: the goal tasks' rate
+    define('RS_MAX_HORIZON', resource_task.MAX_HORIZON)  # a life's bound (check_life)
     cfg = config.TASK_CFG
     define('RS_CFG_PACE_JITTER', cfg.get('paceJitterTicks', 0))
     define('RS_CFG_DECISION_POINTS', bool(cfg.get('decisionPoints')))
@@ -305,6 +364,35 @@ def generated_header():
     table('int32_t', 'RS_OBS_NELEM', elems)
     table('int32_t', 'RS_OBS_OFFSET', offsets)
     table('int32_t', 'RS_OBS_NBYTES', nbytes)
+    # obs-v6 (rl/obs.py project_v6, sim/spec.py OBSERVATION_SHAPES_V6): the packed row above holds obs-v5's arrays and,
+    # after them, each SKILL_ORDER skill's level progress (RS_OBS_PROGRESS_OFF); a v6 key is its obs-v5 key's bytes
+    # (RS_OBS6_SRC, from RS_OBS6_SKIP bytes on: task_vec drops its decision count), and prog_vec is followed by the
+    # progress block. The client's level table (rl/obs.py LEVEL_XP) is the progress's.
+    v6 = spec.OBSERVATION_SHAPES_V6
+    if [k for k in keys if k in v6] != list(v6):
+        raise ValueError('obs-v6 keys are not obs-v5 keys in obs-v5 order')
+    define('RS_OBS_PROGRESS_OFF', -(-offset // 8) * 8)
+    define('RS_OBS_PROGRESS_N', len(rl_obs.SKILL_ORDER))
+    define('RS_OBS_ROW_BYTES', -(-(-(-offset // 8) * 8 + 4 * len(rl_obs.SKILL_ORDER)) // 8) * 8)
+    define('RS_OBSV_PROG_VEC_V6', rl_obs.PROG_VEC_V6)
+    define('RS_OBSV_TASK_VEC_V6', rl_obs.TASK_VEC_V6)
+    if rl_obs.PROG_VEC_V6 != rl_obs.PROG_VEC + len(rl_obs.SKILL_ORDER) or rl_obs.TASK_VEC_V6 != rl_obs.TASK_VEC - 1:
+        raise ValueError('obs-v6 prog_vec or task_vec is not obs-v5\'s with the progress added, the decision count gone')
+    table('int32_t', 'RS_OBS_LEVEL_XP', list(rl_obs.LEVEL_XP))
+    v6keys = list(v6)
+    for k, key in enumerate(v6keys):
+        define(f'RS_OBS6_{key.upper()}', k)
+    define('RS_OBS6_N_KEYS', len(v6keys))
+    out.append(f'static const char *const RS_OBS6_NAMES[{len(v6keys)}] RS_GEN_UNUSED = '
+               f'{{{", ".join(json.dumps(k) for k in v6keys)}}};')
+    out.append(f'static const char RS_OBS6_FORMAT[{len(v6keys)}] RS_GEN_UNUSED = '
+               f'{{{", ".join(repr(np.dtype(spec.dtype(k)).char) for k in v6keys)}}};')
+    table('uint8_t', 'RS_OBS6_NDIM', [len(v6[k]) for k in v6keys])
+    table('int32_t', 'RS_OBS6_SHAPE', [d for k in v6keys for d in (list(v6[k]) + [1])[:2]])
+    table('int32_t', 'RS_OBS6_NELEM', [int(np.prod(v6[k])) for k in v6keys])
+    table('int32_t', 'RS_OBS6_NBYTES', [int(np.prod(v6[k])) * np.dtype(spec.dtype(k)).itemsize for k in v6keys])
+    table('int32_t', 'RS_OBS6_SRC', [keys.index(k) for k in v6keys])
+    table('int32_t', 'RS_OBS6_SKIP', [4 if k == 'task_vec' else 0 for k in v6keys])
 
     section('step info (sim/spec.py INFO_FIELDS order; sim/workers.py fields adds made, kills, facts, reward, done)')
     info = list(spec.INFO_FIELDS)
@@ -388,10 +476,25 @@ def build(out, header):
 _MODULE = None
 
 
+def check_interpreter(total=None):
+    """Refuse an interpreter whose sum() of floats is not compensated. The oracle sums floats with sum() where they
+    reach a compared value (free-play-v1's pay: the fractional level gains over S), and CPython sums floats with
+    Neumaier's compensation since 3.12, plainly before; the C twin mirrors the compensated sum (sim/native/pysum.h), so
+    under a plain sum() the two engines' pay would differ in its last bits with no other error. The probe: 1e16 + 1.0
+    rounds the 1.0 away, which only the compensation keeps. total: the sum to probe (default: the builtin, looked up
+    at the call)."""
+    if (sum if total is None else total)([1e16, 1.0, -1e16]) != 1.0:
+        raise RuntimeError(f'this interpreter (Python {sys.version.split()[0]}) adds floats in sum() plainly, not '
+                           "with the compensation of CPython 3.12 and later that the C twin mirrors (sim/native/pysum.h): "
+                           "the oracle's free-play pay would differ from the C engine's; use Python 3.12 or later")
+
+
 def load():
-    """The extension module sim._native (built on first use)."""
+    """The extension module sim._native (built on first use), in an interpreter whose sum() the C twin mirrors
+    (check_interpreter)."""
     global _MODULE
     if _MODULE is None:
+        check_interpreter()
         out, header = library()
         if not out.exists():
             build(out, header)
@@ -449,14 +552,39 @@ def names_spec(table):
     return dict(rows=int(rows), dim=int(dim), digest=str(digest))
 
 
+def exporter_hash():
+    """sha256 of this tree's exporter source (sim/native_export.py), which a pack records (manifest 'exporter')."""
+    return sha256_file(EXPORTER)
+
+
+def ids_hash():
+    """sha256 of the C-side id tables a pack's rows are written against beyond the record layouts: the library's script
+    table (RsScript ids: name, Python qualname, port status, which the exporter maps the oracle's scripts through), its
+    section table (the ids a pack's sections are filed under), rs.h's integer contract (sim/native_export.py contract:
+    the enum values, flags, text keys, capacities and other #defines the exporter reads) and the declared worlds
+    (sim/world.py WORLDS, whose order numbers a layout record's world). A pack written against other ids runs other
+    scripts, texts, flags or worlds with no other error, so open_pack refuses it with no override. Not here: the ids the
+    Python side gives a pack's rows (engine.SKILLS' order, the goal tables), which the oracle hash alone covers
+    (allow_stale overrides it), and the archive's own rows, which the pack's recorded inputs pin (open_pack checks them
+    against the files a caller names, with no override)."""
+    from sim.native_export import contract
+    from sim.world import WORLDS
+    module = load()
+    table = dict(scripts=[list(row) for row in module.scripts()], sections=module.constants()['sections'],
+                 contract=contract(), declared=list(WORLDS))
+    return hashlib.sha256(json.dumps(table, sort_keys=True).encode()).hexdigest()
+
+
 def manifest(inputs=None, names=None, **extra):
     """A pack manifest's required part: format, the oracle's file and combined hashes, the record layouts' hash, the
-    exporter's input hashes (input_hashes: archive meta, pools) and the name table its STR_ROW rows come from (a
-    NameTable, or None for a pack without name rows); `extra` adds exporter fields (counts, version)."""
+    exporter (its version and this tree's exporter_hash) and the id tables' hash (ids_hash), the exporter's input hashes
+    (input_hashes: archive meta, pools) and the name table its STR_ROW rows come from (a NameTable, or None for a pack
+    without name rows); `extra` adds exporter fields (counts)."""
+    from sim.native_export import EXPORT_VERSION
     hashes = oracle_hashes()
     return dict(format=PACK_FORMAT, version=PACK_VERSION, oracle=hashes, oracle_hash=oracle_hash(hashes),
-                layout_hash=layout_hash(), inputs=dict(inputs or {}),
-                names=None if names is None else names_spec(names), **extra)
+                layout_hash=layout_hash(), exporter=dict(version=EXPORT_VERSION, sha256=exporter_hash()), ids=ids_hash(),
+                inputs=dict(inputs or {}), names=None if names is None else names_spec(names), **extra)
 
 
 class PackWriter:
@@ -572,22 +700,35 @@ def compare_digests(mine, other):
 
 
 def open_pack(path, allow_stale=False, names=None, inputs=None):
-    """The extension's Pack over `path`, refused when its oracle or record layouts differ from this tree's (an
-    explicit allow_stale accepts a stale oracle, never other layouts), when its names-v1 rows come from another table
-    than `names` (default rl.names.name_table(), the one the Python projection reads), and when a recorded input
-    differs from the file `inputs` ({name: path}) names. The last two have no override: a pack with other rows or
-    inputs gives other observations than CpuBatch with no error."""
+    """The extension's Pack over `path`, refused (a ValueError that names the file) when the reader refuses it (a record
+    section of another struct size, a damaged file), when its record layouts or id tables (ids_hash) differ from this
+    tree's, when its oracle or its exporter's source (exporter_hash) differs (an explicit allow_stale accepts a stale
+    oracle and exporter, never other layouts or ids), when its names-v1 rows come from another table than `names`
+    (default rl.names.name_table(), the one the Python projection reads), and when a recorded input differs from the file
+    `inputs` ({name: path}) names. The last two have no override: a pack with other rows or inputs gives other
+    observations than CpuBatch with no error."""
     module = load()
-    pack = module.Pack(str(path))
+    try:
+        pack = module.Pack(str(path))
+    except module.Error as error:  # the reader's refusal (another struct size, a damaged file), named by its file
+        raise ValueError(f'{path}: {as_python(error)}; export it again') from error
     meta = json.loads(pack.manifest)
     if meta.get('format') != PACK_FORMAT:
         raise ValueError(f'{path}: format {meta.get("format")!r}, not {PACK_FORMAT}')
     if meta.get('layout_hash') != layout_hash():
         raise ValueError(f'{path} was written against other record layouts; export it again')
+    if meta.get('ids') != ids_hash():
+        raise ValueError(f'{path} was written against other ids (the script or section table, rs.h\'s contract or the '
+                         'declared worlds); export it again')
     if meta.get('oracle_hash') != oracle_hash() and not allow_stale:
         current = oracle_hashes()
         changed = sorted(k for k in current if meta.get('oracle', {}).get(k) != current[k])
         raise ValueError(f'{path} was exported from another oracle ({changed}); export it again or pass allow_stale')
+    exporter = meta.get('exporter') or {}
+    if exporter.get('sha256') != exporter_hash() and not allow_stale:
+        raise ValueError(f'{path} was exported by another exporter ({exporter.get("version")}, source '
+                         f'{str(exporter.get("sha256"))[:12]}, not {exporter_hash()[:12]}); export it again or pass '
+                         'allow_stale')
     rows = module.constants()['sections']['STR_ROW'] in {row[0] for row in pack.sections()}
     if rows and meta.get('names') is None:
         raise ValueError(f'{path} has names-v1 rows but does not record their name table; export it again')
@@ -666,25 +807,43 @@ def as_python(error, pack=None):
 
 
 # ---- the batch ------------------------------------------------------------------------------------------------------
-START_KINDS = ('short', 'combat', 'supply')  # rs.h RS_START_*
+START_KINDS = ('short', 'combat', 'supply', 'village')  # rs.h RS_START_*
 LAYOUT_KINDS = ('compact', 'supply', 'variant')  # rs.h RS_LAYOUT_*
 
 
 def compact_layouts(pack):
-    """(seed, declared world) of a Pack's compact pool layouts in pool order, from its LAYOUTS records: the world is the
-    first declared one of the record's size, as sim/world.py world_of reads a layout's. A generator: the section is read
-    when iterated."""
+    """(seed, declared world) of a Pack's compact pool layouts in pool order, from its LAYOUTS records: the world each
+    record names (RsLayoutRec.world: 1 + its sim/world.py WORLDS index), which the exporter writes from world_of of the
+    layout built as its pool's class, as CpuBatch reads it. A generator: the section is read when iterated."""
     from sim.world import WORLDS
-    records = np.frombuffer(pack.section(load().constants()['sections']['LAYOUTS']), record_dtype('RsLayoutRec'))
+    names, sid = list(WORLDS), load().constants()['sections']['LAYOUTS']
+    if sid not in {row[0] for row in pack.sections()}:  # a pack of no layouts (a test pack) holds none
+        return
+    records = np.frombuffer(pack.section(sid), record_dtype('RsLayoutRec'))
     records = records[records['kind'] == LAYOUT_KINDS.index('compact')]
     for r in records[np.argsort(records['pool_index'], kind='stable')]:
-        size = (int(r['W']), int(r['H']))
-        yield int(r['seed']), next((name for name, spec in WORLDS.items() if spec['size'] == size), None)
+        yield int(r['seed']), names[int(r['world']) - 1]
+
+
+
+def village_world(declared):
+    """The village world (sim/combat.py VILLAGES key) that plays layouts of this declared world, or None: village_of's
+    rule on a record's world name."""
+    from sim.combat import VILLAGES
+    return next((name for name, v in VILLAGES.items() if v['layouts'] == declared), None)
 
 
 def fields(n):
     from sim.workers import fields as worker_fields
     return worker_fields(n)
+
+
+def free_fields(n, shapes):
+    """The arrays a free-play batch writes (bind): the training workers' own table, sim/workers.py fields(n, shapes,
+    last_obs=True), which allocates their shared buffer: obs/<key> and last_obs/<key> in the batch's table (obs-v6's),
+    the info fields, made, kills, facts, reward, done and action."""
+    from sim.workers import fields as worker_fields
+    return worker_fields(n, shapes, last_obs=True)
 
 
 def decode_start(raw):
@@ -696,7 +855,12 @@ def decode_start(raw):
     start = dict(layout=raw['layout'], tile=(raw['tile_x'], raw['tile_z']), weapon=START_WEAPONS[raw['weapon']],
                  levels=dict(zip(START_LEVELS, raw['levels'])), world_seed=raw['world_seed'])
     kind = START_KINDS[raw['kind']]
-    if kind == 'combat':
+    if kind == 'village':  # draw_village's dict (sim/combat.py) and draw_life's length (sim/vec.py _episode)
+        start['village'] = dict(group=GROUPS[raw['group']], hp=raw['hp'], food=[COMBAT['food'][k] for k in raw['food']],
+                                worn=bool(raw['worn']), muggers=list(zip(raw['mugger_x'], raw['mugger_z'])),
+                                placed=bool(raw['placed']))
+        start['length'] = raw['length']
+    elif kind == 'combat':
         start['combat'] = dict(group=GROUPS[raw['group']], hp=raw['hp'], food=[COMBAT['food'][k] for k in raw['food']],
                                worn=bool(raw['worn']), muggers=list(zip(raw['mugger_x'], raw['mugger_z'])))
     elif kind == 'supply':
@@ -710,18 +874,24 @@ def encode_start(start):
     from sim.combat import COMBAT, GROUPS
     from sim.search import SUPPLY
     from sim.spec import START_LEVELS, START_WEAPONS
-    raw = dict(kind=START_KINDS.index('combat' if 'combat' in start else 'supply' if start.get('supply') else 'short'),
+    kind = 'village' if 'village' in start else 'combat' if 'combat' in start else 'supply' if start.get('supply') else 'short'
+    raw = dict(kind=START_KINDS.index(kind),
                layout=int(start['layout']), tile_x=int(start['tile'][0]), tile_z=int(start['tile'][1]),
                weapon=START_WEAPONS.index(start['weapon']), levels=[int(start['levels'][s]) for s in START_LEVELS],
                world_seed=int(start['world_seed']), rec=-1)
-    if 'combat' in start:
-        c = start['combat']
+    if 'combat' in start or 'village' in start:
+        c = start.get('combat') or start['village']
         raw.update(group=GROUPS.index(c['group']), hp=int(c['hp']), food=[COMBAT['food'].index(f) for f in c['food']],
                    worn=int(bool(c['worn'])), mugger_x=[int(x) for x, _ in c['muggers']],
                    mugger_z=[int(z) for _, z in c['muggers']])
+    if 'village' in start:
+        raw.update(length=int(start['length']), placed=int(bool(start['village']['placed'])))
     if start.get('supply'):
         raw.update(grove=int(start['grove']), variant=SUPPLY['variants'].index(start['variant']))
     return raw
+
+
+UNSET = object()  # NativeBatch's goals and horizon when not given: a goal task's defaults, or free play's (CpuBatch's)
 
 
 class NativeBatch:
@@ -735,25 +905,89 @@ class NativeBatch:
     the archive and pool files the caller would load). `threads` > 1 steps the worlds on that many threads (results do
     not depend on it). Task v4 (search) is refused; v11 runs as v5 once its bindings hold (sim/combat.py
     check_bindings on the goals and the pack's compact layouts). For the equivalence harness: `trace`, `trace_rows`,
-    `begin`, `set_episode` and `external_starts` (sim/native_harness.py NativeSide)."""
+    `begin`, `set_episode` and `external_starts` (sim/native_harness.py NativeSide).
 
-    def __init__(self, pack, n, first=0, task='goal-activity-v5', goals=None, horizon=None, cfg=None, allow_stale=False,
-                 inputs=None, threads=1):
+    task='free-play-v1' is CpuBatch's free-play batch (sim/vec.py, sim/task.py FreePlayEpisode): the lives of the
+    village world that the pack's compact records declare (village-world-v1 Stage A on compact-world-v1 layouts,
+    village-world-v2 on its own: each record names its world), obs-v6 observations, `xp_rate` (1 or 25; None: 1) and,
+    with no default, `muggers` (True or False; False in village-world-v2) and `life` (sim/task.py check_life); CpuBatch's
+    check_village runs over the archive content the pack's manifest records; `horizon` and `goals` keep CpuBatch's
+    defaults and `cfg` defaults to free_play_cfg. It refuses what CpuBatch refuses, here at build where CpuBatch's World
+    and FreePlayEpisode refuse at the first life: an XP rate that is not a plain int, and agent limits that could cut the
+    longest life. Its step's info has goal -1 and info['last_obs'] (each ended life's last observation, zero elsewhere);
+    it binds free_fields(n, shapes): obs/<key> and last_obs/<key> in obs-v6's table. `observation` and `shapes` name
+    the table of every batch; `xp_rate`, `muggers`, `life` and `world` are free play's. `world` is CpuBatch's: the
+    village world (sim/combat.py VILLAGES) that the pool's layouts declare, held as the batch's `world` (None for a goal
+    task); when it is given it must be that one. A goal task is played on compact-world-v1 layouts only: on a pack of
+    village-world-v2's it is refused (native only; CpuBatch plays the goal tasks on v2 layouts)."""
+
+    def __init__(self, pack, n, first=0, task='goal-activity-v5', goals=UNSET, horizon=UNSET, cfg=None, allow_stale=False,
+                 inputs=None, threads=1, xp_rate=None, muggers=None, life=None, world=None):
         from baseline import config
         from baseline.resource_task import GOALS
+        from obs import OBSERVATION
         from sim import agent
-        from sim.combat import check_bindings, task_spec
-        from sim.spec import HORIZON_TICKS, goal_set, slot_goal
+        from sim.combat import VILLAGE, VILLAGES, check_bindings, check_village, task_spec
+        from sim.spec import HORIZON_TICKS, OBSERVATIONS, goal_set, slot_goal
+        from sim.task import FREE_PLAY, check_life, free_play_cfg
+        if n < 1 or first < 0:  # rs_batch_new's rule, raised as CpuBatch's ValueError for n = 0 (at its reset)
+            raise ValueError(f'a batch needs n >= 1 worlds, first >= 0: n {n!r}, first {first!r}')
         if task not in TASKS:
             raise ValueError(f'the native engine runs {sorted(TASKS)}, not {task}')
-        self.spec = task_spec(task)
-        horizon = HORIZON_TICKS if horizon is None else horizon
-        if self.spec['combat'] and horizon != HORIZON_TICKS:
-            raise ValueError(f'{task} keeps the gathering goals\' {HORIZON_TICKS}-tick horizon')
-        goals = goal_set(GOALS if goals is None else goals)
-        cfg = dict(cfg or config.TASK_CFG)
+        self.free = task == FREE_TASK
         self.pack = pack if isinstance(pack, load().Pack) else open_pack(pack, allow_stale, inputs=inputs)
-        check_bindings(self.spec, compact_layouts(self.pack), goals)
+        life_cfg = dict(life_kind=0, life_lo=0, life_hi=0)
+        self.world = None
+        if self.free:  # CpuBatch's checks, in its order (sim/vec.py), then its first life's (World, FreePlayEpisode)
+            goals, horizon = GOALS if goals is UNSET else goals, HORIZON_TICKS if horizon is UNSET else horizon
+            if horizon != HORIZON_TICKS or tuple(goals) != GOALS:
+                raise ValueError(f'{task} has no goal, no goal horizon and no search pool')
+            if type(muggers) is not bool:
+                raise ValueError(f"{VILLAGE['version']} Stage A places muggers or not: pass muggers=True or False")
+            declared = [name for _, name in compact_layouts(self.pack)]
+            found = {village_world(name) for name in declared}
+            if len(found) != 1 or None in found:
+                worlds = ', '.join(f"{name} on {v['layouts']}" for name, v in VILLAGES.items())
+                raise ValueError(f'{task} plays the layouts of one village world ({worlds}), not {sorted(set(declared))}')
+            self.world = found.pop()
+            if world is not None and world != self.world:
+                raise ValueError(f'the pool holds {self.world} layouts, not {world!r}')
+            # check_village over the archive the pack was exported from (its manifest's content keys)
+            content = json.loads(self.pack.manifest).get('content') or []
+            check_village(VILLAGES[self.world], SimpleNamespace(meta=dict(content=dict.fromkeys(content))), muggers)
+            self.spec, self.muggers = dict(combat=False, search=False, supply=False), muggers
+            self.xp_rate = FREE_PLAY['xp_rates'][0] if xp_rate is None else xp_rate
+            if self.xp_rate not in FREE_PLAY['xp_rates']:
+                raise ValueError(f"a free-play XP rate is one of {FREE_PLAY['xp_rates']}, not {xp_rate!r}")
+            if life is None:
+                raise ValueError(f"{task}'s life-length distribution is a setting with no default: pass life")
+            self.life = check_life(life)
+            life_cfg = dict(life_kind=int(self.life[0] == 'uniform'), life_lo=self.life[1], life_hi=self.life[-1])
+            self.observation = FREE_PLAY['observation']
+            cfg = free_play_cfg() if cfg is None else cfg
+            if type(self.xp_rate) is not int:  # World's check (sim/engine.py), at CpuBatch's first life
+                raise ValueError(f'xp_rate {self.xp_rate!r}: a positive whole multiplier')
+            limits = dict(cfg or config.TASK_CFG)  # FreePlayEpisode's check against the longest life
+            if limits.get('maxEpisodeTicks', 0) < life_cfg['life_hi'] + 2 * agent.DECISION_WAIT_TICKS or \
+                    limits.get('maxDecisions', 0) < life_cfg['life_hi']:
+                raise ValueError('agent limits that could cut a free-play life (free_play_cfg)')
+            horizon, goals, rate = HORIZON_TICKS, goal_set(GOALS), self.xp_rate
+        else:
+            from sim.engine import XP_RATE
+            if (xp_rate, muggers, life, world) != (None, None, None, None):
+                raise ValueError(f'xp_rate, muggers, life and world are {FREE_TASK} settings, not {task}\'s')
+            if {village_world(name) for _, name in compact_layouts(self.pack)} - {VILLAGE['version'], None}:
+                raise ValueError('the native engine plays the goal tasks on compact-world-v1 layouts only')
+            self.spec = task_spec(task)
+            goals, horizon = None if goals is UNSET else goals, None if horizon is UNSET else horizon
+            horizon = HORIZON_TICKS if horizon is None else horizon
+            if self.spec['combat'] and horizon != HORIZON_TICKS:
+                raise ValueError(f'{task} keeps the gathering goals\' {HORIZON_TICKS}-tick horizon')
+            goals = goal_set(GOALS if goals is None else goals)
+            check_bindings(self.spec, compact_layouts(self.pack), goals)
+            self.observation, rate = OBSERVATION, XP_RATE
+        self.shapes = OBSERVATIONS[self.observation]
+        self.cfg = cfg = dict(cfg or config.TASK_CFG)
         self.n, self.first, self.horizon, self.task = n, first, horizon, task
         self.goals = [slot_goal(goals, first + b) for b in range(n)]
         # the agent's cfg as Agent._login copies it, with agent.py's defaults for absent keys (truncated, pace_ticks)
@@ -761,9 +995,11 @@ class NativeBatch:
             task=TASKS[task], n=n, first=first, n_goals=len(goals), goal=GOALS.index(goals[0]), horizon=horizon,
             pace_jitter=cfg.get('paceJitterTicks', 0), decision_points=int(bool(cfg.get('decisionPoints'))),
             max_decisions=cfg.get('maxDecisions', agent.MAX_DECISIONS),
-            max_episode_ticks=cfg.get('maxEpisodeTicks', agent.MAX_EPISODE_TICKS), threads=int(threads)), log1p_table())
+            max_episode_ticks=cfg.get('maxEpisodeTicks', agent.MAX_EPISODE_TICKS), threads=int(threads),
+            xp_rate=rate, muggers=int(bool(muggers)), **life_cfg), log1p_table())
         self.key, self.views, self.evidence = None, None, []
-        self.bind({name: np.zeros(shape, kind) for name, (shape, kind) in fields(n).items()})
+        table = free_fields(n, self.shapes) if self.free else fields(n)
+        self.bind({name: np.zeros(shape, kind) for name, (shape, kind) in table.items()})
 
     def bind(self, views):
         """Write into these arrays from now on: sim/workers.py fields(n) names, shapes and dtypes, C-contiguous."""
@@ -775,28 +1011,56 @@ class NativeBatch:
         try:
             method(*args)
         except load().Error as error:
+            from sim.engine import Unsupported
             exception = as_python(error, self.pack)
             exception.world = error.args[5]
+            if isinstance(exception, Unsupported) and 0 <= exception.world < self.n:
+                self._setup_evidence(exception.world, exception)
             raise exception from None
 
-    def _fill_late(self):
-        """Write each world's late log1p features (log1p_feature) into its observation row of the bound arrays."""
-        for b, off, k, count in self._batch.late():
-            name, start, _ = next(entry for entry in _obs_layout() if entry[1] <= off < entry[1] + entry[2])
-            self.views[f'obs/{name}'][b].flat[(off - start) // 4] = log1p_feature(k, count)
+    def _setup_evidence(self, b, error):
+        """CpuBatch._start's evidence row for world b's setup that reached unsupported content (a step's Unsupported is
+        flagged, never raised, so a raised one is a setup's: reset, an auto-reset or begin): the start as drawn, its
+        layout seed, the slot's episode counter, then the call raises it."""
+        raw = self._batch.start(b)
+        self.evidence.append(dict(reason=str(error), world=self.first + b, key=self.key, episode=self._batch.episodes()[b],
+                                  start=None if raw is None or raw['seed'] is None else decode_start(raw),
+                                  seed=None if raw is None else raw['seed'], setup=True, decision=0, tick=None,
+                                  action=None))
 
-    def check(self):
+    def _fill_late(self, last=False):
+        """Write each world's late log1p features (log1p_feature) into its observation row of the bound arrays (with
+        `last`, its last_obs row's). An obs-v6 key holds its obs-v5 key's values from the same place; task_vec, the one
+        key obs-v6 shortens (its decision count is dropped), holds no log1p feature, so a late one there is refused."""
+        for b, off, k, count in (self._batch.late_last() if last else self._batch.late()):
+            name, start, _ = next(entry for entry in _obs_layout() if entry[1] <= off < entry[1] + entry[2])
+            if name == 'task_vec':
+                raise RuntimeError(f'a late log1p feature in task_vec (byte {off}), which holds none')
+            self.views[f'{"last_obs" if last else "obs"}/{name}'][b].flat[(off - start) // 4] = log1p_feature(k, count)
+
+    def check(self, step=False):
         """CpuBatch._stack's check_batch on the written observations, with its ValueErrors: the keys, shapes and dtypes
         are the bound arrays' (bind checks them against sim/spec.py), and the value checks (finite floats, a 0/1 mask
-        with a legal action in every row) run in C over those arrays (rs_batch_check)."""
-        from sim.spec import OBSERVATION_SHAPES
+        with a legal action in every row) run in C over those arrays (rs_batch_check). With `step`, free play's
+        last_obs too, as sim/workers.py _write checks a CpuBatch reply, here in Python over the bound arrays: finite
+        floats in every ended life's row, and a legal action in the row of each life cut by its length."""
         bad = self._batch.check()
-        if bad is None:
+        if bad is not None:
+            names = list(self.shapes)
+            if bad < len(names):
+                raise ValueError(f'{names[bad]}: non-finite values')
+            raise ValueError('invalid or all-empty action mask')
+        if not (step and self.free):
             return
-        names = list(OBSERVATION_SHAPES)
-        if bad < len(names):
-            raise ValueError(f'{names[bad]}: non-finite values')
-        raise ValueError('invalid or all-empty action mask')
+        from sim.spec import TERMINAL_HORIZON
+        ended = np.flatnonzero(self.views['done'])
+        for name in self.shapes:
+            value = self.views[f'last_obs/{name}'][ended]
+            if value.dtype.kind == 'f' and not np.isfinite(value).all():
+                raise ValueError(f'last_obs {name}: non-finite values')
+        cut = self.views['info/terminal'] == TERMINAL_HORIZON
+        if not self.views['last_obs/mask'][cut].any(-1).all():
+            raise ValueError('the last observation of a life cut by its length offers no legal action')
 
     def _record_failures(self):
         """CpuBatch.step's evidence rows for the worlds this step flagged unsupported."""
@@ -812,15 +1076,17 @@ class NativeBatch:
 
     def observations(self):
         """Copies of the bound observation arrays."""
-        from sim.spec import OBSERVATION_SHAPES
-        return {name: self.views[f'obs/{name}'].copy() for name in OBSERVATION_SHAPES}
+        return {name: self.views[f'obs/{name}'].copy() for name in self.shapes}
 
     def outputs(self):
-        """step's return value from the bound arrays (copies): state, obs, reward, done, info."""
+        """step's return value from the bound arrays (copies): state, obs, reward, done, info (free play: with
+        last_obs)."""
         from sim.spec import INFO_FIELDS
         info = {name: self.views[f'info/{name}'].copy() for name in INFO_FIELDS}
         info.update(made=self.views['info/made'].copy(), kills=self.views['info/kills'].copy(),
                     facts=self.views['info/facts'].copy())
+        if self.free:
+            info['last_obs'] = {name: self.views[f'last_obs/{name}'].copy() for name in self.shapes}
         return self.state(), self.observations(), self.views['reward'].copy(), self.views['done'].copy(), info
 
     def reset_into(self, key, check=True):
@@ -843,8 +1109,10 @@ class NativeBatch:
         self._call(self._batch.step, self.views['action'])
         self._record_failures()
         self._fill_late()
+        if self.free:
+            self._fill_late(last=True)
         if check:
-            self.check()
+            self.check(step=True)
 
     def step(self, state, action):
         if state['key'] != self.key:
@@ -858,13 +1126,14 @@ class NativeBatch:
 
     @property
     def cycles(self):
-        """World cycles every world has run so far, setup ones included (sim/bench.py's tick count)."""
+        """World cycles every world has run so far, setup ones included (sim/native_bench.py's tick count)."""
         return self._batch.cycles()
 
     @property
     def starts(self):
-        """CpuBatch.starts: each world's current start (decode_start)."""
-        return [decode_start(self._batch.start(b)) for b in range(self.n)]
+        """CpuBatch.starts: each world's current start (decode_start); None before its first draw and after a draw
+        that failed, as CpuBatch's."""
+        return [None if raw is None else decode_start(raw) for raw in map(self._batch.start, range(self.n))]
 
     # ---- the equivalence harness's calls
     def trace(self, on=True, **caps):
@@ -916,6 +1185,8 @@ def main():
                                                  'divergence (sim/native_harness.py)'))
     native_harness.gate_arguments(sub.add_parser('gate', help='the release gate: every frozen case, the digests, thread '
                                                  'invariance and the soak (sim/native_harness.py)'))
+    native_harness.free_soak_arguments(sub.add_parser('free-soak', help="free-play-v1's soak: random legal play and the "
+                                                      'free-play controls in lockstep with the Python reference'))
     native_bench.add_arguments(sub.add_parser('bench', help='world ticks and decisions per second by activity, action '
                                               'source, thread count and check (sim/native_bench.py)'))
     native_bench.env_arguments(sub.add_parser('env', help='random legal play through the training workers with either '
@@ -926,6 +1197,9 @@ def main():
         return
     if args.command == 'gate':
         native_harness.gate_main(args)
+        return
+    if args.command == 'free-soak':
+        native_harness.free_soak_main(args)
         return
     if args.command == 'bench':
         native_bench.main(args)

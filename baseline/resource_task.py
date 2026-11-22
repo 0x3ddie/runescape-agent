@@ -40,6 +40,10 @@ GOAL_FAMILIES = dict(wood=frozenset((1511, 1513, 1515, 1517, 1519, 1521, 2862)),
 # (Entrana and its arena). A kill counts once per enemy life: this agent's first hit finds it at
 # full health, nobody else hits it, and this agent's hit defeats it before the task closes.
 MELEE_ENEMIES = frozenset((41, 1017))
+# The one bound on a task's horizon, in native ticks, for the goal tasks and free-play-v1's long lives (the trial's
+# 36,000 ticks, and the one life of 150,000 ticks). It was 10,000, for the goal tasks alone; budget_vec's horizon /
+# 10000 is obs-v5's scale, not this bound.
+MAX_HORIZON = 150_000
 
 
 def goal_items(report, goal, bound='retained_lower'):
@@ -65,7 +69,7 @@ def need(condition, message):
 
 class ResourceClock:
     def __init__(self, armed, horizon):
-        need(type(horizon) is int and 1 <= horizon <= 10000, 'invalid task horizon')
+        need(type(horizon) is int and 1 <= horizon <= MAX_HORIZON, 'invalid task horizon')
         need(armed.get('schema')=='native-resource-capture-v2' and armed.get('failure') is None and
              armed.get('closed') is False and armed.get('lifecycleObserved') is True,
              'invalid armed resource evidence')
@@ -139,7 +143,7 @@ observation. Neither hook is ever called to choose actions inside the rollout.
         acts_from_config(cfg)
         need(cfg.get('lifecycle','episodic-v1')=='episodic-v1' and not cfg.get('resetPrelude'),
              'resource task requires fresh first-life setup')
-        need(type(horizon) is int and 1<=horizon<=10000,'invalid task horizon')
+        need(type(horizon) is int and 1<=horizon<=MAX_HORIZON,'invalid task horizon')
         need(type(reward_scale) in (int,float) and math.isfinite(reward_scale) and reward_scale>0,'invalid task reward scale')
         need(goal is None or goal in GOALS,'invalid goal')
         # With a goal the held measure counts the goal's items, not coins (see _held).

@@ -1,9 +1,7 @@
-"""Checks of the simulator against the saved native evidence (logs/wt/act/logs/goal).
+"""Checks of the simulator against the saved native evidence.
 
     .venv-sim/bin/python -m sim.check replay --evaluations logs/native-click/fidelity --out logs/native-click/fidelity/replay.json
     .venv-sim/bin/python -m sim.check chase --evaluations logs/native-click/chase --out logs/native-click/chase/chase.json
-    .venv-sim/bin/python -m sim.check policy --runs logs/sim/runs/eval
-    .venv-sim/bin/python -m sim.check coverage
 
 `replay` re-plays each native evaluation episode (baseline.evaluate's trajectories keep every
 observation; each ran alone on a fresh world) in the simulator: the same setup, then each native
@@ -23,16 +21,8 @@ actions (the act-v1 and act-v2 evaluations under logs/wt/act/logs/goal-eval stop
 wander draws are the native ones. The player's tile must equal the native one at every tick from the ACT to the first hit or
 experience on either side (combat draws are not controlled), and natively the player must reach the npc and attack it.
 
-`policy` compares simulator evaluations (sim.run, same policies, fixtures, trial seeds and
-horizon) with the native scores, per policy and goal. The rule was fixed before any
-simulator result was read: the 90% bootstrap interval of the difference in mean return
-(simulator minus native) must lie inside +-MARGIN for "equivalent"; an interval that
-excludes 0 is "different"; anything else is "inconclusive", which is not evidence of
-equivalence. A coverage failure has no return, so it is scored both 0 and 1 and both
-bounds must pass.
-
-`coverage` reads native goal-v1 training (episodes.jsonl.gz) and counts, per quarter of each
-run, the episodes whose every decision the simulator covers by meaning (`uncovered`).
+The `policy` check (simulator evaluations against the native scores) and the `coverage` count of native goal-v1
+training are not in this tree.
 
 `mechanics` compares the compact world's mechanics with native captures of the development sites
 (the native captures' manifest; only its listed captures, their sha256 checked). Native draws are
@@ -137,72 +127,6 @@ from baseline.resource_task import GOAL_FAMILIES, GOAL_ITEMS
 from sim.audit import audit
 from sim.engine import Unsupported, World
 from sim.task import GoalEpisode
-
-NATIVE = Path('logs/wt/act/logs/goal')
-MARGIN = 0.15
-LEVEL = 0.90
-RESAMPLES = 10_000
-
-
-def bootstrap_difference(sim, native, rng):
-    sim, native = np.asarray(sim, float), np.asarray(native, float)
-    a = rng.choice(sim, (RESAMPLES, len(sim))).mean(1)
-    b = rng.choice(native, (RESAMPLES, len(native))).mean(1)
-    tail = (1 - LEVEL) / 2
-    low, high = np.quantile(a - b, [tail, 1 - tail])
-    return float(sim.mean() - native.mean()), float(low), float(high)
-
-
-def verdict(low, high):
-    if -MARGIN <= low and high <= MARGIN:
-        return 'equivalent'
-    if low > 0 or high < 0:
-        return 'different'
-    return 'inconclusive'
-
-
-def native_trials(policy, seed, goal, endpoint='k65'):
-    score = json.loads((NATIVE / f'score-s{seed}-{endpoint}.json').read_text())
-    name = f'{policy}-s{seed}' if policy != 'wait' and policy != 'random' else policy
-    block = score['goals'][f'goal_{goal}']
-    return dict(returns=block['per_trial'][name], successes=block['successes'][name], deaths=block['deaths'][name])
-
-
-def sim_trials(path):
-    result = json.loads((path / 'results.json').read_text())
-    rows = result['trials']
-    returns = [r.get('episode_return') for r in rows]
-    return dict(returns=returns, coverage=sum(r is None for r in returns), successes=result['successes'],
-                deaths=result['deaths'], completed=result['completed'])
-
-
-def policy_check(runs, out=None):
-    rng = np.random.default_rng(0)
-    rows = []
-    for path in sorted(p for p in runs.iterdir() if p.is_dir() and (p / 'results.json').exists()):
-        policy, seed, goal = path.name.split('-')
-        endpoint = policy if policy in ('k65', 'k262') else 'k65'
-        native = native_trials(policy, seed[1:], goal, endpoint)
-        sim = sim_trials(path)
-        bounds = []
-        for fill in (0.0, 1.0):
-            filled = [fill if r is None else r for r in sim['returns']]
-            bounds.append(bootstrap_difference(filled, native['returns'], rng))
-        verdicts = {verdict(low, high) for _, low, high in bounds}
-        overall = verdicts.pop() if len(verdicts) == 1 else 'inconclusive'
-        rows.append(dict(run=path.name, native_mean=float(np.mean(native['returns'])), native_successes=native['successes'],
-                         native_deaths=native['deaths'], sim_completed=sim['completed'], sim_coverage_failures=sim['coverage'],
-                         sim_successes=sim['successes'], sim_deaths=sim['deaths'],
-                         difference_if_failures_0=bounds[0], difference_if_failures_1=bounds[1], verdict=overall))
-    for r in rows:
-        d0, d1 = r['difference_if_failures_0'], r['difference_if_failures_1']
-        print(f"{r['run']:18s} native {r['native_mean']:.3f} ({r['native_successes']:2d} ok, {r['native_deaths']} dead) | "
-              f"sim {r['sim_completed']:2d} done {r['sim_coverage_failures']:2d} uncovered {r['sim_successes']:2d} ok "
-              f"{r['sim_deaths']} dead | diff [{d0[1]:+.2f},{d0[2]:+.2f}]..[{d1[1]:+.2f},{d1[2]:+.2f}] {r['verdict']}")
-    if out:
-        Path(out).write_text(json.dumps(dict(margin=MARGIN, level=LEVEL, resamples=RESAMPLES, rows=rows), indent=1) + '\n')
-    return rows
-
 
 # ---- replay ---------------------------------------------------------------------------------
 GATHERED = ('logs', 'oak_logs', 'willow_logs', 'raw_shrimp', 'raw_anchovies')
@@ -705,88 +629,6 @@ def chase(evaluations, out=None):
           f"{sum(r.get('compared', 0) for r in rows)} ticks compared, the target moved {sum(r.get('target_moves', 0) for r in rows)} times")
     if out:
         Path(out).write_text(json.dumps(dict(trials=rows, passed=len(good)), indent=1, default=str) + '\n')
-    return rows
-
-
-# ---- coverage of native training ------------------------------------------------------------------
-ACT_NOTE = re.compile(r' (loc|npc|obj)=(\d+)@\d+,\d+,(\d+)')
-USE_NOTE = re.compile(r'use (\d+) on (\d+)')
-COVERED_FAMILIES = ('wait', 'close', 'dialog', 'click', 'style', 'withdraw', 'deposit', 'page', 'use')
-
-
-def uncovered(t, meaning, note, supported):
-    """What a native training decision did that the simulator does not run, judged by its
-    meaning and the engine scripts its target's triggers name; None when covered (a continued
-    option counts where it began). Walks are not judged: leaving the area or a long route the
-    simulator cannot follow shows only when it runs."""
-    family = meaning['family']
-    if family in COVERED_FAMILIES:
-        return None
-    what = f"{meaning.get('kind', '')}:{meaning.get('name', '')}:{meaning.get('option', '')}"
-    if family == 'held':
-        hit = USE_NOTE.search(note or '')
-        if meaning.get('option') == 'Use' and (hit is None or not any(
-                t.obj_types[int(obj)]['triggers'].get('OPHELDU') for obj in hit.groups())):
-            return None
-        return f"held:{meaning.get('option', '')}"
-    if family != 'act':
-        return family
-    hit = ACT_NOTE.search(note or '')
-    if hit is None:
-        return None
-    kind, type_id, level = hit.group(1), int(hit.group(2)), int(hit.group(3))
-    if level not in t.levels:
-        return f'{what} (upper floor)'
-    ty = {'loc': t.loc_types, 'npc': t.npc_types, 'obj': t.obj_types}[kind].get(type_id)
-    if ty is None:
-        return what
-    ops = [o for o in (ty['op'] or [])]
-    option = meaning.get('option')
-    if option == 'Use' and meaning.get('item'):
-        k = 'U'
-    elif kind == 'obj':  # EngineAgent.pickUp: the first op that takes, else op 3
-        k = str(next((i for i, o in enumerate(ops) if o and 'take' in o.lower()), 2) + 1)
-    elif option in ops:
-        k = str(ops.index(option) + 1)
-    else:
-        return what
-    base = kind.upper()
-    op, ap = ty['triggers'].get(f'OP{base}{k}'), ty['triggers'].get(f'AP{base}{k}')
-    if (op or ap or k == 'U') and (op is None or op in supported) and (ap is None or ap in supported):
-        return None
-    return what
-
-
-def coverage(seeds, supported=None, out=None):
-    """Native goal-v1 training episodes that use only simulated content, by quarter of training."""
-    from sim.engine import SCRIPTS
-    t = Tables.load()
-    supported = set(SCRIPTS) if supported is None else set(supported)
-    rows = {}
-    for seed in seeds:
-        episodes, current = [], Counter()
-        with gzip.open(NATIVE / seed / 'episodes.jsonl.gz', 'rt') as stream:
-            for line in stream:
-                r = json.loads(line)
-                if r['kind'] == 'effect':
-                    missing = uncovered(t, r['meaning'], r.get('action_note'), supported)
-                    if missing:
-                        current[missing] += 1
-                elif r['kind'] == 'episode_measures':
-                    episodes.append(current)
-                    current = Counter()
-        n = len(episodes)
-        quarters = [episodes[q * n // 4:(q + 1) * n // 4] for q in range(4)]
-        shares = [sum(not e for e in part) / len(part) for part in quarters]
-        touching = Counter(k for e in episodes for k in e)
-        early = Counter(k for e in quarters[0] for k in e)
-        rows[seed] = dict(episodes=n, covered=[sum(not e for e in part) for part in quarters],
-                          per_quarter=[len(part) for part in quarters], shares=shares,
-                          first_quarter_touching=dict(early.most_common(20)), touching=dict(touching.most_common(30)))
-        print(f"{seed}: {n} episodes; covered by quarter " + ', '.join(f'{s:.0%}' for s in shares))
-        print('  first quarter, episodes touching: ' + ', '.join(f'{k} {v}' for k, v in early.most_common(10)))
-    if out:
-        Path(out).write_text(json.dumps(rows, indent=1) + '\n')
     return rows
 
 
@@ -1489,9 +1331,6 @@ def z_report(pairs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='check', required=True)
-    p = sub.add_parser('policy', help='simulator evaluations against the native scores')
-    p.add_argument('--runs', type=Path, required=True)
-    p.add_argument('--out', type=Path)
     r = sub.add_parser('replay', help='native evaluation episodes replayed by meaning')
     r.add_argument('--evaluations', type=Path, required=True, help='the directory of act-v3 evaluations')
     r.add_argument('--pattern', default='*', help='evaluation directories under --evaluations')
@@ -1507,18 +1346,11 @@ def main():
     cb = sub.add_parser('combat', help='sustained-combat-v1 mechanics against native captures (rules C1-C6)')
     cb.add_argument('--manifest', type=Path, required=True)
     cb.add_argument('--out', type=Path)
-    c = sub.add_parser('coverage', help='native training episodes that use only simulated content, by quarter')
-    c.add_argument('--seeds', nargs='+', default=['s101', 's202', 's303'], help='runs under logs/wt/act/logs/goal')
-    c.add_argument('--out', type=Path)
     args = parser.parse_args()
-    if args.check == 'policy':
-        policy_check(args.runs, args.out)
-    elif args.check == 'replay':
+    if args.check == 'replay':
         replay(args.evaluations, args.pattern, args.out, args.limit, args.held_out)
     elif args.check == 'chase':
         chase(args.evaluations, args.out)
-    elif args.check == 'coverage':
-        coverage(args.seeds, out=args.out)
     elif args.check == 'mechanics':
         print(json.dumps(mechanics(args.manifest, args.out), indent=1, default=str))
     elif args.check == 'combat':

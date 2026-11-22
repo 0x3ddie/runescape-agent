@@ -2,7 +2,8 @@
 // during ordinary GPU collection. Telemetry is out-of-band, not policy input.
 import { Worker } from 'worker_threads';
 import { nativeResourceHttp } from './engine/resource-capture-native';
-import { demoSettings } from './core/spectator';
+import { demoSettings, viewRequests } from './core/spectator';
+import { activeProfile } from './engine/tick-profile';
 import { actorCount, installNativeSpectator, type RouteOf } from './engine/spectator-native';
 import World from '../vendor/rs-sdk/server/engine/src/engine/World.js';
 import Environment from '../vendor/rs-sdk/server/engine/src/util/Environment.js';
@@ -10,8 +11,13 @@ import TcpServer from '../vendor/rs-sdk/server/engine/src/server/tcp/TcpServer.j
 import { startWeb, startManagementWeb } from '../vendor/rs-sdk/server/engine/src/web.js';
 import OpLocHandler from '../vendor/rs-sdk/server/engine/src/network/game/client/handler/OpLocHandler.js';
 import MoveClickHandler from '../vendor/rs-sdk/server/engine/src/network/game/client/handler/MoveClickHandler.js';
+import { isZoneAllocated } from '../vendor/rs-sdk/server/engine/src/engine/GameMap.js';
 
-export async function startDemoServices(routeOf?: RouteOf): Promise<void> {
+/**
+ * shared: a shared world's id and capacity (engine-env RL_SHARED_AGENTS), whose demo spectator takes a view
+ * (core/spectator.ts) by POST /demo-view; null in a one-agent world, which refuses one.
+ */
+export async function startDemoServices(routeOf?: RouteOf, shared: { id: string; capacity: number } | null = null): Promise<void> {
     if (Environment.node.production) throw new Error('demo services require a local non-production world');
     const port = Number(process.env.RL_TELEMETRY_PORT ?? 43610);
     if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('invalid telemetry port');
@@ -19,6 +25,10 @@ export async function startDemoServices(routeOf?: RouteOf): Promise<void> {
     // A demo world's watching login (scripts/stack.py --demo-spectator), hooked before any client connects.
     const demo = demoSettings(process.env);
     const spectator = demo ? installNativeSpectator(demo.spectator, routeOf) : null;
+    // A shared demo world's view, from its command or a request (core/spectator.ts viewRequests): a tile with no map
+    // (isZoneAllocated, which Player.teleport checks) is refused.
+    const setView = viewRequests(spectator, shared, tile => isZoneAllocated(tile.level, tile.x, tile.z), () => World.currentTick,
+        line => console.log(`[demo-services] ${line}`));
     // Diagnostics never enter observations sent to the policy. Preserve original
     // handler arguments/result and retain only a bounded ring of dispatch facts.
     const interactionEvents: object[] = [];
@@ -60,7 +70,9 @@ export async function startDemoServices(routeOf?: RouteOf): Promise<void> {
     Bun.serve({
         hostname: '127.0.0.1', port,
         fetch(req) {
-            if (new URL(req.url).pathname === '/resource-capture') return resourceCapture(req);
+            if (new URL(req.url).pathname === '/resource-capture')
+                return activeProfile ? activeProfile.time('http:resource-capture', () => resourceCapture(req)) : resourceCapture(req);
+            if (new URL(req.url).pathname === '/demo-view' && req.method === 'POST') return setView(req);
             if (req.method !== 'GET' || new URL(req.url).pathname !== '/status') {
                 return new Response('not found', { status: 404 });
             }

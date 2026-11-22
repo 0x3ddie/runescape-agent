@@ -56,7 +56,37 @@ export const A_USE0 = 76;
 export const A_CLICK_HIGH = 84;
 export const N_CLICK = 24;
 
-// DROP becomes legal only under inventory pressure (see buildMask).
+// act-v4 (item-v4's page): rows 0..95 keep act-v3's meaning exactly, and 32 rows follow for entries 8..15 of the four
+// families that point at a page entry, so each of those families lies in two groups of rows, as the clicks do (17..28
+// and 84..95):
+//   96..103   HELD_8..15     pack options of heldSel[8..15]
+//   104..111  DROP_8..15     drop invSel[8..15]
+//   112..119  DEPOSIT_8..15  bank invSel[8..15], with the bank open
+//   120..127  USE_8..15      pick invSel[8..15] to use
+// Withdrawals (the bank's page of 8), the 16 nearby targets and the 24 clicks do not change.
+export const ACT_V4 = 'act-v4';
+export const N_ACTIONS_V4 = 128;
+export const N_PAGE_V4 = 16; // entries of item-v4's page and of its pack options
+const PAGE_FAMILIES: ReadonlyArray<[number, number]> = [[A_HELD0, 96], [A_DROP0, 104], [A_DEPOSIT0, 112], [A_USE0, 120]];
+
+/** act-v4's row of entry k (0..15) of the page family whose first act-v3 row is `base` (A_HELD0, A_DROP0, A_DEPOSIT0
+ * or A_USE0): base + k for entries 0..7, the family's second group for entries 8..15. */
+export function pageRow(base: number, k: number): number {
+    const group = PAGE_FAMILIES.find(([first]) => first === base);
+    if (!group || !Number.isInteger(k) || k < 0 || k >= N_PAGE_V4) throw new Error(`no act-v4 row for ${base} entry ${k}`);
+    return k < N_INV_SEL ? base + k : group[1] + k - N_INV_SEL;
+}
+
+/** The page family (its first act-v3 row) and entry of an act-v4 row of one of the four page families, or null. */
+export function pageEntry(action: number): { base: number; k: number } | null {
+    for (const [base, second] of PAGE_FAMILIES) {
+        if (action >= base && action < base + N_INV_SEL) return { base, k: action - base };
+        if (action >= second && action < second + N_INV_SEL) return { base, k: N_INV_SEL + action - second };
+    }
+    return null;
+}
+
+// DROP becomes legal only under inventory pressure (see buildMask; mask-v5 and before).
 export const DROP_MIN_STACKS = 24;
 
 // Tools the agent needs to earn anything are never dropped: a dropped tool ends every

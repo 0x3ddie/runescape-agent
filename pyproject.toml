@@ -14,12 +14,13 @@ exclude = ["*/tests/*"]
 min_confidence = 60
 # Called or read by Stable-Baselines3 or the OS, not by our code; the action table mirrors env-ts/core/actions.ts and
 # keeps every slot named; NAMES_V1 names the names contract. Test instruments kept beside the code they check:
-# sim/learn.py's host collector and host-read counter (sim/tests/test_learn.py), sim/paths.py's packed route
-# (sim/tests/test_paths.py) and baseline/world.py's evidence-log reader (baseline/tests). CpuWorkers.startup_seconds is
-# the workers' measured start time, kept for benchmarks.
+# sim/learn.py's host collector and host-read counter (sim/tests/test_learn.py) and baseline/world.py's evidence-log
+# reader (baseline/tests). health_pay: a model attribute SB3 saves with every checkpoint, read by its name (sim/train.py
+# LEG_SAME, sim/watch.py VERSION_SAVES). IMPL: sim/paths.py's name of the path finder in use, read by nothing since
+# sim/bench.py's removal; sim/paths.py is an ORACLE file (sim/native.py), so it stays.
 ignore_names = [
     "step_async", "get_attr", "set_attr", "env_method", "env_is_wrapped", "method_name", "wrapper_class",
     "render_mode", "make_features_extractor", "_get_action_dist_from_latent", "target_kl", "gae_lambda", "learning_rate",
     "_on_step", "_on_rollout_start", "_on_rollout_end", "_on_training_start", "_on_training_end", "frame", "exc", "flags", "A_*",
-    "NAMES_V1", "HostVecEnv", "HostReads", "read_jsonl", "packed", "startup_seconds",
+    "NAMES_V1", "HostVecEnv", "HostReads", "read_jsonl", "health_pay", "IMPL",
 ]

@@ -45,10 +45,45 @@ struct RsPool {
 };
 
 /* ---- output rows ------------------------------------------------------------------------------------------------ */
+/* obs-v6's arrays of a packed row (rs_gen.h RS_OBS6_*): each its obs-v5 key's bytes from RS_OBS6_SKIP on (task_vec
+   without its decision count), prog_vec followed by the progress block. */
+static void write_obs6(void *const *arrays, int32_t i, const uint8_t *row) {
+    for (int k = 0; k < RS_OBS6_N_KEYS; k++) {
+        uint8_t *to = (uint8_t *)arrays[k] + (size_t)i * (size_t)RS_OBS6_NBYTES[k];
+        int src = RS_OBS6_SRC[k];
+        if (k == RS_OBS6_PROG_VEC) {
+            memcpy(to, row + RS_OBS_OFFSET[src], (size_t)RS_OBS_NBYTES[src]);
+            memcpy(to + RS_OBS_NBYTES[src], row + RS_OBS_PROGRESS_OFF, (size_t)RS_OBS6_NBYTES[k] - RS_OBS_NBYTES[src]);
+        } else {
+            memcpy(to, row + RS_OBS_OFFSET[src] + RS_OBS6_SKIP[k], (size_t)RS_OBS6_NBYTES[k]);
+        }
+    }
+}
+_Static_assert(RS_OBS6_PROG_VEC >= 0 && RS_OBS_PROGRESS_N * 4 + RS_OBSV_PROG_VEC * 4 == RS_OBSV_PROG_VEC_V6 * 4,
+               "obs-v6 prog_vec is obs-v5's followed by the progress block");
+
 static void write_obs(const RsOut *out, int32_t i, const uint8_t *row) {
+    if (out->v6) {
+        write_obs6(out->obs6, i, row);
+        return;
+    }
     for (int k = 0; k < RS_OBS_N_KEYS; k++)
         memcpy((uint8_t *)out->obs[k] + (size_t)i * (size_t)RS_OBS_NBYTES[k], row + RS_OBS_OFFSET[k],
                (size_t)RS_OBS_NBYTES[k]);
+}
+
+/* free-play-v1's info['last_obs'] row of world i: the observation at the life's end when this step ended it (and its
+   late features kept for NativeBatch), else zero. */
+static void write_last(const RsOut *out, int32_t i, RsSlot *s, int done) {
+    s->has_last = (uint8_t)done;
+    s->n_late_last = done ? s->n_late : 0;
+    if (done) {
+        memcpy(s->late_last, s->late, (size_t)s->n_late * sizeof *s->late);
+        write_obs6(out->last6, i, s->obs);
+        return;
+    }
+    for (int k = 0; k < RS_OBS6_N_KEYS; k++)
+        memset((uint8_t *)out->last6[k] + (size_t)i * (size_t)RS_OBS6_NBYTES[k], 0, (size_t)RS_OBS6_NBYTES[k]);
 }
 
 static void write_info(const RsOut *out, int32_t i, const RsStepInfo *f) {
@@ -88,6 +123,7 @@ static int reset_world(RsBatch *b, int32_t i, const RsOut *out, RsErr *err) {
     memset(&s->fail, 0, sizeof s->fail);
     s->fail_decision = s->fail_tick = s->fail_action = 0;
     s->n_late = 0;                     /* no row of this world is written until its episode begins */
+    s->has_last = 0, s->n_late_last = 0;
     if (b->external_starts) return 0;  /* the caller begins it (rs_batch_begin) */
     if (rs_episode_new(s, b->key)) {
         *err = s->w.err;
@@ -115,10 +151,12 @@ static int step_world(RsBatch *b, int32_t i, int32_t action, const RsOut *out, R
         info.goal = s->ep.goal;
         info.unsupported = 1;
         write_info(out, i, &info);
+        if (out->v6) write_last(out, i, s, 0);
         write_obs(out, i, s->obs);
         return 0;
     }
     write_info(out, i, &info);
+    if (out->v6) write_last(out, i, s, info.done);
     if (info.done) {
         s->episode++;
         if (!b->external_starts && rs_episode_new(s, b->key)) {
@@ -237,8 +275,29 @@ int rs_batch_new(const RsPack *P, const RsConfig *cfg, const float *log1p, RsBat
     memset(err, 0, sizeof *err);
     if (!log1p) return RS_FAIL_TEXT(err, RS_E_CONTRACT, "a batch needs the log1p feature tables");
     if (!P->str_row) return RS_FAIL_TEXT(err, RS_E_PACK, "the pack has no STR_ROW section (names-v1 rows)");
-    if (cfg->task != RS_TASK_V2 && cfg->task != RS_TASK_V3 && cfg->task != RS_TASK_V5)
-        return RS_FAIL_TEXT(err, RS_E_CONTRACT, "the native engine runs goal-activity-v2, v3 and v5");
+    if (cfg->task != RS_TASK_V2 && cfg->task != RS_TASK_V3 && cfg->task != RS_TASK_V5 && cfg->task != RS_TASK_FREE)
+        return RS_FAIL_TEXT(err, RS_E_CONTRACT, "the native engine runs goal-activity-v2, v3, v5 and free-play-v1");
+    if (cfg->task == RS_TASK_FREE
+        ? cfg->xp_rate < 1 || (cfg->muggers != 0 && cfg->muggers != 1) || cfg->life_lo < 1 || cfg->life_lo > RS_MAX_HORIZON
+          || (cfg->life_kind == RS_LIFE_UNIFORM ? cfg->life_hi < cfg->life_lo || cfg->life_hi > RS_MAX_HORIZON
+                                                : cfg->life_kind != RS_LIFE_FIXED)
+        : cfg->xp_rate != RS_ENGINE_XP_RATE || cfg->muggers || cfg->life_kind || cfg->life_lo || cfg->life_hi)
+        return RS_FAIL_TEXT(err, RS_E_CONTRACT, "free-play-v1 takes an XP rate, muggers and a life length; a goal task "
+                            "plays the engine's XP rate and has neither");
+    /* the compact pool's village world (CpuBatch: one village world's layouts; its muggers, where it holds any). A goal
+       task is played on village-world-v1's compact layouts only: on another world's it is refused (native only). */
+    int32_t village = -2, other = 0;   /* other: a record of a village world other than village-world-v1 (index 0) */
+    for (int32_t i = 0; i < P->n_compact; i++) {
+        int32_t v = P->layouts[P->compact0 + i].village;
+        other |= v > 0;
+        village = village == -2 ? v : village == v ? v : -1;
+    }
+    if (cfg->task == RS_TASK_FREE && (village < 0 || village >= RS_N_VILLAGES))
+        return RS_FAIL_TEXT(err, RS_E_CONTRACT, "free-play-v1 plays the layouts of one village world");
+    if (cfg->task == RS_TASK_FREE && cfg->muggers && !RS_VILLAGE_PLACE_MUGGERS[village])
+        return RS_FAIL_TEXT(err, RS_E_CONTRACT, RS_VILLAGE_NO_MUGGERS[village]);
+    if (cfg->task != RS_TASK_FREE && other)
+        return RS_FAIL_TEXT(err, RS_E_CONTRACT, "the native engine plays the goal tasks on compact-world-v1 layouts only");
     if (cfg->n < 1 || cfg->first < 0)
         return RS_FAIL_TEXT(err, RS_E_CONTRACT, "a batch needs n >= 1 worlds, first >= 0");
     if (!(cfg->n_goals == RS_N_GOALS || (cfg->n_goals == 1 && cfg->goal >= 0 && cfg->goal < RS_N_GOALS)))
@@ -286,6 +345,7 @@ void rs_batch_free(RsBatch *b) {
 int rs_batch_reset(RsBatch *b, int64_t key, const RsOut *out) {
     b->key = key;
     b->has_key = 1;
+    for (int32_t i = 0; i < b->n; i++) b->slots[i].has_start = 0;  /* CpuBatch.reset: starts = [None] * n */
     return run_all(b, JOB_RESET, NULL, out);
 }
 
@@ -300,20 +360,22 @@ int rs_batch_step(RsBatch *b, const int32_t *actions, const RsOut *out) {
 
 int rs_batch_check(const RsBatch *b, const RsOut *out) {
     size_t n = (size_t)b->n;
-    for (int k = 0; k < RS_OBS_N_KEYS; k++) {
-        if (RS_OBS_FORMAT[k] != 'f') continue;
-        const float *v = out->obs[k];   /* np.isfinite: |x| <= FLT_MAX, which NaN and infinities fail */
-        size_t count = n * (size_t)RS_OBS_NELEM[k];
+    int keys = out->v6 ? RS_OBS6_N_KEYS : RS_OBS_N_KEYS;   /* the batch's table (sim/spec.py OBSERVATIONS) */
+    for (int k = 0; k < keys; k++) {
+        if ((out->v6 ? RS_OBS6_FORMAT[k] : RS_OBS_FORMAT[k]) != 'f') continue;
+        const float *v = out->v6 ? out->obs6[k] : out->obs[k];   /* np.isfinite: |x| <= FLT_MAX, which NaN and
+                                                                     infinities fail */
+        size_t count = n * (size_t)(out->v6 ? RS_OBS6_NELEM[k] : RS_OBS_NELEM[k]);
         int bad = 0;
         for (size_t j = 0; j < count; j++) bad |= !(fabsf(v[j]) <= FLT_MAX);
         if (bad) return k;
     }
-    const int8_t *mask = out->obs[RS_OBS_MASK];
+    const int8_t *mask = out->v6 ? out->obs6[RS_OBS6_MASK] : out->obs[RS_OBS_MASK];
     for (size_t i = 0; i < n; i++) {
         const int8_t *row = mask + i * RS_N_ACTIONS;
         int any = 0, other = 0;
         for (int a = 0; a < RS_N_ACTIONS; a++) any |= row[a] == 1, other |= row[a] != 0 && row[a] != 1;
-        if (other || !any) return RS_OBS_N_KEYS;
+        if (other || !any) return keys;
     }
     return -1;
 }

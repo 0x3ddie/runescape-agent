@@ -247,7 +247,9 @@ int rs_npc_script_step(World *w, Npc *n, Frame *f, RsSusp *out) {
 }
 
 /* ---- lifecycle (engine.py) --------------------------------------------------------------------------- */
-/* World.npc_respawn: Npc.resetEntity(true) at the spawn; its [ai_spawn] runs in the next cycle's npc event phase. */
+/* World.npc_respawn: Npc.resetEntity(true) at the spawn; its [ai_spawn] runs in the next cycle's npc event phase. Its
+   last step writes the npc_respawn event (nid, the base type, the new life), as the oracle's last statement does: a
+   record for the XP check, which nothing in the engine reads. */
 static int npc_respawn(World *w, Npc *n) {
     n->type = n->base;
     const RsNpcType *nt = ntype(w, n);
@@ -265,7 +267,8 @@ static int npc_respawn(World *w, Npc *n) {
     rs_occupy(w, n->level, n->x, n->z, n->size, 1);
     if (w->n_npc_events >= RS_MAX_NPCS) return RS_OVERFLOW(&w->err, "RS_MAX_NPCS npc events");
     w->npc_events[w->n_npc_events++] = (uint8_t)(n - w->npcs);
-    return 0;
+    RsEvent e = {.tick = w->tick, .kind = RS_EV_NPC_RESPAWN, .obj = n->nid, .count = n->type, .v0 = n->life};
+    return rs_event(w, &e);
 }
 
 int rs_npc_lifecycle(World *w, Npc *n) {

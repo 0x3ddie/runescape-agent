@@ -1,8 +1,12 @@
 """sim/workers.py: CPU reference workers behind shared buffers draw and step as one CpuBatch of the whole batch, so a
 world's goal, starts, episode sequence and memory do not depend on the worker that holds it; a worker's error reaches
-the caller; the training entry point trains on them with every rollout check; and a single-goal set holds its
-goal in every slot while the four-goal path stays as it was."""
+the caller; the training entry point trains on them with every rollout check, for the goal tasks and through the
+command for free play (cut lives that bootstrap, deaths that do not), where the worker count changes no result, the C
+engine collects what the Python reference collects and a start-only run records a real run's start digest; and a
+single-goal set holds its goal in
+every slot while the four-goal path stays as it was."""
 import hashlib
+import re
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +16,7 @@ from baseline.resource_task import GOAL_VEC, GOALS
 from sim import search, world as W
 from sim.engine import Rng
 from sim.vec import CpuBatch
-from sim.workers import CpuWorkers
+from sim.workers import FREE_PLAY_TASK, CpuWorkers
 
 ROOT = Path(__file__).resolve().parents[2]
 # Keyed random legal play of the four-goal path under the suite's synthetic name table, recorded before goal
@@ -120,6 +124,183 @@ def test_the_training_entry_point_trains_on_cpu_workers_with_every_rollout_check
     assert all(r['checks']['illegal_actions'] == 0 for r in rows)
     assert all(r['worker_timing']['steps'] == 8 and r['worker_timing']['workers'] == 2 for r in rows)
     assert {'obs/mask', 'actions', 'info/made', 'info/kills'} <= set(summary['first_rollout'])
+
+
+def free_play_command(tmp_path, monkeypatch, path, *settings, n_steps=64, updates=2, options=(), world='village-world-v1'):
+    """sim.train train --task free-play-v1 on the real batch on two CPU workers with --validate; returns its summary.
+    settings: the batch settings beside the world it names (`world`; None: none). options: further flags, after the
+    others (a later --worlds, --workers or --seed overrides)."""
+    import json
+    import sys
+    from sim.train import main
+    monkeypatch.setattr(sys, 'argv', ['sim.train', 'train', '--task', 'free-play-v1', '--env', 'cpu', '--workers', '2',
+                                      '--pool', str(path), '--worlds', '8', '--n-steps', str(n_steps), '--batch-size', '128',
+                                      '--epochs', '1', '--decisions', str(updates * 8 * n_steps), '--seed', '1', '--validate',
+                                      '--batch-setting', *settings, *([f'world="{world}"'] if world else []),
+                                      '--output', str(tmp_path / 'run'), *options])
+    main()
+    return json.loads((tmp_path / 'run' / 'summary.json').read_text())
+
+
+def test_the_training_entry_point_trains_free_play_on_cpu_workers_with_every_rollout_check(pool_file, tmp_path, monkeypatch):
+    """The free-play twin through the command: lives of 200 ticks without muggers end inside the run; the batch's
+    settings in effect are recorded; every rollout passes validate_free_play (each life's pay equals its episode_return,
+    bootstrap values only at cut lives); the cut lives bootstrap; the lives' facts reach the training evidence; and the
+    checkpoint loads as an obs-v6 policy whose digest is the summary's policy_sha256_at_end."""
+    import json
+    from sb3_contrib import RecurrentPPO
+    from baseline.policy import check_names
+    from sim.task import free_play_cfg
+    from sim.train import policy_digest
+    from sim.vec import COMBAT_FACTS
+    summary = free_play_command(tmp_path, monkeypatch, pool_file[0], 'muggers=false', 'life=["fixed",200]')
+    assert summary['status'] == 'completed' and summary['goals'] == [] and summary['per_goal'] is None
+    free = summary['free_play']
+    assert free['observation'] == 'obs-v6' and free['batch'] == dict(muggers=False, life=['fixed', 200], world='village-world-v1')
+    assert free['batch_in_effect'] == dict(world='village-world-v1', observation='obs-v6', xp_rate=1, muggers=False,
+                                           life=['fixed', 200], cfg=json.loads(json.dumps(free_play_cfg())))
+    with pytest.raises(ValueError, match=r"names muggers, life, world \(--batch-setting\): \['world'\] missing"):
+        free_play_command(tmp_path / 'unnamed', monkeypatch, pool_file[0], 'muggers=false', 'life=["fixed",200]', world=None)
+    with pytest.raises(RuntimeError, match="the pool holds village-world-v1 layouts, not 'village-world-v2'"):  # a worker's
+        free_play_command(tmp_path / 'other', monkeypatch, pool_file[0], 'muggers=false', 'life=["fixed",200]',
+                          world='village-world-v2')
+    checks = summary['checks']['rollouts']
+    assert len(checks) == 2 and all(c['problems'] == [] and c['illegal_actions'] == 0 for c in checks)
+    assert all(c['decisions'] == 8 * 64 and c['native_ticks'] >= 2 * c['decisions'] for c in checks)
+    lives = summary['lives']
+    assert lives['cut'] == sum(c['cut_lives'] for c in checks) >= 8 and lives['deaths'] == sum(c['deaths'] for c in checks)
+    assert lives['lives'] == lives['cut'] + lives['deaths'] and lives['mean_ticks'] >= 200
+    assert any(c['cut_lives'] and c['cut_value_sum'] != 0 for c in checks) and lives['mean_cut_value'] != 0  # bootstrapped
+    facts = [r['evidence']['life_facts'] for r in summary['updates']]
+    assert all(set(f) == {*COMBAT_FACTS, 'cells'} for f in facts)
+    assert sum(f['cells']['free-play-v1'] for f in facts) >= lives['lives']  # each life stood in a cell
+    assert all(r['worker_timing']['workers'] == 2 for r in summary['updates'])
+    loaded = RecurrentPPO.load(tmp_path / 'run' / 'latest.zip', device='cpu').policy
+    check_names(loaded, observation='obs-v6')
+    assert summary['policy_sha256_at_end'] == policy_digest(loaded) and summary['checkpoint_digests'] == {}  # none in 2
+
+
+def test_a_death_on_the_real_free_play_batch_ends_its_life_without_a_bootstrap(pool_file, tmp_path, monkeypatch):
+    """Muggers at the XP rate of 25 in long lives: lives end by death inside the run, and every rollout passes
+    validate_free_play, which refuses a bootstrap value at a death."""
+    summary = free_play_command(tmp_path, monkeypatch, pool_file[0], 'muggers=true', 'xp_rate=25', 'life=["fixed",6000]',
+                                n_steps=128, updates=3)
+    assert summary['status'] == 'completed' and summary['free_play']['batch_in_effect']['muggers'] is True
+    checks = summary['checks']['rollouts']
+    assert all(c['problems'] == [] for c in checks) and summary['lives']['deaths'] == sum(c['deaths'] for c in checks) >= 1
+    assert summary['lives']['cut'] == 0
+
+
+def test_the_worker_count_changes_no_transition_and_no_update_of_a_free_play_run(pool_file, tmp_path, monkeypatch):
+    """The same seed on 1, 2 and 4 CPU workers, with muggers that attack and lives cut by their length: the first
+    rollout's digests (observations, actions, rewards, ends, values, log-probabilities and info), each update's evidence,
+    the lives and the policy after two updates are the same bit for bit, so the worker count is not a setting of a run's
+    results (each worker steps its own slots of one CpuBatch, keyed by slot)."""
+    counts = (1, 2, 4)
+    runs = [free_play_command(tmp_path / str(w), monkeypatch, pool_file[0], 'muggers=true', 'xp_rate=25',
+                              'life=["fixed",200]', options=('--workers', str(w))) for w in counts]
+    assert all(r['status'] == 'completed' and r['updates'][0]['worker_timing']['workers'] == w for r, w in zip(runs, counts))
+    evidence = lambda run: [u['evidence'] for u in run['updates']]
+    assert runs[0]['lives']['cut'] >= 8 and all(e['life_facts']['aggressed'][FREE_PLAY_TASK] > 0 for e in evidence(runs[0]))
+    for r in runs[1:]:
+        assert r['first_rollout'] == runs[0]['first_rollout'] and r['lives'] == runs[0]['lives']
+        assert evidence(r) == evidence(runs[0])
+        assert r['policy_sha256_at_end'] == runs[0]['policy_sha256_at_end'] != runs[0]['policy_sha256_at_start']
+
+
+@pytest.fixture(scope='module')
+def free_pack(pool_file, name_table_path, tmp_path_factory):
+    """The C engine's pack of pool_file's layouts under the suite's name table, exported as
+    sim/tests/test_native_free_play.py exports its packs: no route trees (C searches routes live, as the Python reference
+    computes them over a pool without derived tables) and one supply layout, which free play does not play."""
+    supply = ROOT / 'logs/supply/pools/train-128.npz'
+    if not supply.exists():
+        pytest.skip('private supply pool absent')
+    from names import NameTable
+    from sim.build import DATA
+    from sim.native_export import export
+    work = tmp_path_factory.mktemp('free-pack')
+    one = W.save_pool(work / 'supply.npz', W.load_pool(supply)[0][:1], version=search.SUPPLY['world'])
+    return export(work / 'free.pack', pool_file[0], one, DATA, names=NameTable(name_table_path), trees=False, variants=1,
+                  log=lambda _: None)
+
+
+def test_free_play_collects_alike_on_the_c_engine_and_on_the_python_reference(pool_file, free_pack, tmp_path, monkeypatch):
+    """The training command with the same seed and batch settings (muggers, lives drawn from 100 to 300 ticks, XP rate 1)
+    on the Python reference and on the C engine (--engine native) with 1, 2 and 4 workers: the first rollout's digests
+    (the observations with their masks, the actions the same policy took, the pay, the life ends, values,
+    log-probabilities and info), the lives, each update's checks and evidence and the policy after two updates are the
+    same bit for bit, and the settings in effect too. A C run records its engine, its pack with the inputs that the
+    pack's manifest names, and the archive that each worker held equal to the pack's: with no --tables, the one the Python
+    reference loads (its pins unchecked: C reads only the pack). The C path reads the pack (a pool other than the pack's
+    is refused, so equal runs are not the Python reference twice; so is a pack that names another archive, with no
+    --tables given), and it refuses a batch setting that the Python reference does not take (NativeBatch's allow_stale
+    would pass a stale pack)."""
+    from baseline.telemetry import sha256
+    from sim.build import DATA
+    from sim.native import read_pack
+    meta = read_pack(free_pack)[1]
+    other = tmp_path / 'other.npz'
+    W.save_pool(other, pool_file[1][3:])
+    settings = ('muggers=true', 'xp_rate=1', 'life=["uniform",100,300]')
+    native = ('--engine', 'native', '--pack', str(free_pack))
+    python = free_play_command(tmp_path / 'cpu', monkeypatch, pool_file[0], *settings)
+    first = python['checks']['rollouts'][0]
+    assert python['engine'] == 'cpu' and first['cut_lives'] + first['deaths'] > 0  # lives end inside the first rollout
+    counts = (1, 2, 4)
+    for w in counts:
+        run = free_play_command(tmp_path / f'c{w}', monkeypatch, pool_file[0], *settings, options=(*native, '--workers', str(w)))
+        assert run['status'] == 'completed' and run['updates'][0]['worker_timing']['workers'] == w
+        assert run['engine'] == 'native' and run['pack'] == dict(path=str(free_pack), sha256=sha256(free_pack),
+                                                                 inputs=meta['inputs'], oracle_hash=meta['oracle_hash'])
+        assert run['tables'] == dict(python['tables'], pins_checked=False) == dict(path=str(DATA), sha256=sha256(DATA),
+                                                                                   pins_checked=False)
+        assert meta['inputs']['tables'] == run['tables']['sha256'] and meta['inputs']['pool'] == run['pool']['sha256']
+        assert run['free_play'] == python['free_play']  # the settings in effect among them, the world too
+        assert run['free_play']['batch_in_effect']['world'] == 'village-world-v1'
+        assert run['first_rollout'] == python['first_rollout'] and run['lives'] == python['lives']
+        assert run['checks']['rollouts'] == python['checks']['rollouts']
+        assert [u['evidence'] for u in run['updates']] == [u['evidence'] for u in python['updates']]
+        assert run['policy_sha256_at_end'] == python['policy_sha256_at_end'] != python['policy_sha256_at_start']
+    with pytest.raises(RuntimeError, match='was exported from another pool than'):
+        free_play_command(tmp_path / 'other', monkeypatch, other, *settings, options=native)
+    forged = tmp_path / 'forged.pack'  # the same pack, but its manifest names another archive (one digit of its sha256)
+    raw = bytearray(Path(free_pack).read_bytes())
+    at = raw.index(meta['inputs']['tables'].encode())
+    raw[at] = ord('0' if raw[at] != ord('0') else '1')
+    forged.write_bytes(raw)
+    assert read_pack(forged)[1]['inputs']['tables'] != sha256(DATA)
+    with pytest.raises(RuntimeError, match=re.escape(f'was exported from another tables than {DATA}')):
+        free_play_command(tmp_path / 'forged', monkeypatch, pool_file[0], *settings, options=('--engine', 'native', '--pack',
+                                                                                              str(forged)))
+    with pytest.raises(RuntimeError, match=r"batch settings that the Python reference does not take: \['allow_stale'\]"):
+        free_play_command(tmp_path / 'stale', monkeypatch, pool_file[0], *settings, 'allow_stale=true', options=native)
+
+
+def test_a_start_only_run_records_the_start_digest_of_a_real_run_of_its_seed(pool_file, tmp_path, monkeypatch):
+    """--initial-only builds the batch and the policy, saves initial.zip, records policy_sha256_at_start and stops before
+    any rollout. Its digest is the one a real run of the seed records under the same learner settings, though its worlds,
+    workers, pool, batch settings and table path (--tables, so its pins go unchecked) differ; another seed's differs. A run
+    on the Python reference records the archive it trained on."""
+    from sb3_contrib import RecurrentPPO
+    from baseline.telemetry import sha256
+    from sim.build import DATA
+    from sim.train import policy_digest
+    path, layouts = pool_file
+    real = free_play_command(tmp_path / 'real', monkeypatch, path, 'muggers=false', 'life=["fixed",200]', updates=1)
+    assert real['status'] == 'completed' and real['tables'] == dict(path=str(DATA), sha256=sha256(DATA), pins_checked=True)
+    other, link = tmp_path / 'other.npz', tmp_path / 'tables.npz'
+    W.save_pool(other, layouts[3:])
+    link.symlink_to(DATA)
+    start = lambda seed: free_play_command(tmp_path / f'start-{seed}', monkeypatch, other, 'muggers=true', 'xp_rate=25',
+                                           'life=["fixed",6000]', options=('--worlds', '4', '--workers', '1', '--seed', str(seed),
+                                                                           '--tables', str(link), '--initial-only'))
+    first, run = start(1), tmp_path / 'start-1' / 'run'
+    assert first['status'] == 'initialized' and first['policy_sha256_at_start'] == real['policy_sha256_at_start']
+    assert first['learner'] == real['learner'] and first['worlds'] == 4 and 'lives' not in first and 'updates' not in first
+    assert policy_digest(RecurrentPPO.load(run / 'initial.zip', device='cpu').policy) == first['policy_sha256_at_start']
+    assert not (run / 'latest.zip').exists() and first['tables'] == dict(real['tables'], path=str(link), pins_checked=False)
+    assert start(2)['policy_sha256_at_start'] != first['policy_sha256_at_start']
 
 
 def test_the_four_goal_path_is_unchanged_for_a_fixed_seed(pool_file):

@@ -23,22 +23,26 @@ kills so far) and settled to the audited return: the rewards of an episode sum t
 is decided by sim.audit from the world's events, not by the running payment, so the payment is
 checked against an independent account.
 
-A step the simulator cannot model (sim.engine.Unsupported) closes the episode and re-raises
-: it is never a done, a zero reward, a truncation or a stale observation.
+A step the simulator cannot model (sim.engine.Unsupported) closes the episode and re-raises:
+it is never a done, a zero reward, a truncation or a stale observation.
+
+FreePlayEpisode is one life of free-play-v1: no goal, its own start and agent limits, a
+length drawn per life (draw_life) that no observation shows, the fractional level gain over FREE_PLAY's skills paid as
+it accrues, and the XP checked against its causes every step (sim/audit.py XpCheck).
 """
 from copy import deepcopy
 
 import numpy as np
 
-from baseline.resource_task import GOAL_FAMILIES, GOAL_TARGETS, GOAL_VEC, GOALS
+from baseline.resource_task import GOAL_FAMILIES, GOAL_TARGETS, GOAL_VEC, GOALS, MAX_HORIZON
 from baseline.scripted import AXE, prepare_capacity
 from feedback_contract import episode_start
-from obs import project
-from sim.agent import A_HELD0, A_STYLE0, Agent
-from sim.audit import audit, kills
+from obs import OBSERVATION_V6, project, project_v6
+from sim.agent import A_HELD0, A_STYLE0, DECISION_WAIT_TICKS, Agent
+from sim.audit import AuditError, XpCheck, audit, check_stats, fractional_level, kills
 from sim.combat import COMBAT, enemy_types
 from baseline.resource_task import MELEE_ENEMIES
-from sim.engine import HITPOINTS, Rng, Unsupported, World
+from sim.engine import HITPOINTS, SKILLS, Rng, Unsupported, World
 from sim.spec import START_KIT, START_LEVELS, START_WEAPONS
 from sim.world import ORIGIN
 
@@ -195,6 +199,10 @@ class GoalEpisode:
         if (kit is not None or hp is not None or wield) and not self.combat:
             raise ValueError('only a combat start sets its kit, hitpoints or worn weapon')
         kit = list(START_KIT) + [(weapon, 1)] if kit is None else list(kit)
+        return self._arm(self._setup(tile, weapon, levels, seed, kit, hp, wield))
+
+    def _setup(self, tile, weapon, levels, seed, kit, hp, wield):
+        """The compact start's writes and its setup steps (module docstring); the observation before arm."""
         raw = self.agent.start(seed, deepcopy(self.cfg), tile, kit, levels)
         if hp is not None:
             p = self.agent.player
@@ -211,7 +219,7 @@ class GoalEpisode:
                 raise ValueError(f'no Wield offered for {name} at setup')
             raw = self.agent.step(A_HELD0 + slot)
             self.record('setup', action=A_HELD0 + slot, observation=raw)
-        return self._arm(raw)
+        return raw
 
     def _arm(self, raw):
         self.raw = episode_start(raw)
@@ -258,3 +266,171 @@ class GoalEpisode:
         info = dict(report=report, goal=self.goal, outcomes=outcomes,
                     episode=dict(r=total, l=self.decisions, native_ticks=self.terminal['tick'] - self.start_tick))
         return result, reward, True, info
+
+
+# ---- free-play-v1 ----------------------------------------------------------------------------------------------------
+FREE_PLAY = dict(
+    # the declared worlds a free-play life plays (sim/combat.py VILLAGES): a run's pool decides which (sim/vec.py CpuBatch)
+    version='free-play-v1', worlds=('village-world-v1', 'village-world-v2'), observation=OBSERVATION_V6,
+    # S: the skills whose XP source both engines implement and a native capture has passed
+    skills=('woodcutting', 'mining', 'fishing', 'attack', 'strength', 'defence', 'hitpoints'),
+    xp_rates=(1, 25),               # 1 primary, 25 the declared second read; no other rate
+    # A life's length in native ticks from arm is a setting with no default (check_life); the proposal, not frozen, is
+    # ('uniform', 6000, 36000).
+)
+R_LIFE = 40  # purpose of a life's length draw (R_LAYOUT..R_WORLD are 1-5, sim/combat.py's 16-21, sim/search.py's 30-33)
+
+
+def free_play_cfg():
+    """The free-play life's agent settings: TASK_CFG (unchanged, baseline/config.py) with its own limits, so that
+    sim/agent.py truncated() never cuts a life of up to MAX_HORIZON ticks (a decision takes at least K_TICKS = 2)."""
+    from baseline import config
+    return dict(config.TASK_CFG, maxDecisions=MAX_HORIZON, maxEpisodeTicks=2 * MAX_HORIZON)
+
+
+def check_life(life):
+    """A life-length distribution: ('fixed', ticks) or ('uniform', low, high), whole ticks within 1..MAX_HORIZON."""
+    life = tuple(life)
+    ok = (len(life) == 2 and life[0] == 'fixed') or (len(life) == 3 and life[0] == 'uniform' and life[1] <= life[2])
+    if not ok or not all(type(v) is int and 1 <= v <= MAX_HORIZON for v in life[1:]):
+        raise ValueError(f"a life length is ('fixed', ticks) or ('uniform', low, high) within 1..{MAX_HORIZON}, not {life!r}")
+    return life
+
+
+def draw_life(key, slot, episode, life):
+    """The length of life `episode` of world slot `slot` (a keyed draw of its own purpose, R_LIFE, so every other draw of
+    the start is the same whatever it draws)."""
+    life = check_life(life)
+    if life[0] == 'fixed':
+        return life[1]
+    low, high = life[1:]
+    return low + int(Rng.draw(Rng(key).prefix(slot, episode), R_LIFE) * (high - low + 1))
+
+
+class FreePlayEpisode(GoalEpisode):
+    """One life of free-play-v1 in a world: a start (`start`: the levels, kit, hitpoints and worn weapon of a declared
+    draw, sim/combat.py draw_village), then decisions until death or `length` native ticks from arm, whichever comes
+    first. The policy reads obs-v6 (rl/obs.py project_v6): no goal and no time input, so neither the length nor the time
+    elapsed is in what it receives.
+
+    Each step pays the change in fractional total level over S (FREE_PLAY skills; sim/audit.py fractional_level) as it
+    accrues; nothing is settled at the end and death takes nothing back. The XP is the game's (Player.stats); each
+    step's XP events are checked against the tables first (sim/audit.py XpCheck), and the XP of every skill must be the
+    XP its checked events gained (the bookkeeping check, every step and from start to end). A failed check raises
+    AuditError, which stops the run as incomplete. An unsupported step closes the life and re-raises.
+
+    The agent's settings are free_play_cfg's unless `cfg` is given, which must not cut a life before its length."""
+
+    def __init__(self, world: World, length, xp_rate, cfg=None, skills=FREE_PLAY['skills'], record=None, name='wd1a0'):
+        if type(length) is not int or not 1 <= length <= MAX_HORIZON:
+            raise ValueError(f'a life of 1..{MAX_HORIZON} ticks, not {length!r}')
+        if xp_rate not in FREE_PLAY['xp_rates'] or world.xp_rate != xp_rate:
+            raise ValueError(f"a free-play XP rate is one of {FREE_PLAY['xp_rates']} and the world's: {xp_rate!r}, the "
+                             f"world's {world.xp_rate!r}")
+        self.xp_rate = xp_rate
+        self.cfg = dict(free_play_cfg() if cfg is None else cfg)
+        if self.cfg.get('maxEpisodeTicks', 0) < length + 2 * DECISION_WAIT_TICKS or self.cfg.get('maxDecisions', 0) < length:
+            raise ValueError('agent limits that could cut a free-play life (free_play_cfg)')
+        self.world, self.length, self.horizon, self.goal, self.combat, self.scale = world, length, length, None, False, 1.0
+        self.skill_names = tuple(skills)
+        self.skills = tuple(SKILLS.index(s) for s in self.skill_names)
+        self.agent = Agent(world, name)
+        self.record = record or (lambda kind, **data: None)
+        # every npc type a fight can certify (sim/combat.py fights): the melee task's enemies and the chickens
+        self.enemies = enemy_types(world.t) | MELEE_ENEMIES
+        self.family = set()
+        self.raw = self.projected = None
+        self.active = False
+
+    def reset(self, seed=0, transport=None):
+        raise ValueError('a free-play life starts with start(); it has no Draynor reset')
+
+    def start(self, tile, weapon, levels, seed=0, kit=None, hp=None, wield=False):
+        """The life's start: START_KIT and the weapon unless `kit`, the levels, then hitpoints and the setup Wield."""
+        self.terminal, self.armed = None, False
+        kit = list(START_KIT) + [(weapon, 1)] if kit is None else list(kit)
+        return self._arm(self._setup(tile, weapon, levels, seed, kit, hp, wield))
+
+    def _arm(self, raw):
+        self.raw = episode_start(raw)
+        self.start_tick, self.end = self.world.tick, self.world.tick + self.length
+        self.event_start = self.checked = len(self.world.events)
+        self.initial = self.holdings()
+        p = self.agent.player
+        self.arm_hp, self.arm_stats, self.arm_levels = p.hp, list(p.stats), list(p.base_levels)
+        self.xp = XpCheck(self.world.t, self.xp_rate, self.agent.name, p.stats)  # the declared rate, not the world's
+        self.level = [fractional_level(p.stats[s]) for s in self.skills]
+        self.paid, self.decisions = 0.0, 0
+        self.made, self.kills = np.zeros(len(FAMILIES), np.int32), 0
+        self.families = object_families(self.world.t)
+        self.armed, self.active = True, True
+        self._watch()
+        self.agent.ended = lambda: self.terminal is not None
+        return self.project()
+
+    def project(self):
+        self.projected = project_v6(self.raw)
+        return self.projected
+
+    def _account(self):
+        """Check the events since the last step (XpCheck and the bookkeeping check) and count their production and the
+        agent's defeats; returns this step's pay."""
+        events = self.world.events[self.checked:]
+        self.checked = len(self.world.events)
+        self.xp.observe(events)
+        p = self.agent.player
+        for stat, have in enumerate(p.stats):
+            if have != self.xp.xp[stat]:
+                raise AuditError(f'stat {stat} holds {have} XP, its checked events {self.xp.xp[stat]}')
+        self.made += produced(events, self.families)
+        self.kills += sum(kind == 'npc_defeated' and data['source'] == self.agent.name for _, kind, data in events)
+        level = [fractional_level(p.stats[s]) for s in self.skills]
+        pay = sum(b - a for a, b in zip(self.level, level))
+        self.level = level
+        return pay
+
+    def step(self, action):
+        if not self.active:
+            raise RuntimeError('step on a closed life')
+        if not (type(action) is int and 0 <= action < 96 and self.projected['mask'][action]):
+            raise ValueError(f'invalid/masked action {action}')
+        self.decisions += 1
+        if self.terminal is None:
+            try:
+                self.raw = self.agent.step(action)
+            except Unsupported:
+                self.active = False
+                self._unwatch()
+                raise
+            if self.agent.truncated():
+                raise RuntimeError('the agent\'s limits cut a free-play life (free_play_cfg)')
+        reward = self._account()
+        self.paid += reward
+        result = self.project()
+        if self.terminal is None:
+            return result, reward, False, {}
+        self.active = False
+        self._unwatch()
+        report = self.report()
+        return result, reward, True, dict(report=report, outcomes=report['gain_total'],
+                                          episode=dict(r=self.paid, l=self.decisions,
+                                                       native_ticks=self.terminal['tick'] - self.start_tick))
+
+    def report(self):
+        """The closed life: the second check (start to end), then its reason, ticks, decisions and levels over S."""
+        p, events = self.agent.player, self.world.events[self.event_start:]
+        gained = [0] * len(p.stats)
+        for _, kind, data in events:
+            if kind == 'xp':
+                gained[data['stat']] += data['after'] - data['before']
+        check_stats(self.arm_stats, p.stats, gained)
+        start = [fractional_level(self.arm_stats[s]) for s in self.skills]
+        fractional = sum(b - a for a, b in zip(start, self.level))
+        if abs(self.paid - fractional) > 1e-6 * max(1.0, abs(fractional)):
+            raise AuditError(f'paid {self.paid}, the fractional level gain {fractional}')
+        gain = {name: p.base_levels[s] - self.arm_levels[s] for name, s in zip(self.skill_names, self.skills)}
+        return dict(reason=self.terminal['reason'], survived=self.terminal['reason'] != 'death', tick=self.terminal['tick'],
+                    ticks=self.terminal['tick'] - self.start_tick, decisions=self.decisions, length=self.length,
+                    gain=gain, gain_total=sum(gain.values()), fractional=fractional, paid=self.paid,
+                    levels={name: (self.arm_levels[s], p.base_levels[s]) for name, s in zip(self.skill_names, self.skills)},
+                    xp={name: gained[s] for name, s in zip(self.skill_names, self.skills)})

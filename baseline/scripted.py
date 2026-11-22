@@ -9,7 +9,7 @@ import re
 from collections import Counter
 
 from act_contract import A_ACT0, BANK_NAME, BANK_OPTION, CLICK_ROWS, banks
-from item_contract import observation_contract
+from wide_contract import check_items
 
 LOGS = 1511
 AXE = 'bronze axe'
@@ -57,9 +57,9 @@ class ItemGate:
         self.env, self.record, self.obs = env, record, None
 
     def accept(self, obs):
-        observation_contract(obs)
+        rows = check_items(obs)  # the item pages under the observation's own contract (item-v2, v3 or v4)
         assert not obs['done'] and not obs.get('truncated') and not obs['player']['isDead'] and obs['player']['hp'] > 0
-        assert len(obs['mask']) == 96
+        assert len(obs['mask']) == rows
         if not obs['bankOpen']:
             assert not any(obs['mask'][A_WITHDRAW0:A_WITHDRAW0 + 8]), 'withdraw exposed while bank closed'
         self.obs = obs
@@ -175,7 +175,9 @@ def prepare_capacity(transport, obs, record, capacity, tool=AXE):
 
 # The game's names of the items a declared start may hold, by their debug names (TaskCfg seedItems).
 KIT_NAMES = dict(bronze_axe='Bronze axe', net='Small fishing net', bronze_pickaxe='Bronze pickaxe', shrimp='Shrimps',
-                 bread='Bread', bronze_dagger='Bronze dagger', bronze_sword='Bronze sword')
+                 bread='Bread', bronze_dagger='Bronze dagger', bronze_sword='Bronze sword',
+                 tinderbox='Tinderbox',  # free-play-v3's kit holds one beside the record's (sim/workers.py FREE_PLAY_V3)
+                 raw_chicken='Raw chicken')  # a declared start may hold it (the watch's item-v4 kits)
 
 
 def prepare_declared(transport, obs, record, items, stats):

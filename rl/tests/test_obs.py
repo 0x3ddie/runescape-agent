@@ -79,3 +79,47 @@ def test_projection_does_not_see_absolute_position():
     assert here.keys() == there.keys()
     for key in here:
         np.testing.assert_array_equal(here[key], there[key])
+
+
+def test_obs_v6_drops_the_decision_count_and_adds_each_skills_progress():
+    """obs-v6 (free-play-v1): task_vec without its decision count, prog_vec's 25 entries and then each SKILL_ORDER skill's
+    progress to its next level from the observed whole XP; nothing else changes."""
+    from obs import LEVEL_XP, PROG_VEC_V6, SKILL_ORDER, TASK_VEC_V6, level_progress, project_v6
+    v5, v6 = project(FIXTURE), project_v6(FIXTURE)
+    assert set(v6) == set(v5) and v6["task_vec"].shape == (TASK_VEC_V6,) and v6["prog_vec"].shape == (PROG_VEC_V6,)
+    assert np.array_equal(v6["task_vec"], v5["task_vec"][1:]) and np.array_equal(v6["prog_vec"][:25], v5["prog_vec"])
+    assert all(np.array_equal(v6[k], v5[k]) for k in v5 if k not in ("task_vec", "prog_vec"))
+    later = deepcopy(FIXTURE)
+    later["decision"], later["tick"] = 1499, FIXTURE["tick"] + 36000
+    assert all(np.array_equal(project_v6(later)[k], v6[k]) for k in v6)  # no time input
+    half = deepcopy(FIXTURE)
+    s_names = ("Woodcutting", "Mining", "Fishing", "Attack", "Strength", "Defence", "Hitpoints")  # free-play-v1's S
+    for n, name in enumerate(s_names):  # each between two levels: level 10 + n, a quarter or more of the way up
+        level, share = 10 + n, (n + 1) / 8
+        low, high = LEVEL_XP[level - 2], LEVEL_XP[level - 1]
+        skill = next(s for s in half["skills"] if s["name"] == name)
+        skill.update(baseLevel=level, level=level, xp=int(low + share * (high - low)) // 10)
+    got = project_v6(half)["prog_vec"]
+    for n, name in enumerate(s_names):
+        skill = next(s for s in half["skills"] if s["name"] == name)
+        low, high = LEVEL_XP[8 + n], LEVEL_XP[9 + n]
+        assert got[25 + SKILL_ORDER.index(name)] == pytest.approx((10 * skill["xp"] - low) / (high - low), abs=1e-6)
+        assert got[25 + SKILL_ORDER.index(name)] == pytest.approx((n + 1) / 8, abs=1e-2), name
+    outside_s = ("Prayer", "Cooking")  # rb2-3: skills outside S show their progress too
+    for n, name in enumerate(outside_s):
+        low, high = LEVEL_XP[2 + n], LEVEL_XP[3 + n]  # level 4 + n
+        skill = next(s for s in half["skills"] if s["name"] == name)
+        skill.update(baseLevel=4 + n, level=4 + n, xp=int(low + 0.6 * (high - low)) // 10)
+    got = project_v6(half)["prog_vec"]
+    for n, name in enumerate(outside_s):
+        skill = next(s for s in half["skills"] if s["name"] == name)
+        low, high = LEVEL_XP[2 + n], LEVEL_XP[3 + n]
+        assert got[25 + SKILL_ORDER.index(name)] == pytest.approx((10 * skill["xp"] - low) / (high - low), abs=1e-6)
+        assert 0.55 < got[25 + SKILL_ORDER.index(name)] < 0.65, name
+    others = [25 + k for k, name in enumerate(SKILL_ORDER) if name not in s_names + outside_s]
+    assert np.array_equal(got[others], project_v6(FIXTURE)["prog_vec"][others])
+    wc = next(s for s in half["skills"] if s["name"] == "Woodcutting")
+    assert level_progress(10 ** 7, 99) == 0.0
+    del wc["xp"]
+    with pytest.raises(ValueError):
+        project_v6(half)

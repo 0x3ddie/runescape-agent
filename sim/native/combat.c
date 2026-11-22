@@ -216,21 +216,23 @@ static int npc_defence_roll(World *w, const Npc *n, int32_t damagetype, int64_t 
     return 0;
 }
 
-/* give_combat_experience (engine.py) for the melee styles. */
-static int give_combat_xp(World *w, int32_t style, int32_t damage, int32_t mult) {
+/* give_combat_experience (engine.py:2469-2483) for the melee styles. */
+static int give_combat_xp(World *w, int32_t style, int32_t damage, int32_t mult, const Npc *n) {
     int64_t base = (int64_t)damage * 10;
 #define XP(pct) ((int32_t)rs_floordiv(rs_floordiv(base * (pct), 100) * mult, 1000))
-    if (style == 0) RS_TRY(rs_add_xp(w, RS_SKILL_ATTACK, XP(400)));
-    else if (style == 1) RS_TRY(rs_add_xp(w, RS_SKILL_STRENGTH, XP(400)));
-    else if (style == 2) RS_TRY(rs_add_xp(w, RS_SKILL_DEFENCE, XP(400)));
+#define ADD(stat, pct) rs_add_xp(w, stat, XP(pct), RS_XPC_HIT, n->nid, n->life)   /* the hit is the cause */
+    if (style == 0) RS_TRY(ADD(RS_SKILL_ATTACK, 400));
+    else if (style == 1) RS_TRY(ADD(RS_SKILL_STRENGTH, 400));
+    else if (style == 2) RS_TRY(ADD(RS_SKILL_DEFENCE, 400));
     else if (style == 3) {
-        RS_TRY(rs_add_xp(w, RS_SKILL_ATTACK, XP(133)));
-        RS_TRY(rs_add_xp(w, RS_SKILL_STRENGTH, XP(133)));
-        RS_TRY(rs_add_xp(w, RS_SKILL_DEFENCE, XP(133)));
+        RS_TRY(ADD(RS_SKILL_ATTACK, 133));
+        RS_TRY(ADD(RS_SKILL_STRENGTH, 133));
+        RS_TRY(ADD(RS_SKILL_DEFENCE, 133));
     } else {
         return RS_FAIL(&w->err, RS_E_COMBAT_XP_STYLE, style);
     }
-    return rs_add_xp(w, RS_SKILL_HITPOINTS, XP(133));
+    return ADD(RS_SKILL_HITPOINTS, 133);
+#undef ADD
 #undef XP
 }
 
@@ -266,7 +268,11 @@ static int melee_attack(World *w, Npc *n) {
         RS_TRY(param(w, ntype(w, n)->max_dealt, &max_dealt));
         damage = (int32_t)rs_randominc(w, imin(p->varp[RS_VARP_com_maxhit], max_dealt), RS_KEYS(n->nid, 3));
         int32_t capped = imin(damage, n->levels[RS_NPC_HP]);
-        RS_TRY(give_combat_xp(w, p->varp[RS_VARP_damagestyle], capped, n->v_xp_mult));
+        /* the hit as its xp's cause (sim/audit.py XpCheck): the damage queued below lands later */
+        RsEvent hit = {.tick = w->tick, .kind = RS_EV_HIT, .a8 = 1, .obj = n->nid, .count = n->type, .v0 = n->life,
+                       .v1 = damage, .v2 = n->levels[RS_NPC_HP], .v3 = p->varp[RS_VARP_damagestyle]};
+        RS_TRY(rs_event(w, &hit));
+        RS_TRY(give_combat_xp(w, p->varp[RS_VARP_damagestyle], capped, n->v_xp_mult, n));
         if (capped >= 1) n->has_hero = 1, n->hero_damage += capped;
     }
     int32_t weapon = rhand(w), v;
@@ -625,7 +631,7 @@ static int death_script(World *w, Npc *n, Frame *f, RsSusp *out) {
                 RS_TRY(rs_event(w, &e));
                 break;
             }
-            if ((w->excl & RS_EXCLUDE_LOOT_DROPS) && (ot->flags & RS_OF_LOOT_OUTSIDE)) {
+            if ((w->excl & RS_EXCLUDE_LOOT_DROPS) && (ot->flags & w->loot)) {  /* loot_outside(w.t, obj, w.loot_outside) */
                 RsEvent e = {.tick = w->tick, .kind = RS_EV_EXCLUDED, .a8 = RS_EXCL_LOOT, .obj = obj, .v0 = n->nid};
                 RS_TRY(rs_event(w, &e));
                 break;
@@ -691,6 +697,12 @@ int rs_npc_combat_step(World *w, Npc *n, Frame *f, RsSusp *out) {
     case RS_S_NPC_DEFAULT_RETALIATE_AP: return npc_default_retaliate(w, n, 1);
     case RS_S_NPC_DEFAULT_DAMAGE: return npc_default_damage(w, n, f->arg[0][0], f->arg[0][1]);
     case RS_S_NPC_DEATH_SCRIPT: return death_script(w, n, f, out);
+    case RS_S_HIGHWAYMAN_APPROACH:
+        /* [ai_applayer2,highwayman] (engine.py highwayman_approach; highwayman.rs2): npc_say, which nothing the slice or
+           the interface reads and the oracle leaves out, then npc_setmode(opplayer2) with the npc's target as the
+           script's player (fn(world, npc, npc.target)); it ends without a suspension */
+        rs_npc_set_mode(w, n, RS_MODE_OPPLAYER2, n->target_player);
+        return 0;
     default: return RS_FAIL_TEXT(&w->err, RS_E_INTERNAL, "rs_npc_combat_step: not an npc script");
     }
 }

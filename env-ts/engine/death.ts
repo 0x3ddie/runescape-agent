@@ -16,12 +16,17 @@ export interface DeathMonitor {
 
 const monitors = new WeakMap<HealthSource, DeathMonitor>();
 
-export function monitorDeath(player: HealthSource, hpIndex: number, tick: () => number): DeathMonitor {
+/** onDeath runs once, inside the damage or stat change that ends the life (its attacker still targets the player). */
+export function monitorDeath(player: HealthSource, hpIndex: number, tick: () => number,
+                             onDeath?: () => void): DeathMonitor {
     const existing = monitors.get(player);
     if (existing) return existing;
     let deathTick: number | null = null;
     const sample = () => {
-        if (deathTick === null && player.levels[hpIndex] <= 0) deathTick = tick();
+        if (deathTick === null && player.levels[hpIndex] <= 0) {
+            deathTick = tick();
+            onDeath?.();
+        }
     };
     const damage = player.applyDamage;
     player.applyDamage = function (amount, type) {

@@ -1,5 +1,6 @@
 # Local artifacts and dependency environments
 logs/
+/logs
 .venv/
 .venv-sim/
 __pycache__/

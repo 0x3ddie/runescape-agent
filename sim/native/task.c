@@ -17,8 +17,10 @@
  * (events from arm with tick < the terminal tick), and their errors are the terminal's in Python too, so rs_audit and
  * rs_fights feed fresh accumulators over the window then, each in its own pass and with its own kill ledger, as
  * audit() and fights() each call kill_lives on the window (the audit stays an account independent of the payment). */
+#include <math.h>
 #include <string.h>
 
+#include "pysum.h"
 #include "rs.h"
 
 /* ---- start draws ------------------------------------------------------------------------------------------------ */
@@ -99,13 +101,14 @@ static int hitpoints_level(void) {
    (R_FOOD, i), muggers (R_MUGGER, i) and worn (R_WORN). Mugger options: outside(layout)'s tiles in x-major order whose
    Chebyshev distance from the camp centre (np.mean of the camp tiles: an exact integer sum, one correctly rounded
    division, in double) lies in mugger_camp, at least mugger_start from the start tile, and not a camp tile. */
-int rs_draw_combat(const RsPack *P, int64_t key, int32_t slot, int32_t episode, RsStart *s, RsErr *err) {
+static int draw_combat_in(const RsPack *P, int64_t key, int32_t slot, int32_t episode, RsStart *s, int32_t group,
+                          int place_muggers, RsErr *err) {
     const RsLayout *L = pool_layout(P, RS_LAYOUT_COMPACT, s->layout, err);
     if (!L) return 1;
     int hpk = hitpoints_level();
     if (hpk < 0) return RS_FAIL_TEXT(err, RS_E_INTERNAL, "START_LEVELS has no hitpoints");
     uint32_t h = start_prefix(key, slot, episode);
-    int32_t g = (int32_t)PICK(h, RS_N_GROUPS, RS_R_GROUP);
+    int32_t g = group >= 0 ? group : (int32_t)PICK(h, RS_N_GROUPS, RS_R_GROUP);  /* `group` replaces its draw */
     int32_t base = s->levels[hpk], lo = RS_GROUP_HP_LO[g], hi = RS_GROUP_HP_HI[g];
     int32_t d = lo + (int32_t)PICK(h, hi - lo + 1, RS_R_HP);
     int32_t hp = RS_GROUP_HP_ABS[g] ? d : base - d;
@@ -118,7 +121,7 @@ int rs_draw_combat(const RsPack *P, int64_t key, int32_t slot, int32_t episode, 
     for (int32_t i = 0; i < n_food; i++) s->food[i] = (int8_t)PICK(h, RS_COMBAT_N_FOOD, RS_R_FOOD, i);
     int32_t want = RS_GROUP_MUGGERS[g];
     s->n_muggers = 0;
-    if (want > 0) {
+    if (want > 0 && place_muggers) {   /* `if spec['muggers'] and place_muggers`: no camp read, no tiles, no draw */
         if (want > (int32_t)(sizeof s->mugger_x / sizeof *s->mugger_x)) return RS_OVERFLOW(err, "combat start muggers");
         if (L->n_camp < 1) return RS_FAIL_TEXT(err, RS_E_PACK, "a combat layout has no camp");
         int64_t sum_x = 0, sum_z = 0;
@@ -153,7 +156,11 @@ int rs_draw_combat(const RsPack *P, int64_t key, int32_t slot, int32_t episode, 
     return 0;
 }
 
-/* scarce_rows' kept row (search.py): the grove's normal tree nearest the start tile (local; Chebyshev from
+int rs_draw_combat(const RsPack *P, int64_t key, int32_t slot, int32_t episode, RsStart *s, RsErr *err) {
+    return draw_combat_in(P, key, slot, episode, s, -1, 1, err);
+}
+
+/* scarce_rows' kept row (search.py:346-351): the grove's normal tree nearest the start tile (local; Chebyshev from
    its origin), ties to the lower row; -1 when the grove has no normal tree (min() of nothing: never, for a site). */
 static int32_t scarce_keep(const RsLayout *L, int32_t grove, int32_t tx, int32_t tz) {
     int32_t keep = -1, best = 0;
@@ -203,6 +210,7 @@ int rs_draw_supply(const RsPack *P, int64_t key, int32_t slot, int32_t episode, 
    draw_start on the compact pool, and a melee slot of a combat task (v3, v5; combat.task_spec) adds draw_combat. */
 int rs_episode_draw(const RsSlot *s, int64_t key, RsStart *out, RsErr *err) {
     int task = s->cfg->task;
+    if (task == RS_TASK_FREE) return rs_draw_village(s->P, s->cfg, key, s->slot, s->episode, out, err);
     if (task != RS_TASK_V2 && task != RS_TASK_V3 && task != RS_TASK_V5)
         return RS_FAIL_TEXT(err, RS_E_CONTRACT, "the native engine runs goal-activity-v2, v3 and v5");
     if (task == RS_TASK_V5 && s->goal == RS_GOAL_WOOD) return rs_draw_supply(s->P, key, s->slot, s->episode, out, err);
@@ -249,7 +257,7 @@ int rs_combat_npcs(const RsPack *P, const RsStart *s, RsNpcSpawn out[RS_MAX_NPCS
 int rs_start_kit(const RsPack *P, const RsStart *s, int32_t obj[RS_START_KIT_MAX], int32_t count[RS_START_KIT_MAX]) {
     const RsConsts *C = P->consts;
     int n = 0;
-    if (s->kind == RS_START_COMBAT) {
+    if (s->kind == RS_START_COMBAT || s->kind == RS_START_VILLAGE) {   /* combat.kit (village_life's too) */
         for (int i = 0; i < (int)(sizeof C->combat_tools / sizeof *C->combat_tools); i++)
             obj[n] = C->combat_tools[i], count[n++] = C->combat_tool_count[i];
         for (int i = 0; i < s->n_food; i++) obj[n] = C->combat_food[s->food[i]], count[n++] = 1;
@@ -653,6 +661,7 @@ int rs_supply_observe(RsSlot *s) {
 
 /* The start kind a slot's episodes draw (CpuBatch._episode, vec.py). */
 static int slot_kind(const RsSlot *s) {
+    if (s->cfg->task == RS_TASK_FREE) return RS_START_VILLAGE;
     if (s->cfg->task == RS_TASK_V5 && s->goal == RS_GOAL_WOOD) return RS_START_SUPPLY;
     if (s->cfg->task != RS_TASK_V2 && s->goal == RS_GOAL_MELEE) return RS_START_COMBAT;
     return RS_START_SHORT;
@@ -690,6 +699,11 @@ static void episode_init(RsSlot *s, int kind) {
     ep->goal = (int8_t)s->goal;
     ep->combat = kind == RS_START_COMBAT;
     ep->scale = 1.0;
+    if (kind == RS_START_VILLAGE) {   /* FreePlayEpisode.__init__: no goal (info goal -1), the life's own length */
+        ep->goal = -1;
+        ep->horizon = s->start.length;
+        return;
+    }
     if (ep->combat) {
         ep->horizon = RS_COMBAT_HORIZON, ep->target = RS_COMBAT_TARGET;
         ep->n_enemies = 2, ep->enemies[0] = s->P->consts->npc_goblin, ep->enemies[1] = s->P->consts->npc_mugger;
@@ -702,12 +716,493 @@ static void episode_init(RsSlot *s, int kind) {
 }
 
 void rs_commit_obs(RsSlot *s, const uint8_t *row) {
-    memcpy(s->obs, row, RS_OBS_BYTES);
+    memcpy(s->obs, row, RS_OBS_ROW_BYTES);   /* obs-v6's progress block included */
     s->n_late = s->n_late_next;
     memcpy(s->late, s->late_next, (size_t)s->n_late * sizeof *s->late);
 }
 
-/* GoalEpisode._arm (task.py) with the projection it returns: the setup observation's feedback quieted
+/* ---- free-play-v1 (sim/task.py FreePlayEpisode, sim/combat.py VILLAGE, sim/audit.py XpCheck) ------------------ */
+/* draw_village then draw_life (combat.py, task.py): draw_start on the compact pool; the village world that plays the
+   drawn layout (village_of: its record's world; none is a ValueError), whose muggers the batch may not ask for where
+   it holds none; draw_combat in that world's start group (its R_GROUP draw skipped), whose mugger tiles are drawn
+   (and their shortage raised) in both forms where the world places muggers and kept only when the batch places them;
+   then the life's length, fixed or lo + int(draw(R_LIFE) * (hi - lo + 1)). */
+int rs_draw_village(const RsPack *P, const RsConfig *cfg, int64_t key, int32_t slot, int32_t episode, RsStart *out,
+                    RsErr *err) {
+    if (cfg->life_lo < 1 || cfg->life_lo > RS_MAX_HORIZON
+        || (cfg->life_kind == RS_LIFE_UNIFORM && (cfg->life_hi < cfg->life_lo || cfg->life_hi > RS_MAX_HORIZON))
+        || (cfg->life_kind != RS_LIFE_UNIFORM && cfg->life_kind != RS_LIFE_FIXED))
+        return RS_FAIL_TEXT(err, RS_E_CONTRACT, "a life length is ('fixed', ticks) or ('uniform', low, high) within 1..MAX_HORIZON");
+    RS_TRY(rs_draw_start(P, RS_LAYOUT_COMPACT, key, slot, episode, out, err));
+    int32_t v = P->layouts[out->rec].village;
+    if (v < 0 || v >= RS_N_VILLAGES) return RS_FAIL_TEXT(err, RS_E_CONTRACT, RS_VILLAGE_NONE);
+    if (cfg->muggers && !RS_VILLAGE_PLACE_MUGGERS[v]) return RS_FAIL_TEXT(err, RS_E_CONTRACT, RS_VILLAGE_NO_MUGGERS[v]);
+    RS_TRY(draw_combat_in(P, key, slot, episode, out, RS_VILLAGE_GROUP[v], RS_VILLAGE_PLACE_MUGGERS[v], err));
+    out->kind = RS_START_VILLAGE;
+    out->placed = cfg->muggers != 0;
+    if (!out->placed) out->n_muggers = 0;
+    uint32_t h = start_prefix(key, slot, episode);
+    out->length = cfg->life_kind == RS_LIFE_FIXED ? cfg->life_lo
+        : cfg->life_lo + (int32_t)PICK(h, cfg->life_hi - cfg->life_lo + 1, RS_R_LIFE);
+    return 0;
+}
+
+/* village_npcs (combat.py): combat_npcs of the start (the placed muggers only), then the layout's chickens at their
+   spawns in layout order, with nids following and the type's size. */
+int rs_village_npcs(const RsPack *P, const RsStart *s, RsNpcSpawn out[RS_MAX_NPCS], int *n, RsErr *err) {
+    RS_TRY(rs_combat_npcs(P, s, out, n, err));
+    const RsConsts *C = P->consts;
+    const RsLayout *L = pool_layout(P, RS_LAYOUT_COMPACT, s->layout, err);
+    if (!L) return 1;
+    int k = *n;
+    for (int32_t i = 0; i < L->n_npcs; i++) {
+        int32_t type = L->npcs[i * 4 + 1], x = L->npcs[i * 4 + 2], z = L->npcs[i * 4 + 3];
+        if (type != C->npc_chicken && type != C->npc_chicken_brown) continue;
+        const RsNpcType *t = rs_npc_type(P, type);
+        if (!t) return RS_FAIL_TEXT(err, RS_E_PACK, "a village chicken's type is not in the pack");
+        if (k >= RS_MAX_NPCS) return RS_OVERFLOW(err, "RS_MAX_NPCS village npcs");
+        out[k] = (RsNpcSpawn){.nid = k, .type = type, .x = L->x0 + x, .z = L->z0 + z, .level = 0, .size = t->size};
+        k++;
+    }
+    *n = k;
+    return 0;
+}
+
+/* audit.fractional_level: L + (x - X(L)) / (X(L+1) - X(L)) at XP x (tenths), L = level_for(x), 99.0 from level 99;
+   ints exact in double, one division, then the int level added, as Python computes it. */
+double rs_fractional_level(const RsPack *P, int32_t xp) {
+    const int32_t *t = P->consts->level_xp;
+    int32_t level = 1;
+    for (int i = 98; i >= 0; i--)
+        if (xp >= t[i]) {
+            level = i + 2 < 99 ? i + 2 : 99;
+            break;
+        }
+    if (level >= 99) return 99.0;
+    int64_t low = level >= 2 ? t[level - 2] : 0, high = t[level - 1];
+    return (double)level + (double)((int64_t)xp - low) / (double)(high - low);
+}
+
+/* The obs-v6 projection of a free-play life (FreePlayEpisode.project: project_v6 of the raw observation), built
+   aside and kept only once whole. */
+static int free_project(RsSlot *s) {
+    _Alignas(8) uint8_t row[RS_OBS_ROW_BYTES];
+    memset(row, 0, sizeof row);
+    RS_TRY(rs_project(s, row));
+    rs_project_progress(s, row);
+    rs_commit_obs(s, row);
+    return 0;
+}
+
+/* FreePlayEpisode._arm: the setup observation's feedback quieted, the clock (start_tick, end = tick + length), the
+   event cursor, the arm hitpoints, stats and levels, XpCheck over the stats as they stand, the fractional levels over
+   S, nothing paid, armed and active, then the first projection. No goal: nothing carried, banked or targeted. */
+static int free_arm(RsSlot *s) {
+    Episode *ep = &s->ep;
+    World *w = &s->w;
+    RsFree *f = &s->fp;
+    const Player *p = &w->p;
+    rs_episode_start_feedback(&s->a.obs);
+    memset(f, 0, sizeof *f);
+    f->length = s->start.length;
+    ep->start_tick = w->tick, ep->end = w->tick + f->length;
+    ep->event_start = (int32_t)(w->ev_base + w->n_events);
+    f->checked = w->ev_base + w->n_events;
+    ep->arm_hp = p->levels[RS_SKILL_HITPOINTS];
+    memcpy(f->arm_stats, p->stats, sizeof f->arm_stats);
+    memcpy(f->arm_levels, p->base_levels, sizeof f->arm_levels);
+    memcpy(f->xp, p->stats, sizeof f->xp);
+    for (int k = 0; k < RS_FREE_N_SKILLS; k++)
+        f->level[k] = f->start_level[k] = rs_fractional_level(s->P, p->stats[RS_FREE_SKILLS[k]]);
+    for (int i = 0; i < RS_MAX_NPCS; i++) f->row_life[i] = f->hit_life[i] = -1;
+    ep->paid = 0.0, ep->decisions = 0;
+    ep->armed = ep->active = 1;
+    return free_project(s);
+}
+
+/* ---- XpCheck.observe, one tick's events at a time (sim/audit.py) */
+#define XP_CAUSES 64              /* productions, hits and burials in one tick */
+typedef struct {
+    int32_t n_made, n_hit, n_bury, n_resp;
+    const RsEvent *made[XP_CAUSES], *hit[XP_CAUSES], *bury[XP_CAUSES];
+    const RsEvent *resp[RS_MAX_NPCS];  /* the tick's npc_respawn events (one an npc: a second of a life raises) */
+    uint8_t made_used[XP_CAUSES], bury_used[XP_CAUSES];
+    uint32_t hit_used[XP_CAUSES];  /* stats of the hit already given their XP */
+} XpCauses;
+
+/* XpCheck._respawn_cycle: the hit's npc life respawned in the hit's own tick (respawned[(npc, life)] == tick). A life's
+   one respawn event is its key's only tick (a second raises before any XP of its tick is checked), so the tick's own
+   npc_respawn events decide it. */
+static int respawn_cycle(const XpCauses *c, const RsEvent *hit) {
+    for (int32_t k = 0; k < c->n_resp; k++)
+        if (c->resp[k]->obj == hit->obj && c->resp[k]->v0 == hit->v0) return 1;
+    return 0;
+}
+
+/* XpCheck._percent: a hit's percent per stat (the style's HIT_PERCENT row, hitpoints 133 for every style); 0: none. */
+static int32_t hit_percent(int32_t style, int32_t stat) {
+    if (stat == RS_SKILL_HITPOINTS) return 133;
+    if (style == 0) return stat == RS_SKILL_ATTACK ? 400 : 0;
+    if (style == 1) return stat == RS_SKILL_STRENGTH ? 400 : 0;
+    if (style == 2) return stat == RS_SKILL_DEFENCE ? 400 : 0;
+    if (style == 3) return stat == RS_SKILL_ATTACK || stat == RS_SKILL_STRENGTH || stat == RS_SKILL_DEFENCE ? 133 : 0;
+    return 0;
+}
+
+/* XpCheck._hit_amount: (min(damage, hp) * 10 * percent // 100) * the npc type's combat_xp_multiplier // 1000. */
+static int hit_amount(const RsPack *P, const RsEvent *hit, int32_t stat, int64_t *out, RsErr *err) {
+    const RsNpcType *nt = rs_npc_type(P, hit->count);
+    if (!nt) return RS_FAIL_TEXT(err, RS_E_PACK, "a hit's npc type is not in the pack");
+    int64_t dealt = hit->v1 < hit->v2 ? hit->v1 : hit->v2;
+    *out = rs_floordiv(rs_floordiv(dealt * 10 * hit_percent(hit->v3, stat), 100) * nt->combat_xp_multiplier, 1000);
+    return 0;
+}
+
+/* The stat a production script trains (PRODUCE_SKILL), -1 for a script outside it. */
+static int produce_skill(const RsConsts *C, int32_t script) {
+    if (script == C->s_produce_get_logs) return RS_SKILL_WOODCUTTING;
+    if (script == C->s_produce_ore_normal || script == C->s_produce_ore_fast) return RS_SKILL_MINING;
+    if (script == C->s_produce_fish_roll) return RS_SKILL_FISHING;
+    return -1;
+}
+
+/* XpCheck.owed[script][obj] > 0: every table row of the script's skill whose product is obj gives XP (the least of
+   them above 0); a product no row lists owes none. */
+static int produce_owed(const RsPack *P, int32_t script, int32_t obj) {
+    const RsConsts *C = P->consts;
+    int found = 0;
+    int32_t least = 0;
+    if (script == C->s_produce_get_logs) {
+        for (int32_t r = 0; r < P->n_trees; r++)
+            if (P->trees[r].product == obj && (!found || P->trees[r].productexp < least))
+                least = P->trees[r].productexp, found = 1;
+    } else if (script == C->s_produce_ore_normal || script == C->s_produce_ore_fast) {
+        for (int32_t r = 0; r < P->n_rocks; r++)
+            if (P->rocks[r].output == obj && (!found || P->rocks[r].exp < least)) least = P->rocks[r].exp, found = 1;
+    } else if (script == C->s_produce_fish_roll) {
+        for (int32_t r = 0; r < P->n_fish; r++)
+            if (P->fish[r].obj == obj) least = P->fish[r].productexp, found = 1;
+    }
+    return found && least > 0;
+}
+
+static int xp_fail(RsErr *err, const RsEvent *e, const char *why) {
+    rs_fail(err, RS_E_AUDIT_XP, 2, (const int32_t[]){e->tick, e->a8});
+    err->text = why;
+    return 1;
+}
+
+/* XpCheck._product: the amount the table row gives the production: the tree's (by the xp's src, its loc type) or the
+   compact rock's whose product is the obj, the fish's. Cooking has no C port. */
+static int produce_amount(const RsPack *P, const RsEvent *x, int32_t script, int64_t *out, RsErr *err) {
+    const RsConsts *C = P->consts;
+    if (script == C->s_produce_get_logs || script == C->s_produce_ore_normal || script == C->s_produce_ore_fast) {
+        const RsLocType *lt = rs_loc_type(P, x->v2);
+        int wood = script == C->s_produce_get_logs;
+        int32_t r = !lt ? -1 : wood ? lt->tree_row : lt->rock_row;
+        if (r < 0 || (wood ? P->trees[r].product : P->rocks[r].output) != x->obj)
+            return xp_fail(err, x, wood ? "no tree of that type gives that product" : "no rock of that type gives that ore");
+        *out = wood ? P->trees[r].productexp : P->rocks[r].exp;
+        return 0;
+    }
+    for (int32_t r = 0; r < P->n_fish; r++)
+        if (P->fish[r].obj == x->obj) {
+            *out = P->fish[r].productexp;
+            return 0;
+        }
+    return xp_fail(err, x, "no fish row for that item");
+}
+
+/* XpCheck._amount: the cause in its tick (each production and burial used once, each stat of a hit once) and the
+   amount the tables give it. */
+static int xp_amount(const RsSlot *s, XpCauses *c, const RsEvent *x, int64_t *out, RsErr *err) {
+    const RsPack *P = s->P;
+    int32_t stat = x->a8;
+    switch (x->b8) {
+    case RS_XPC_PRODUCE: {
+        int32_t k = 0;
+        while (k < c->n_made && (c->made_used[k] || c->made[k]->obj != x->obj)) k++;
+        if (k == c->n_made) return xp_fail(err, x, "no production of that item in its tick");
+        c->made_used[k] = 1;
+        int32_t script = c->made[k]->v0;
+        if (produce_skill(P->consts, script) != stat || c->made[k]->count < 1)
+            return xp_fail(err, x, "production by a script that trains no such skill");
+        return produce_amount(P, x, script, out, err);
+    }
+    case RS_XPC_HIT: {
+        int32_t k = 0;
+        while (k < c->n_hit && !(c->hit[k]->obj == x->obj && c->hit[k]->v0 == x->v2)) k++;
+        if (k == c->n_hit || !c->hit[k]->a8) return xp_fail(err, x, "no hit by this agent on that npc life in its tick");
+        if (respawn_cycle(c, c->hit[k])) return xp_fail(err, x, "a hit in its npc life's respawn cycle gives no XP");
+        if (!hit_percent(c->hit[k]->v3, stat) || (c->hit_used[k] >> stat & 1u))
+            return xp_fail(err, x, "a hit in its style gives that stat no more XP");
+        c->hit_used[k] |= 1u << stat;
+        return hit_amount(P, c->hit[k], stat, out, err);
+    }
+    case RS_XPC_BURY: {
+        int32_t k = 0;
+        while (k < c->n_bury && (c->bury_used[k] || c->bury[k]->obj != x->obj)) k++;
+        if (k == c->n_bury || stat != RS_SKILL_PRAYER) return xp_fail(err, x, "no bones of that type buried in its tick");
+        c->bury_used[k] = 1;
+        const RsObjType *t = rs_obj_type(P, x->obj);
+        if (!t || t->bone_exp == RS_NONE) return xp_fail(err, x, "bones without a bone_exp param");
+        *out = t->bone_exp;
+        return 0;
+    }
+    case RS_XPC_LIGHT:   /* no light reaches the C engine (no firemaking port): a light's XP is never checked here */
+        return RS_FAIL_TEXT(err, RS_E_NOT_PORTED, "XpCheck of a light's XP (firemaking)");
+    default:
+        return xp_fail(err, x, "no cause");
+    }
+}
+
+/* One tick's events ev[a..b): the causes, every xp event checked in order (its stat's running XP before, the cause's
+   amount at the declared rate after, capped), then XpCheck._owed: each cause that gives XP has had it. */
+static int xp_tick(RsSlot *s, int32_t a, int32_t b) {
+    World *w = &s->w;
+    RsFree *f = &s->fp;
+    RsErr *err = &w->err;
+    XpCauses c;
+    c.n_made = c.n_hit = c.n_bury = c.n_resp = 0;
+    for (int32_t i = a; i < b; i++) {
+        const RsEvent *e = &w->ev[i];
+        if (e->kind == RS_EV_PRODUCE) {
+            if (c.n_made >= XP_CAUSES) return RS_OVERFLOW(err, "XP_CAUSES productions in one tick");
+            c.made_used[c.n_made] = 0, c.made[c.n_made++] = e;
+        } else if (e->kind == RS_EV_HIT) {
+            if (c.n_hit >= XP_CAUSES) return RS_OVERFLOW(err, "XP_CAUSES hits in one tick");
+            c.hit_used[c.n_hit] = 0, c.hit[c.n_hit++] = e;
+        } else if (e->kind == RS_EV_REMOVE && e->a8 == RS_WHY_BURY) {
+            if (c.n_bury >= XP_CAUSES) return RS_OVERFLOW(err, "XP_CAUSES burials in one tick");
+            c.bury_used[c.n_bury] = 0, c.bury[c.n_bury++] = e;
+        } else if (e->kind == RS_EV_NPC_RESPAWN) {  /* XpCheck.respawned: each npc life respawns once */
+            if (e->obj < 0 || e->obj >= RS_MAX_NPCS) return RS_FAIL_TEXT(err, RS_E_INTERNAL, "a respawn outside the world");
+            if (e->v0 < 0 || e->v0 >= RS_RESPAWN_LIVES) return RS_OVERFLOW(err, "RS_RESPAWN_LIVES lives of one npc");
+            uint8_t *seen = &f->respawned[e->obj][e->v0 >> 3], bit = (uint8_t)(1u << (e->v0 & 7));
+            if (*seen & bit) return RS_FAIL(err, RS_E_AUDIT_RESPAWN, e->obj, e->v0, e->tick);
+            *seen |= bit;
+            if (c.n_resp >= RS_MAX_NPCS) return RS_OVERFLOW(err, "RS_MAX_NPCS respawns in one tick");
+            c.resp[c.n_resp++] = e;
+        }
+    }
+    for (int32_t i = a; i < b; i++) {
+        const RsEvent *x = &w->ev[i];
+        if (x->kind != RS_EV_XP) continue;
+        int32_t stat = x->a8;
+        if (stat >= 21) return xp_fail(err, x, "a stat outside the player's");
+        if (x->v0 != f->xp[stat]) return xp_fail(err, x, "the stat's XP before is not its checked XP");
+        int64_t amount;
+        RS_TRY(xp_amount(s, &c, x, &amount, err));
+        int64_t after = (int64_t)f->xp[stat] + amount * s->cfg->xp_rate;
+        if (after > 2000000000) after = 2000000000;   /* XP_CAP */
+        if (x->count != amount || x->v1 != after) return xp_fail(err, x, "the tables give another amount at its rate");
+        f->gained[stat] += (int64_t)x->v1 - x->v0;
+        f->xp[stat] = x->v1;
+    }
+    for (int32_t k = 0; k < c.n_made; k++)
+        if (!c.made_used[k] && c.made[k]->count >= 1 && produce_owed(s->P, c.made[k]->v0, c.made[k]->obj))
+            return RS_FAIL(err, RS_E_AUDIT_XP_OWED, c.made[k]->tick), err->text = "production", 1;
+    for (int32_t k = 0; k < c.n_hit; k++) {
+        const RsEvent *hit = c.hit[k];
+        if (!hit->a8 || hit->v3 < 0 || hit->v3 > 3 || respawn_cycle(&c, hit)) continue;  /* a respawn cycle owes none */
+        for (int32_t stat = 0; stat < 21; stat++) {
+            int64_t amount;
+            if (!hit_percent(hit->v3, stat) || (c.hit_used[k] >> stat & 1u)) continue;
+            RS_TRY(hit_amount(s->P, hit, stat, &amount, err));
+            if (amount > 0) return RS_FAIL(err, RS_E_AUDIT_XP_OWED, hit->tick), err->text = "hit", 1;
+        }
+    }
+    for (int32_t k = 0; k < c.n_bury; k++) {
+        if (c.bury_used[k]) continue;
+        const RsObjType *t = rs_obj_type(s->P, c.bury[k]->obj);
+        if (!t || t->bone_exp == RS_NONE) return xp_fail(err, c.bury[k], "bones without a bone_exp param");
+        if (t->bone_exp > 0) return RS_FAIL(err, RS_E_AUDIT_XP_OWED, c.bury[k]->tick), err->text = "bones buried", 1;
+    }
+    return 0;
+}
+
+/* XpCheck.observe over ev[first..n): tick by tick (every event of a tick lies in it). */
+int rs_free_xp_check(RsSlot *s, int32_t first, int32_t n) {
+    const World *w = &s->w;
+    for (int32_t i = first; i < n;) {
+        int32_t j = i;
+        while (j < n && w->ev[j].tick == w->ev[i].tick) j++;
+        RS_TRY(xp_tick(s, i, j));
+        i = j;
+    }
+    return 0;
+}
+
+/* ---- fights' summary of a life (combat.fights), event by event over the window */
+/* fights' row of (npc, life): new when that life is past the npc's last row (aggressor: whoever came first). An
+   npc's lives only grow, so its rows come in life order; an event of an earlier row is a path C does not keep. */
+static int fight_row(RsFree *f, int32_t npc, int32_t life, int npc_first, RsErr *err) {
+    if (npc < 0 || npc >= RS_MAX_NPCS) return RS_FAIL_TEXT(err, RS_E_INTERNAL, "a fight with an npc outside the world");
+    if (f->row_life[npc] == life) return 0;
+    if (f->row_life[npc] > life) return RS_FAIL_TEXT(err, RS_E_NOT_PORTED, "a fight row of an npc's earlier life");
+    f->row_life[npc] = life;
+    f->aggressed += npc_first;
+    return 0;
+}
+
+static int fights_feed(RsFree *f, const RsEvent *e, RsErr *err) {
+    switch (e->kind) {
+    case RS_EV_NPC_DAMAGE:
+        if (e->obj < 0 || e->obj >= RS_MAX_NPCS) return RS_FAIL_TEXT(err, RS_E_INTERNAL, "damage to an npc outside the world");
+        /* kill_lives' keys: every hit's (npc, life), whoever dealt it */
+        if (e->v0 < f->hit_life[e->obj]) return RS_FAIL_TEXT(err, RS_E_NOT_PORTED, "a hit on an npc's earlier life");
+        f->hit_life[e->obj] = e->v0;
+        if (!e->a8) return 0;
+        f->life_seen[e->obj] = e->v0, f->has_life[e->obj] = 1;   /* life[npc] = data['life'] */
+        return fight_row(f, e->obj, e->v0, 0, err);
+    case RS_EV_NPC_DEFEATED:
+        if (e->obj < 0 || e->obj >= RS_MAX_NPCS) return RS_FAIL_TEXT(err, RS_E_INTERNAL, "a defeat outside the world");
+        if (e->v0 < f->hit_life[e->obj]) return RS_FAIL_TEXT(err, RS_E_NOT_PORTED, "a defeat of an npc's earlier life");
+        if (e->v0 != f->hit_life[e->obj]) f->defeat_unhit = 1;   /* kill_lives: an npc defeated without a hit */
+        f->life_seen[e->obj] = e->v0 + 1, f->has_life[e->obj] = 1;
+        return 0;
+    case RS_EV_AGENT_HP: {
+        int32_t gained = e->v1 - e->v0;
+        if (e->a8 == RS_HP_DAMAGE) {
+            if (!e->has_source) return 0;
+            int32_t npc = e->v2;
+            if (npc < 0 || npc >= RS_MAX_NPCS) return RS_FAIL_TEXT(err, RS_E_INTERNAL, "damage from an npc outside the world");
+            return fight_row(f, npc, f->has_life[npc] ? f->life_seen[npc] : 0, 1, err);
+        }
+        if (e->a8 == RS_HP_EAT) f->eats++, f->eat_gain += gained;
+        else if (e->a8 == RS_HP_REGEN) f->regen_gain += gained;
+        else if (e->a8 == RS_HP_LEVELUP) f->levelup_gain += gained;
+        return 0;
+    }
+    case RS_EV_REMOVE:
+        f->eaten += e->a8 == RS_WHY_EAT;
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* FreePlayEpisode._account, settled in steps: the events since the cursor (every event of a tick lies in one step,
+   since a step ends at a cycle's end) through XpCheck, tick by tick; each stat's XP against its checked XP; the
+   production (made by family), the agent's defeats (kills) and fights' window (tick < the terminal tick); the cursor
+   moves past them and the World keeps only the last (rs_free_settle's compaction: world.events' length and last event
+   stay the canonical record's). *pay is this step's change of fractional level over S: its terms in S's order, summed
+   as the oracle's sum() sums them (rs_py_sum). */
+static int free_settle(RsSlot *s, double *pay) {
+    World *w = &s->w;
+    RsFree *f = &s->fp;
+    Episode *ep = &s->ep;
+    RsErr *err = &w->err;
+    if (f->checked < w->ev_base || f->checked > w->ev_base + w->n_events)
+        return RS_FAIL_TEXT(err, RS_E_INTERNAL, "a free-play cursor outside the world's events");
+    int32_t first = (int32_t)(f->checked - w->ev_base), n = w->n_events;
+    RS_TRY(rs_free_xp_check(s, first, n));
+    for (int stat = 0; stat < 21; stat++)
+        if (w->p.stats[stat] != f->xp[stat]) return RS_FAIL(err, RS_E_AUDIT_XP_HELD, stat, w->p.stats[stat], f->xp[stat]);
+    for (int32_t i = first; i < n; i++) {
+        const RsEvent *e = &w->ev[i];
+        if (e->kind == RS_EV_PRODUCE) {
+            const RsObjType *t = rs_obj_type(s->P, e->obj);
+            if (t && t->made_family >= 0) ep->made[t->made_family] += e->count;
+        } else if (e->kind == RS_EV_NPC_DEFEATED) {
+            f->kills += e->a8;
+        }
+        if (!ep->terminal || e->tick < ep->term_tick) RS_TRY(fights_feed(f, e, err));
+    }
+    f->checked = w->ev_base + n;
+    double terms[RS_FREE_N_SKILLS];
+    for (int k = 0; k < RS_FREE_N_SKILLS; k++) {
+        double level = rs_fractional_level(s->P, w->p.stats[RS_FREE_SKILLS[k]]);
+        terms[k] = level - f->level[k];
+        f->level[k] = level;
+    }
+    *pay = rs_py_sum(terms, RS_FREE_N_SKILLS);
+    /* the settled events leave the buffer, but the last, which the canonical record shows */
+    if (n > 1) {
+        int32_t drop = n - 1;
+        w->ev[0] = w->ev[n - 1];
+        w->ev_base += drop;
+        w->n_events = 1;
+        if (w->trace) w->trace->ev_seen = w->trace->ev_seen > drop ? w->trace->ev_seen - drop : 0;
+    }
+    return 0;
+}
+
+/* FreePlayEpisode.report's checks at the life's end: check_stats (each stat's XP from arm to end is its events'
+   gain), the paid sum against the fractional gain over S (within 1e-6 of max(1, |gain|)); returns the integer level
+   gain over S (info outcomes). */
+static int free_report(RsSlot *s, int32_t *gain) {
+    World *w = &s->w;
+    RsFree *f = &s->fp;
+    for (int stat = 0; stat < 21; stat++) {
+        int64_t moved = (int64_t)w->p.stats[stat] - f->arm_stats[stat];
+        if (moved != f->gained[stat])
+            return RS_FAIL(&w->err, RS_E_AUDIT_XP_STATS, stat, (int32_t)moved, (int32_t)f->gained[stat]);
+    }
+    double terms[RS_FREE_N_SKILLS];
+    for (int k = 0; k < RS_FREE_N_SKILLS; k++) terms[k] = f->level[k] - f->start_level[k];
+    double fractional = rs_py_sum(terms, RS_FREE_N_SKILLS);  /* report's sum(b - a for ...) */
+    double bound = fabs(fractional) > 1.0 ? fabs(fractional) : 1.0;
+    if (fabs(s->ep.paid - fractional) > 1e-6 * bound) return RS_FAIL0(&w->err, RS_E_AUDIT_PAID);
+    int32_t total = 0;
+    for (int k = 0; k < RS_FREE_N_SKILLS; k++)
+        total += w->p.base_levels[RS_FREE_SKILLS[k]] - f->arm_levels[RS_FREE_SKILLS[k]];
+    *gain = total;
+    return 0;
+}
+
+/* FreePlayEpisode.step with CpuBatch._step_free's info: the action against the last mask, the decision counted, the
+   agent's step until the terminal (an Unsupported closes the life and fails the call; the agent's limits must not
+   cut it), the settlement and its pay, the projection; made and kills so far; at the life's end its report, then
+   fights' window (kill_lives' error) and the facts: no group, success, search or supply, the fights' food and
+   healing, the visited cells. goal -1: no goal. */
+static int free_step(RsSlot *s, int32_t action, RsStepInfo *out) {
+    World *w = &s->w;
+    Episode *ep = &s->ep;
+    RsFree *f = &s->fp;
+    memset(out, 0, sizeof *out);
+    out->goal = -1;
+    int32_t before = w->tick;
+    if (!ep->active) return RS_FAIL0(&w->err, RS_E_CLOSED_LIFE);
+    const int8_t *mask = (const int8_t *)(s->obs + RS_OBS_MASK_OFF);
+    if (action < 0 || action >= RS_N_ACTIONS || !mask[action]) return RS_FAIL(&w->err, RS_E_MASKED_ACTION, action);
+    ep->decisions++;
+    if (!ep->terminal) {
+        if (rs_agent_step(s, action)) {
+            if (w->err.code == RS_UNSUPPORTED) ep->active = 0;
+            return 1;
+        }
+        if (rs_agent_truncated(&s->a)) return RS_FAIL0(&w->err, RS_E_FREE_CUT);
+    }
+    double pay;
+    RS_TRY(free_settle(s, &pay));
+    ep->paid += pay;
+    RS_TRY(free_project(s));
+    out->reward = (float)pay;
+    out->decision_ticks = w->tick - before;
+    for (int k = 0; k < 3; k++) out->made[k] = ep->made[k];
+    out->kills = f->kills;
+    if (!ep->terminal) return 0;
+    ep->active = 0;
+    RS_TRY(free_report(s, &out->outcomes));
+    if (f->defeat_unhit) return RS_FAIL0(&w->err, RS_E_AUDIT_DEFEAT);
+    out->done = 1;
+    out->terminal = ep->term_reason == RS_TERM_DEATH ? RS_TERMINAL_DEATH : RS_TERMINAL_HORIZON;
+    out->episode_return = (float)ep->paid;
+    out->episode_decisions = ep->decisions;
+    out->episode_ticks = ep->term_tick - ep->start_tick;
+    int32_t *facts = out->facts;
+    memset(facts, 0, sizeof out->facts);
+    facts[RS_FACT_DISCOVERY_TICKS] = -1;
+    facts[RS_FACT_CELLS] = popcount64(s->a.visited) + s->a.n_visited_off;   /* len(agent.visited) */
+    facts[RS_FACT_EXHAUSTED_TICK] = facts[RS_FACT_ELSEWHERE_GAP] = -1;
+    facts[RS_FACT_EATEN] = f->eaten, facts[RS_FACT_EAT_GAIN] = f->eat_gain, facts[RS_FACT_REGEN_GAIN] = f->regen_gain;
+    facts[RS_FACT_LEVELUP_GAIN] = f->levelup_gain, facts[RS_FACT_AGGRESSED] = f->aggressed;
+    facts[RS_FACT_EATS_WITHOUT_GAIN] = f->eaten - f->eats;
+    return 0;
+}
+
+/* GoalEpisode._arm (task.py:216-229) with the projection it returns: the setup observation's feedback quieted
    (feedback_contract.episode_start), the clock (start_tick, end), the event cursor, the arm holdings and hitpoints,
    the gathering count carried (goal items held at arm are a ValueError), the payment at 0, armed and active; then the
    ledgers start at the cursor (made, lives, kills 0) and project() writes the first observation. */
@@ -724,7 +1219,7 @@ static int episode_arm(RsSlot *s) {
     ep->paid = 0.0, ep->decisions = 0;
     ep->armed = ep->active = 1;
     ep->ev_seen = ep->event_start;
-    _Alignas(8) uint8_t row[RS_OBS_BYTES];
+    _Alignas(8) uint8_t row[RS_OBS_ROW_BYTES];
     memset(row, 0, sizeof row);
     RS_TRY(rs_project(s, row));
     rs_task_project(s, row);
@@ -750,11 +1245,23 @@ int rs_episode_begin(RsSlot *s, const RsStart *start) {
         return RS_FAIL_TEXT(&w->err, RS_E_CONTRACT, "a start names no layout record (rs_start_rec)");
     RsNpcSpawn spawns[RS_MAX_NPCS];
     int n_spawns = 0;
+    int village = kind == RS_START_VILLAGE, fights = kind == RS_START_COMBAT || village;
     if (kind == RS_START_COMBAT) RS_TRY(rs_combat_npcs(P, start, spawns, &n_spawns, &w->err));
+    if (village) {
+        if (start->length < 1 || start->length > RS_MAX_HORIZON || !start->placed != !s->cfg->muggers
+            || (!start->placed && start->n_muggers))
+            return RS_FAIL_TEXT(&w->err, RS_E_CONTRACT, "a village start of another life length or muggers setting");
+        RS_TRY(rs_village_npcs(P, start, spawns, &n_spawns, &w->err));
+    }
     s->start = *start;
-    uint8_t excl = kind == RS_START_COMBAT ? RS_COMBAT_EXCLUSIONS : kind == RS_START_SUPPLY ? RS_SUPPLY_EXCLUSIONS : 0;
-    RS_TRY(rs_world_init(w, P, &P->layouts[start->rec], start->world_seed, RS_WORLD_START_TICK,
-                         kind == RS_START_COMBAT ? spawns : NULL, n_spawns, excl, RS_XP_RATE));
+    s->has_start = 1;
+    int32_t v = village ? P->layouts[start->rec].village : -1;   /* village_life: village_of(layout) */
+    if (village && (v < 0 || v >= RS_N_VILLAGES)) return RS_FAIL_TEXT(&w->err, RS_E_CONTRACT, RS_VILLAGE_NONE);
+    uint8_t excl = kind == RS_START_COMBAT ? RS_COMBAT_EXCLUSIONS : kind == RS_START_SUPPLY ? RS_SUPPLY_EXCLUSIONS
+        : village ? RS_VILLAGE_EXCLUSIONS[v] : 0;
+    RS_TRY(rs_world_init(w, P, &P->layouts[start->rec], start->world_seed, RS_WORLD_START_TICK, fights ? spawns : NULL,
+                         n_spawns, excl, s->cfg->xp_rate));
+    if (village && RS_VILLAGE_OWN_LOOT[v]) w->loot = RS_OF_LOOT_OUTSIDE_OWN;   /* World(loot_outside=its list) */
     w->trace = s->trace;
     if (s->trace) rs_trace_begin(s->trace, s->episode);
     episode_init(s, kind);
@@ -763,13 +1270,13 @@ int rs_episode_begin(RsSlot *s, const RsStart *start) {
     int32_t kit[RS_START_KIT_MAX], count[RS_START_KIT_MAX];
     int n_kit = rs_start_kit(P, start, kit, count);
     RS_TRY(rs_agent_start(s, 0, start->tile_x, start->tile_z, kit, count, n_kit, start->levels));
-    if (kind == RS_START_COMBAT) {
+    if (fights) {
         int32_t base = w->p.base_levels[RS_SKILL_HITPOINTS];
         if (start->hp < 1 || start->hp > base) return RS_FAIL(&w->err, RS_E_HP_RANGE, start->hp, base);
         w->p.levels[RS_SKILL_HITPOINTS] = (int16_t)start->hp;
     }
     RS_TRY(rs_agent_step(s, RS_A_STYLE0));
-    if (kind == RS_START_COMBAT && start->worn) {
+    if (fights && start->worn) {
         const RsObjType *t = rs_obj_type(P, C->weapons[start->weapon]);
         if (!t) return RS_FAIL_TEXT(&w->err, RS_E_PACK, "a start weapon is not in the pack");
         int32_t slot = -1;
@@ -778,7 +1285,7 @@ int rs_episode_begin(RsSlot *s, const RsStart *start) {
         if (slot < 0) return RS_FAIL(&w->err, RS_E_NO_WIELD, t->name);
         RS_TRY(rs_agent_step(s, RS_A_HELD0 + slot));
     }
-    RS_TRY(episode_arm(s));
+    RS_TRY(village ? free_arm(s) : episode_arm(s));
     if (kind == RS_START_SUPPLY) {
         const RsLayout *L = &P->layouts[P->supply0 + start->layout];
         RsSupply *t = &s->supply;
@@ -798,6 +1305,7 @@ int rs_episode_begin(RsSlot *s, const RsStart *start) {
 
 int rs_episode_new(RsSlot *s, int64_t key) {
     RsStart start;
+    s->has_start = 0;  /* CpuBatch._start: starts[b] = None before the draw */
     RS_TRY(rs_episode_draw(s, key, &start, &s->w.err));
     return rs_episode_begin(s, &start);
 }
@@ -821,6 +1329,7 @@ static void track_bank(RsSlot *s) {
    ledgers', and a terminal step adds the ended episode's fields and facts. The projection is built aside and kept
    only once it is whole, so a failed step leaves the last observation (CpuBatch's stale task.projected). */
 int rs_episode_step(RsSlot *s, int32_t action, RsStepInfo *out) {
+    if (s->start.kind == RS_START_VILLAGE) return free_step(s, action, out);
     World *w = &s->w;
     Episode *ep = &s->ep;
     memset(out, 0, sizeof *out);
@@ -837,7 +1346,7 @@ int rs_episode_step(RsSlot *s, int32_t action, RsStepInfo *out) {
         }
         track_bank(s);
     }
-    _Alignas(8) uint8_t row[RS_OBS_BYTES];
+    _Alignas(8) uint8_t row[RS_OBS_ROW_BYTES];
     memset(row, 0, sizeof row);
     RS_TRY(rs_project(s, row));
     rs_task_project(s, row);

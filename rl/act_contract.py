@@ -15,6 +15,8 @@ import zlib
 
 import numpy as np
 
+from item_contract import ITEM_CONTRACTS, ITEM_V3
+
 ACT_V3 = 'act-v3'
 A_ACT0, N_ACT = 1, 16
 A_HELD0, N_HELD = 29, 8
@@ -51,8 +53,8 @@ def name_id(text):
 
 
 def acts_from_config(cfg):
-    if cfg.get('actTargets') != ACT_V3 or cfg.get('contract') != 'item-v2':
-        raise ValueError('the task requires item-v2 and act-v3 affordances')
+    if cfg.get('actTargets') != ACT_V3 or cfg.get('contract') not in ITEM_CONTRACTS:
+        raise ValueError('the task requires item-v2 or item-v3 and act-v3 affordances')
     return ACT_V3
 
 
@@ -71,7 +73,7 @@ def bank_distance(target, near):
 
 def project_acts(obs, ident):
     """`ident(kind, name)` gives a thing's row in the name table (rl/names.py)."""
-    if obs.get('actTargetVersion') != ACT_V3 or obs.get('contractVersion') != 'item-v2':
+    if obs.get('actTargetVersion') != ACT_V3 or obs.get('contractVersion') not in ITEM_CONTRACTS:
         raise ValueError('Invalid act observation version')
     acts, held, mask = obs.get('actSel'), obs.get('heldSel'), obs.get('mask', [0] * 96)
     if not isinstance(acts, list) or len(acts) > N_ACT or not isinstance(held, list) or len(held) > N_HELD:
@@ -113,7 +115,8 @@ def project_acts(obs, ident):
                 or not h['option'] or h['option'].lower() == 'drop'):
             raise ValueError('Held affordance does not match the visible page')
         held_ids[i], held_ops[i] = ident('obj', item['name']), name_id(h['option'])
-        held_feats[i] = [np.log1p(item['count']) / 5.0, 1.0]
+        # the count input: the slot's own count (item-v2), or the kind's total over the pack (item-v3)
+        held_feats[i] = [np.log1p(item['total'] if obs['contractVersion'] == ITEM_V3 else item['count']) / 5.0, 1.0]
     if any(mask[A_HELD0 + len(held):A_HELD0 + N_HELD]):
         raise ValueError('Held slot/action mapping mismatch')
     return {'act_ids': ids, 'act_op_ids': ops, 'act_feats': feats,

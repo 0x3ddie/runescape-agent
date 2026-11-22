@@ -1,7 +1,7 @@
 # Notes
 
-How the project got where it is, from the first agent in the real engine to now, and then
-[the results in detail](#results-in-detail) with how far to trust each number.
+How the project got where it is, from the first agent in the real engine to goal-free play, and then
+[the results of the 12 November release in detail](#results-in-detail) with how far to trust each number.
 
 ## Starting in the real engine
 
@@ -111,14 +111,41 @@ That doesn't tell us what training with the fix would do, since those weights le
 it. In the real engine, an idle player hit back in 16 of 16 trials, which is the rule the fix
 follows.
 
-## Where it's at
+## Goal-free play (12 to 21 November)
 
-Phase 2 (firemaking, cooking, and eating food you cooked yourself) has just started. The Python
-reference runs both skills from the engine's scripts. The C port, the tasks and training aren't
-done yet. Every task still tells the agent its goal, no run has learned to bank, and no action
-reaches a shop's buy or sell buttons.
+Every task up to phase 1 told the agent what to do. The next question was whether it would
+find things to do by itself, so we dropped the goal. One policy now plays whole lives and is
+paid the gain in its own levels, across every stat in the game.
+
+We also moved training into the real engine. The simulator only has the mechanics we ported,
+so the agent never sees anything it leaves out, and training in the real server closes that
+gap. Many agents of one policy share each world of the real server. The world stops at every tick where an agent needs a new
+action and waits while the learner trains. The C simulator got the same goal-free task, still
+has to match the Python reference bit for bit, and stays as the fast twin.
+
+The agent picked up four skills on its own: woodcutting, firemaking, fighting and burying
+bones. Then it stopped. It never ate when hurt: its actions reach only the 8 pack slots of the
+page on screen, and it drops all its food early in a life to free those slots for logs. A
+charge for time spent hurt, a pay for first uses (which brought the first cooked food, but got
+farmed), lives started at a long life's levels and a phase of extra exploration all failed to
+add a skill. Across four tests the agent moved between the skills it knew and never tried a
+new one, even with a rock one step away.
+
+What was missing was exploration aimed at what the agent hadn't tried. So we added a small pay
+for each decision that gives XP in a stat, worth 10 / (10 + R), where R counts the recent
+decisions with XP in that stat. It is big for rare kinds of XP, fades as they become common,
+and names no skill. On lives that started at a long life's levels, the share that mined five
+ores or more went from 0.7% and 0.0% to 15.1% and 13.6% (two seeds). After we switched the
+pay off for 25 more updates, mining stayed and grew, to 15.1% and 47.7%, and those lives
+gained more levels than lives that were never paid. The pay gave the first tries, and the
+game's own levels kept them.
+
+Limits: two seeds, the long-life starts only (lives at their drawn levels still rarely mine),
+and deaths rose on small counts. The agent still doesn't fish, cook or eat when hurt.
 
 ## Results in detail
+
+These are the results of the 12 November release, the one-skill-at-a-time policies.
 
 ### How to read the numbers
 
@@ -280,13 +307,13 @@ and 300-tick wood (178-197 per variant), losing some combat skill. Tried beside 
   interface actions, fewer kills, and 21.5 to 41 points of combat lost against the start in every
   seed; search was not better. Likely reason, not tested: the bonus is paid per decision.
 - **Continual backpropagation,** with that bonus and then alone. Alone it showed no combat benefit.
-- **Self-distillation** ([sim/distill.py](../sim/distill.py)) kept slightly more of the earlier
+- **Self-distillation** kept slightly more of the earlier
   skills and blocked the new learning.
 - **Targeted self-distillation** learned the new task, but greedy search fell to 141 and 139 of 200
   in two seeds (sampled 188 and 192), and it missed the combat floor and the recovery bounds.
 - **PCGrad** met every rule in two seeds and lost combat in the third: 583 and 568 of 800 against
   its start's 659 and 654. A follow-up gradient check was inconclusive. The code for the bonus,
-  continual backpropagation and PCGrad is not in this repository.
+  continual backpropagation, the distillation and PCGrad is not in this repository.
 
 ### What isn't done yet
 
@@ -294,4 +321,4 @@ and 300-tick wood (178-197 per variant), losing some combat skill. Tried beside 
   controls can bank (deposit, withdraw, walk back, chop again) in 16 of 16. No action reaches a
   shop's buy or sell buttons: Trade opened the shop in 16 of 16, then only WAIT and close were legal.
 - Mine and melee under clicks are one-seed runs (three for the mine retrain), fish has no click
-  policy, melee has no faithful native check, and every task gives the agent its goal.
+  policy, melee has no faithful native check, and every one of these tasks gives the agent its goal.

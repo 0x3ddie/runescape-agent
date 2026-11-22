@@ -26,6 +26,7 @@ import importlib.machinery
 import importlib.util
 import shlex
 import subprocess
+import sys
 import sysconfig
 
 from hypothesis import given, settings, strategies as st
@@ -203,6 +204,9 @@ int rs_feedback(RsSlot *s, const RsMeaning *m, const RsSnap *b, const RsSnap *a,
     return RS_NOT_PORTED_HERE(&s->w.err);
 }
 int rs_capture_text(RsSlot *s) { return RS_NOT_PORTED_HERE(&s->w.err); }
+/* free play's (task.c's life cut and obs-v6 projection): this module replays goal tasks only */
+int rs_agent_truncated(const Agent *a) { (void)a; RS_TRAP(); return 0; }
+void rs_project_progress(const RsSlot *s, uint8_t *row) { (void)s, (void)row; RS_TRAP(); }
 
 /* rt_canon: the canonical record of a slot whose agent and episode are loaded from `in` (AGENT_STATE's order, Python
    encode_state) over an empty world on the pack's first compact layout holding only the npcs' nids. */
@@ -392,6 +396,11 @@ def build_replay(out_dir):
                str(native.SOURCE), *map(str, sources), str(shim), '-o', str(out), '-lz', '-lpthread']
     done = subprocess.run(command, capture_output=True, text=True, timeout=300)
     assert done.returncode == 0, done.stderr[-3000:]
+    # the double stands for every entry point of REPLACED: the build binds all its symbols in a new process, where no
+    # earlier test's extension could lend one it lacks (dyld's flat namespace takes them from any loaded image)
+    loads = subprocess.run([sys.executable, '-c', f'import ctypes, os; ctypes.CDLL({str(out)!r}, mode=os.RTLD_NOW)'],
+                           capture_output=True, text=True, timeout=120)
+    assert loads.returncode == 0, loads.stderr[-2000:]
     return out
 
 

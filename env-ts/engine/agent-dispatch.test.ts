@@ -8,6 +8,6 @@ test('the engine agent dispatches clicks and ACT by the client\'s rule (agent-di
         stdout: 'pipe', stderr: 'pipe' });
     const out = run.stdout.toString() + run.stderr.toString();
     expect(run.exitCode, out).toBe(0);
-    expect(out).toMatch(/\b12 pass\b/);
+    expect(out).toMatch(/\b15 pass\b/);
     expect(out).toMatch(/\b0 fail\b/);
 });

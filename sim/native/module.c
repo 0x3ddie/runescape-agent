@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "pysum.h"
 #include "rs.h"
 
 static PyObject *Error;
@@ -232,7 +233,9 @@ static PyObject *constants(PyObject *self, PyObject *unused) {
         || set_int(out, "RS_MAX_REQS", RS_MAX_REQS) || set_int(out, "RS_MAX_EVENTS", RS_MAX_EVENTS)
         || set_int(out, "RS_FRAME_DEPTH", RS_FRAME_DEPTH) || set_int(out, "RS_N_FACTS", RS_N_FACTS)
         || set_int(out, "sizeof_World", sizeof(World)) || set_int(out, "sizeof_Agent", sizeof(Agent))
-        || set_int(out, "sizeof_Episode", sizeof(Episode)) || set_int(out, "sizeof_RsSlot", sizeof(RsSlot)))
+        || set_int(out, "sizeof_Episode", sizeof(Episode)) || set_int(out, "sizeof_RsSlot", sizeof(RsSlot))
+        || set_int(out, "RS_TASK_FREE", RS_TASK_FREE) || set_int(out, "RS_OBS_ROW_BYTES", RS_OBS_ROW_BYTES)
+        || set_int(out, "RS_OBS_PROGRESS_OFF", RS_OBS_PROGRESS_OFF))
         goto fail;
     Py_DECREF(sections);
     Py_DECREF(obs);
@@ -305,6 +308,36 @@ static PyObject *js_round(PyObject *self, PyObject *args) {
     return PyLong_FromLongLong(rs_js_round(v));
 }
 
+/* rs_py_sum over a sequence of floats (the tests hold it to Python's own sum()). */
+static PyObject *py_sum(PyObject *self, PyObject *arg) {
+    (void)self;
+    PyObject *seq = PySequence_Fast(arg, "py_sum takes a sequence of floats");
+    if (!seq) return NULL;
+    Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    if (n > INT32_MAX) {
+        Py_DECREF(seq);
+        return PyErr_Format(PyExc_ValueError, "py_sum of %zd terms", n);
+    }
+    double *x = PyMem_Malloc(sizeof(double) * (size_t)(n ? n : 1));
+    if (!x) {
+        Py_DECREF(seq);
+        return PyErr_NoMemory();
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
+        if (!PyFloat_CheckExact(item)) {
+            PyMem_Free(x);
+            Py_DECREF(seq);
+            return PyErr_Format(PyExc_TypeError, "py_sum term %zd is not a float", i);
+        }
+        x[i] = PyFloat_AS_DOUBLE(item);
+    }
+    double total = rs_py_sum(x, (int)n);
+    PyMem_Free(x);
+    Py_DECREF(seq);
+    return PyFloat_FromDouble(total);
+}
+
 static PyObject *int_op(PyObject *args, int what) {
     long long a, b;
     if (!PyArg_ParseTuple(args, "LL", &a, &b)) return NULL;
@@ -346,11 +379,11 @@ static PyObject *start_dict(const RsPack *P, const RsStart *s) {
         || set_int(d, "world_seed", s->world_seed) || set_int(d, "group", s->group) || set_int(d, "hp", s->hp)
         || set_list(d, "food", food, n_food) || set_int(d, "worn", s->worn) || set_list(d, "mugger_x", mx, n_muggers)
         || set_list(d, "mugger_z", mz, n_muggers) || set_int(d, "grove", s->grove) || set_int(d, "variant", s->variant)
-        || set_int(d, "rec", s->rec)) {
+        || set_int(d, "rec", s->rec) || set_int(d, "length", s->length) || set_int(d, "placed", s->placed)) {
         Py_XDECREF(d);
         return NULL;
     }
-    int32_t pool = (s->kind == RS_START_SUPPLY ? P->supply0 : P->compact0) + s->layout;
+    int32_t pool = (s->kind == RS_START_SUPPLY ? P->supply0 : P->compact0) + s->layout;   /* village: compact */
     int ok = s->layout >= 0 && pool >= 0 && pool < P->n_layouts
         && P->layouts[pool].kind == (s->kind == RS_START_SUPPLY ? RS_LAYOUT_SUPPLY : RS_LAYOUT_COMPACT);
     if (ok ? set_int(d, "seed", P->layouts[pool].rec->seed) : PyDict_SetItemString(d, "seed", Py_None)) {
@@ -452,18 +485,25 @@ static PyObject *Pack_draw_start(PackObject *self, PyObject *args) {
     return start_dict(self->pack, &start);
 }
 
-/* Pack.episode_draw(task, goal, key, slot, episode): rs_episode_draw for a slot of that task and goal, with the
-   start's kit and, for a combat start, its npc spawns: (start_dict, [(obj, count)], [(nid, type, x, z, level, size)]
-   or None). Raises Error. */
+/* Pack.episode_draw(task, goal, key, slot, episode[, muggers, life_kind, life_lo, life_hi]): rs_episode_draw for a
+   slot of that task and goal (free-play-v1: with those settings), with the start's kit and, for a combat or village
+   start, its npc spawns: (start_dict, [(obj, count)], [(nid, type, x, z, level, size)] or None). Raises Error. */
 static PyObject *Pack_episode_draw(PackObject *self, PyObject *args) {
-    int task, goal, slot, episode;
+    int task, goal, slot, episode, muggers = 0, life_kind = 0, life_lo = 0, life_hi = 0;
     long long key;
-    if (!PyArg_ParseTuple(args, "iiLii", &task, &goal, &key, &slot, &episode)) return NULL;
+    if (!PyArg_ParseTuple(args, "iiLii|iiii", &task, &goal, &key, &slot, &episode, &muggers, &life_kind, &life_lo,
+                          &life_hi))
+        return NULL;
+    if (muggers != 0 && muggers != 1) {  /* rs_batch_new's rule: muggers are placed (1) or not (0) */
+        PyErr_SetString(PyExc_ValueError, "muggers: 0 or 1");
+        return NULL;
+    }
     RsSlot *s = calloc(1, sizeof *s);
     if (!s) return PyErr_NoMemory();
     RsConfig cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.task = task;
+    cfg.muggers = muggers, cfg.life_kind = life_kind, cfg.life_lo = life_lo, cfg.life_hi = life_hi;
     s->P = self->pack, s->cfg = &cfg, s->goal = goal, s->slot = slot, s->episode = episode;
     RsStart start;
     RsErr err;
@@ -472,11 +512,13 @@ static PyObject *Pack_episode_draw(PackObject *self, PyObject *args) {
     int n_npcs = 0, failed = rs_episode_draw(s, key, &start, &err);
     free(s);
     if (!failed && start.kind == RS_START_COMBAT) failed = rs_combat_npcs(self->pack, &start, npcs, &n_npcs, &err);
+    if (!failed && start.kind == RS_START_VILLAGE) failed = rs_village_npcs(self->pack, &start, npcs, &n_npcs, &err);
     if (failed) return raise_err(&err, -1);
     int32_t obj[RS_START_KIT_MAX], count[RS_START_KIT_MAX];
     int n_kit = rs_start_kit(self->pack, &start, obj, count);
     PyObject *d = start_dict(self->pack, &start), *kit = PyList_New(n_kit);
-    PyObject *spawns = start.kind == RS_START_COMBAT ? PyList_New(n_npcs) : (Py_INCREF(Py_None), Py_None);
+    int fights = start.kind == RS_START_COMBAT || start.kind == RS_START_VILLAGE;
+    PyObject *spawns = fights ? PyList_New(n_npcs) : (Py_INCREF(Py_None), Py_None);
     for (int i = 0; kit && i < n_kit; i++) {
         PyObject *row = Py_BuildValue("(ii)", obj[i], count[i]);
         if (!row) Py_CLEAR(kit);
@@ -679,6 +721,43 @@ done:
     return out;
 }
 
+/* Pack.xp_check(events, stats, rate): rs_free_xp_check (XpCheck.observe) of these events (rows of RsEvent's 11
+   fields, in order) from these 21 stats' XP at that XP rate: (each stat's checked XP, each stat's gain), or Error. */
+static PyObject *Pack_xp_check(PackObject *self, PyObject *args) {
+    PyObject *events, *stats;
+    int rate;
+    if (!PyArg_ParseTuple(args, "OOi", &events, &stats, &rate)) return NULL;
+    RsSlot *s = calloc(1, sizeof *s);
+    if (!s) return PyErr_NoMemory();
+    RsConfig cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.task = RS_TASK_FREE, cfg.xp_rate = rate;
+    s->P = s->w.P = self->pack, s->cfg = &cfg;
+    PyObject *out = NULL;
+    int64_t xp[21];
+    Py_ssize_t n = PySequence_Size(events);
+    if (n < 0 || each_row(events, 11, RS_MAX_EVENTS, "events", put_event, s->w.ev) || int_items(stats, xp, 21, "stats"))
+        goto done;
+    s->w.n_events = (int32_t)n;
+    for (int k = 0; k < 21; k++) s->fp.xp[k] = (int32_t)xp[k];
+    if (rs_free_xp_check(s, 0, (int32_t)n)) {
+        out = raise_err(&s->w.err, -1);
+        goto done;
+    }
+    int64_t gained[21];
+    for (int k = 0; k < 21; k++) xp[k] = s->fp.xp[k], gained[k] = s->fp.gained[k];
+    PyObject *a = PyList_New(21), *b = PyList_New(21);
+    for (int k = 0; a && b && k < 21; k++) {
+        PyList_SET_ITEM(a, k, PyLong_FromLongLong(xp[k]));
+        PyList_SET_ITEM(b, k, PyLong_FromLongLong(gained[k]));
+    }
+    out = a && b ? Py_BuildValue("(NN)", a, b) : NULL;
+    if (!out) Py_XDECREF(a), Py_XDECREF(b);
+done:
+    free(s);
+    return out;
+}
+
 static PyMethodDef Pack_methods[] = {
     {"string", (PyCFunction)Pack_string, METH_VARARGS, "the string of a string id ('' out of range)"},
     {"sections", (PyCFunction)Pack_sections, METH_NOARGS, "[(id, dtype, count, elem, nbytes, offset)]"},
@@ -688,6 +767,8 @@ static PyMethodDef Pack_methods[] = {
     {"draw_start", (PyCFunction)Pack_draw_start, METH_VARARGS, "rs_draw_start(pool, key, slot, episode): the start"},
     {"episode_draw", (PyCFunction)Pack_episode_draw, METH_VARARGS,
      "rs_episode_draw(task, goal, key, slot, episode): (start, kit, combat npcs or None)"},
+    {"xp_check", (PyCFunction)Pack_xp_check, METH_VARARGS,
+     "xp_check(events, stats, rate): XpCheck.observe in C, (xp, gained) or Error (free-play-v1's settlement)"},
     {"ledgers", (PyCFunction)(void (*)(void))Pack_ledgers, METH_VARARGS | METH_KEYWORDS,
      "an episode's step ledgers and terminal accounts over recorded events"},
     {NULL, NULL, 0, NULL},
@@ -710,8 +791,10 @@ static PyTypeObject PackType = {
 };
 
 /* ---- Batch ------------------------------------------------------------------------------------------------------ */
-enum { OUT_OBS = 0, OUT_INFO = OUT_OBS + RS_OBS_N_KEYS, OUT_MADE = OUT_INFO + RS_INFO_N, OUT_KILLS, OUT_FACTS,
-       OUT_REWARD, OUT_DONE, OUT_N };
+/* the bound views: obs-v5's arrays (goal tasks) or obs-v6's and last_obs's (free-play-v1), then the info */
+enum { OUT_OBS = 0, OUT_OBS6 = OUT_OBS + RS_OBS_N_KEYS, OUT_LAST6 = OUT_OBS6 + RS_OBS6_N_KEYS,
+       OUT_INFO = OUT_LAST6 + RS_OBS6_N_KEYS, OUT_MADE = OUT_INFO + RS_INFO_N, OUT_KILLS, OUT_FACTS, OUT_REWARD, OUT_DONE,
+       OUT_N };
 
 typedef struct {
     PyObject_HEAD
@@ -780,6 +863,12 @@ static PyObject *Batch_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
         return NULL;
     c.threads = 1;
     if (PyDict_GetItemString(cfg, "threads") && cfg_int(cfg, "threads", &c.threads)) return NULL;
+    /* the worlds' XP rate (the goal tasks': the engine's, when absent) and free-play-v1's settings (absent: none) */
+    c.xp_rate = RS_ENGINE_XP_RATE;
+    static const char *const FREE_KEYS[] = {"xp_rate", "muggers", "life_kind", "life_lo", "life_hi"};
+    int32_t *free_vals[] = {&c.xp_rate, &c.muggers, &c.life_kind, &c.life_lo, &c.life_hi};
+    for (int k = 0; k < 5; k++)
+        if (PyDict_GetItemString(cfg, FREE_KEYS[k]) && cfg_int(cfg, FREE_KEYS[k], free_vals[k])) return NULL;
     Py_buffer table;
     if (take_log1p(log1p, &table)) return NULL;
     RsBatch *batch;
@@ -839,12 +928,19 @@ static PyObject *Batch_bind(BatchObject *self, PyObject *args) {
     Py_ssize_t n = self->batch->n;
     char name[64];
     int failed = 0;
-    for (int k = 0; k < RS_OBS_N_KEYS && !failed; k++) {
+    int v6 = self->batch->cfg.task == RS_TASK_FREE;   /* free-play-v1: obs-v6 and its last_obs (sim/workers.py fields) */
+    for (int k = 0; k < RS_OBS_N_KEYS && !failed && !v6; k++) {
         snprintf(name, sizeof name, "obs/%s", RS_OBS_NAMES[k]);
         int ndim = RS_OBS_NDIM[k];
         failed = take(arrays, name, RS_OBS_FORMAT[k], ndim, RS_OBS_SHAPE[2 * k], RS_OBS_SHAPE[2 * k + 1], n,
                       &views[OUT_OBS + k]);
     }
+    for (int pass = 0; pass < 2 && v6; pass++)
+        for (int k = 0; k < RS_OBS6_N_KEYS && !failed; k++) {
+            snprintf(name, sizeof name, pass ? "last_obs/%s" : "obs/%s", RS_OBS6_NAMES[k]);
+            failed = take(arrays, name, RS_OBS6_FORMAT[k], RS_OBS6_NDIM[k], RS_OBS6_SHAPE[2 * k], RS_OBS6_SHAPE[2 * k + 1],
+                          n, &views[(pass ? OUT_LAST6 : OUT_OBS6) + k]);
+        }
     for (int k = 0; k < RS_INFO_N && !failed; k++) {
         snprintf(name, sizeof name, "info/%s", RS_INFO_NAMES[k]);
         failed = take(arrays, name, RS_INFO_FORMAT[k], 0, 0, 0, n, &views[OUT_INFO + k]);
@@ -862,7 +958,10 @@ static PyObject *Batch_bind(BatchObject *self, PyObject *args) {
     memcpy(self->views, views, sizeof views);
     self->bound = 1;
     RsOut *o = &self->out;
+    memset(o, 0, sizeof *o);
+    o->v6 = (uint8_t)v6;
     for (int k = 0; k < RS_OBS_N_KEYS; k++) o->obs[k] = views[OUT_OBS + k].buf;
+    for (int k = 0; k < RS_OBS6_N_KEYS; k++) o->obs6[k] = views[OUT_OBS6 + k].buf, o->last6[k] = views[OUT_LAST6 + k].buf;
     for (int k = 0; k < RS_INFO_N; k++) o->info[k] = views[OUT_INFO + k].buf;
     o->made = views[OUT_MADE].buf;
     o->kills = views[OUT_KILLS].buf;
@@ -942,6 +1041,7 @@ static int world_arg(BatchObject *self, PyObject *args, int32_t *b) {
 static PyObject *Batch_start(BatchObject *self, PyObject *args) {
     int32_t b;
     if (world_arg(self, args, &b)) return NULL;
+    if (!self->batch->slots[b].has_start) Py_RETURN_NONE;  /* no start: a reset or a draw that has not begun one */
     return start_dict(self->batch->P, &self->batch->slots[b].start);
 }
 
@@ -955,6 +1055,23 @@ static PyObject *Batch_late(BatchObject *self, PyObject *unused) {
         for (int32_t i = 0; i < s->n_late; i++) {
             PyObject *v = Py_BuildValue("(iiiL)", (int)b, (int)s->late[i].off, (int)s->late[i].k,
                                         (long long)s->late[i].count);
+            if (!v || PyList_Append(out, v)) Py_CLEAR(out);
+            Py_XDECREF(v);
+        }
+    }
+    return out;
+}
+
+/* The late log1p features of each world's info['last_obs'] row (free-play-v1: the life's last observation, written
+   at the step that ended it): [(b, byte offset in the packed row, RS_LOG1P_* row, count)]. */
+static PyObject *Batch_late_last(BatchObject *self, PyObject *unused) {
+    (void)unused;
+    PyObject *out = PyList_New(0);
+    for (int32_t b = 0; out && b < self->batch->n; b++) {
+        const RsSlot *s = &self->batch->slots[b];
+        for (int32_t i = 0; s->has_last && i < s->n_late_last; i++) {
+            PyObject *v = Py_BuildValue("(iiiL)", (int)b, (int)s->late_last[i].off, (int)s->late_last[i].k,
+                                        (long long)s->late_last[i].count);
             if (!v || PyList_Append(out, v)) Py_CLEAR(out);
             Py_XDECREF(v);
         }
@@ -1018,7 +1135,7 @@ static int get_int(PyObject *d, const char *key, int32_t *out, int required, int
 /* An RsStart from start_dict's keys (sim/native.py encode_start); rec absent or -1 is rs_start_rec's. */
 static int start_of(const RsPack *P, PyObject *d, RsStart *s, RsErr *err) {
     memset(s, 0, sizeof *s);
-    int32_t tx, tz, worn;
+    int32_t tx, tz, worn, placed;
     int64_t levels[7], food[4], mx[1], mz[1];
     int n_levels, n_food, nmx, nmz;
     if (get_int(d, "kind", &s->kind, 1, 0) || get_int(d, "layout", &s->layout, 1, 0)
@@ -1026,8 +1143,10 @@ static int start_of(const RsPack *P, PyObject *d, RsStart *s, RsErr *err) {
         || get_int(d, "world_seed", &s->world_seed, 1, 0) || get_list(d, "levels", levels, 7, &n_levels)
         || get_int(d, "group", &s->group, 0, 0) || get_int(d, "hp", &s->hp, 0, 0) || get_int(d, "worn", &worn, 0, 0)
         || get_int(d, "grove", &s->grove, 0, -1) || get_int(d, "variant", &s->variant, 0, -1)
-        || get_int(d, "rec", &s->rec, 0, -1))
+        || get_int(d, "rec", &s->rec, 0, -1) || get_int(d, "length", &s->length, 0, 0)
+        || get_int(d, "placed", &placed, 0, 0))
         return -1;
+    s->placed = (uint8_t)(placed != 0);
     n_food = nmx = nmz = 0;
     if ((PyDict_GetItemString(d, "food") && get_list(d, "food", food, 4, &n_food))
         || (PyDict_GetItemString(d, "mugger_x") && get_list(d, "mugger_x", mx, 1, &nmx))
@@ -1210,6 +1329,7 @@ static PyMethodDef Batch_methods[] = {
     {"step", (PyCFunction)Batch_step, METH_VARARGS, "rs_batch_step(actions: int32 [n]) into the bound arrays"},
     {"episodes", (PyCFunction)Batch_episodes, METH_NOARGS, "each world's episode counter"},
     {"late", (PyCFunction)Batch_late, METH_NOARGS, "the late log1p features of each world's last observation"},
+    {"late_last", (PyCFunction)Batch_late_last, METH_NOARGS, "the late log1p features of each world's last_obs row"},
     {"cycles", (PyCFunction)Batch_cycles, METH_NOARGS, "world cycles run by every slot so far (setup included)"},
     {"check", (PyCFunction)Batch_check, METH_NOARGS,
      "check_batch's value checks on the bound observations: None, or the failing key (the mask's: N_KEYS)"},
@@ -1248,6 +1368,7 @@ static PyMethodDef methods[] = {
     {"rng_draw", rng_draw, METH_VARARGS, "Rng.draw(h, *keys)"},
     {"rng_pick", rng_pick, METH_VARARGS, "int(m / 2**24 * n)"},
     {"js_round", js_round, METH_VARARGS, "Math.round"},
+    {"py_sum", py_sum, METH_O, "sum() of a sequence of floats as CPython 3.12 and later compute it (pysum.h)"},
     {"floordiv", floordiv, METH_VARARGS, "Python //"},
     {"mod", mod, METH_VARARGS, "Python %"},
     {"asr", asr, METH_VARARGS, "Python >>"},

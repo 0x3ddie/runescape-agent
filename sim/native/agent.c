@@ -153,6 +153,8 @@ static int truncated(const Agent *a) {
     return a->charged >= a->max_decisions || a->episode_ticks >= a->max_episode_ticks;
 }
 
+int rs_agent_truncated(const Agent *a) { return truncated(a); }
+
 /* ---- [login,_] (agent.py) ------------------------------------------------------------------------------ */
 int rs_agent_login(World *w) {
     Player *p = &w->p;

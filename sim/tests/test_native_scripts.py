@@ -39,6 +39,11 @@ ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / 'logs' / 'sim' / 'data' / 'draynor-nc1.npz'
 COMPACT_POOL = ROOT / 'logs' / 'sim' / 'world' / 'train-8-nc1-derived.npz'
 SUPPLY_POOL = ROOT / 'logs' / 'supply' / 'pools' / 'train-128.npz'
+ARCHIVE_V2 = ROOT / 'logs' / 'sim' / 'data' / 'draynor-nc2.npz'      # village-world-v2's (sim/build.py add_picks)
+POOL_V2 = ROOT / 'logs' / 'sim' / 'world' / 'train-128-20000-v2.npz'
+# the v2 pool's layouts the v2 tests play: the first seven and 20014; between them a door pen (with and without the
+# highwayman) and gate pens, the highwayman, each field kind, a willow and a yew (the env_v2 fixture checks it)
+V2_LAYOUTS = (0, 1, 2, 3, 4, 5, 6, 14)
 ORIGIN = (2880, 3328)
 NAME = 'wd1a0'
 WC, FISH, MINE, HP = SKILLS.index('woodcutting'), SKILLS.index('fishing'), SKILLS.index('mining'), SKILLS.index('hitpoints')
@@ -252,18 +257,19 @@ class Env:
     """The harness library, the C pack, the module's view of the same pack (strings, script ids) and the oracle's
     tables and layouts."""
 
-    def __init__(self, lib):
+    def __init__(self, lib, pack=PACK, archive=ARCHIVE, compact_pool=COMPACT_POOL, supply_pool=SUPPLY_POOL, items=None,
+                 levels=None):
         from sim import native_export as X
-        self.lib = lib
-        self.pack = native.load().Pack(str(PACK))
+        self.lib, self.items, self.levels = lib, items or ITEMS, levels or LEVELS
+        self.pack = native.load().Pack(str(pack))
         if json.loads(self.pack.manifest).get('oracle_hash') != native.oracle_hash():
-            pytest.skip(f'{PACK} was exported from another oracle: export it again')
+            pytest.skip(f'{pack} was exported from another oracle: export it again')
         P, err = ctypes.c_void_p(), RsErr()
-        assert lib.rs_pack_open(str(PACK).encode(), ctypes.byref(P), ctypes.byref(err)) == 0, err.text
+        assert lib.rs_pack_open(str(pack).encode(), ctypes.byref(P), ctypes.byref(err)) == 0, err.text
         self.P = P
         self.pools = {'compact': (lib.t_pool(P, 0), lib.t_pool(P, 1)), 'supply': (lib.t_pool(P, 2), lib.t_pool(P, 3))}
-        self.base = X.load_tables(ARCHIVE)
-        self.layouts = {'compact': X.load_pool(COMPACT_POOL)[0], 'supply': X.load_pool(SUPPLY_POOL)[0][:4]}
+        self.base = X.load_tables(archive)
+        self.layouts = {'compact': X.load_pool(compact_pool)[0], 'supply': X.load_pool(supply_pool)[0][:4]}
         assert len(self.layouts['compact']) == self.pools['compact'][1]
         self.canon = H.Canon(H.PackStrings(self.pack))
         self.sid = self.canon.strings
@@ -281,24 +287,65 @@ class Env:
         return self.base.obj_ids.get(name)
 
 
-@pytest.fixture(scope='module')
-def env(tmp_path_factory):
-    for path in (ARCHIVE, COMPACT_POOL, SUPPLY_POOL, PACK):
-        if not path.exists():
-            pytest.skip(f'{path.relative_to(ROOT)} absent (docs/RUNNING.md)')
+def harness_lib(tmp_path_factory):
     lib = ctypes.CDLL(str(build_harness(tmp_path_factory.mktemp('scripts'))))
     for name, (res, *args) in SIGNATURES.items():
         f = getattr(lib, name)
         f.restype = _C[res] if isinstance(res, str) else res
         f.argtypes = [_C[a] if isinstance(a, str) else a for a in args]
-    e = Env(lib)
+    return lib
+
+
+@pytest.fixture(scope='module')
+def env(tmp_path_factory):
+    for path in (ARCHIVE, COMPACT_POOL, SUPPLY_POOL, PACK):
+        if not path.exists():
+            pytest.skip(f'private data absent: {path.relative_to(ROOT)}')
+    e = Env(harness_lib(tmp_path_factory))
     saved = World.npc_turn, World.npc_lifecycle
     World.npc_turn = World.npc_lifecycle = lambda self, npc: None   # still npcs on both sides (the C doubles)
     try:
         yield e
     finally:
         World.npc_turn, World.npc_lifecycle = saved
-        lib.rs_pack_close(e.P)
+        e.lib.rs_pack_close(e.P)
+
+
+# village-world-v2's held items, and the woodcutting levels at the willow's 30 and the yew's 60
+ITEMS_V2 = ('cabbage', 'potato', 'onion', 'black_cape', 'willow_logs', 'yew_logs')
+LEVELS_V2 = (29, 30, 31, 59, 60, 61)
+
+
+@pytest.fixture(scope='module')
+def env_v2(tmp_path_factory, name_table_path):
+    """Env over village-world-v2: V2_LAYOUTS of the v2 training pool, plain, and their pack without trees over
+    draynor-nc2 (one supply layout, one variant), with the v2 held items and the willow's and yew's levels added."""
+    for path in (ARCHIVE_V2, POOL_V2, SUPPLY_POOL):
+        if not path.exists():
+            pytest.skip(f'private data absent: {path.relative_to(ROOT)}')
+    from names import NameTable
+    from sim import search, world
+    from sim.native_export import export
+    work = tmp_path_factory.mktemp('scripts-v2')
+    layouts = [world.load_pool(POOL_V2)[0][k] for k in V2_LAYOUTS]
+    pool = world.save_pool(work / 'pool.npz', layouts)
+    supply = world.save_pool(work / 'supply.npz', world.load_pool(SUPPLY_POOL)[0][:1], version=search.SUPPLY['world'])
+    pack = export(work / 'v2.pack', pool, supply, ARCHIVE_V2, names=NameTable(name_table_path), trees=False, variants=1,
+                  log=lambda _: None)
+    e = Env(harness_lib(tmp_path_factory), pack, ARCHIVE_V2, pool, supply, items=ITEMS + ITEMS_V2,
+            levels=tuple(sorted(set(LEVELS + LEVELS_V2))))
+    names = lambda L: {e.base.loc_types[int(r[0])]['debugname'] for r in L.locs}
+    held = [names(L) for L in e.layouts['compact']]
+    assert all(any(name in n for n in held) for name in (world.PEN_DOOR, 'cabbage', 'potato', 'onion', world.WILLOW,
+                                                            world.YEW)), 'the v2 layouts lack a feature'
+    assert any(e.base.npc_types[int(r[1])]['debugname'] == world.HUNTER for L in e.layouts['compact'] for r in L.npcs)
+    saved = World.npc_turn, World.npc_lifecycle
+    World.npc_turn = World.npc_lifecycle = lambda self, npc: None   # still npcs on both sides (the C doubles)
+    try:
+        yield e
+    finally:
+        World.npc_turn, World.npc_lifecycle = saved
+        e.lib.rs_pack_close(e.P)
 
 
 # ---- a pair of worlds ------------------------------------------------------------------------------------------------
@@ -576,7 +623,8 @@ ITEMS = ('bronze_axe', 'iron_axe', 'bronze_pickaxe', 'iron_pickaxe', 'net', 'fis
 TOOLS = ('bronze_axe', 'bronze_pickaxe', 'net')
 # The scripts of each focus, by the oracle function's outer name (closures: mining, get_ore, gate).
 FOCUS = dict(wood={'attempt_cut_tree', 'cut_tree', 'use_on_tree'}, mine={'mining', 'get_ore', 'prospect'},
-             fish={'attempt_fish_shrimp', 'fish_shrimp', 'attempt_fish_sardine', 'use_on_saltfish'}, gate={'gate'})
+             fish={'attempt_fish_shrimp', 'fish_shrimp', 'attempt_fish_sardine', 'use_on_saltfish'}, gate={'gate'},
+             door={'door'}, pick={'pick'})
 COMBAT = (engine.player_combat_start, engine.player_combat_start_ap)
 
 
@@ -584,11 +632,11 @@ def xp_for(level):
     return 0 if level <= 1 else LEVEL_XP[level - 2]
 
 
-def levels_strategy(data, stats):
+def levels_strategy(data, stats, levels=LEVELS):
     """Start levels of the gathering skills (and hitpoints), xp often just under the next level."""
     out = {}
     for stat in stats:
-        level = data.draw(st.sampled_from(LEVELS), label=f'level {stat}')
+        level = data.draw(st.sampled_from(levels), label=f'level {stat}')
         lo, hi = xp_for(level), xp_for(level + 1)
         under = data.draw(st.booleans(), label='under')
         xp = hi - data.draw(st.integers(1, min(400, hi - lo)), label='gap') if under and level < 99 else lo
@@ -598,7 +646,7 @@ def levels_strategy(data, stats):
 
 def items_strategy(data, env):
     """An inventory (slot order) from ITEMS by id, with or without the focus's tool, sometimes full."""
-    ids = [env.obj(name) for name in ITEMS if env.obj(name) is not None]
+    ids = [env.obj(name) for name in env.items if env.obj(name) is not None]
     tools = {env.obj(name) for name in TOOLS} - {None}
     picks = data.draw(st.lists(st.sampled_from(ids), max_size=10), label='items')
     if not data.draw(st.booleans(), label='no tools'):   # (Hypothesis draws False first)
@@ -617,8 +665,8 @@ def items_strategy(data, env):
 
 
 def wieldable(env):
-    """Obj ids of ITEMS that have a wearpos (worn at the start sometimes)."""
-    ids = [env.obj(name) for name in ITEMS if env.obj(name) is not None]
+    """Obj ids of the env's items that have a wearpos (worn at the start sometimes)."""
+    ids = [env.obj(name) for name in env.items if env.obj(name) is not None]
     return [i for i in ids if engine.wearpos(SimpleNamespace(t=env.base), i)]
 
 
@@ -628,7 +676,7 @@ def scripted(env, pair, target, op):
     for trig in (op + engine.AP_TO_OP, op):
         name = py.trigger(target, trig)
         if name:
-            return engine.SCRIPTS.get(name)
+            return engine.SCRIPTS.get(name) or engine.archive_script(py, name)   # World.run_trigger's lookup
     return None
 
 
@@ -677,13 +725,13 @@ def near_tile(pair, target, data):
 
 def start(env, data, focus):
     """A pair on a drawn layout, the player near a target of the focus, with drawn levels, items, delays and timers."""
-    pens = [k for k, L in enumerate(env.layouts['compact']) if L.gate[0] >= 0]
+    pens = [k for k, L in enumerate(env.layouts['compact']) if L.gate[0] >= 0 and (L.gate[1] < 0) == (focus == 'door')]
     if focus == 'wood' and data.draw(st.booleans(), label='supply'):
         kind, k = 'supply', data.draw(st.integers(0, len(env.layouts['supply']) - 1), label='supply layout')
     else:
         kind = 'compact'
-        k = data.draw(st.sampled_from(pens) if focus == 'gate' else st.integers(0, len(env.layouts['compact']) - 1),
-                      label='layout')
+        k = data.draw(st.sampled_from(pens) if focus in ('gate', 'door') else
+                      st.integers(0, len(env.layouts['compact']) - 1), label='layout')
     seed = data.draw(st.integers(0, 2 ** 31 - 1), label='seed')
     start_tick = data.draw(st.one_of(st.integers(6, 300), st.integers(480, 499)), label='start tick')
     xp_rate = data.draw(st.sampled_from([25, 25, 25, 1, 5]), label='xp rate')
@@ -700,7 +748,7 @@ def start(env, data, focus):
         found = pair.py.npc_by_nid[target.nid] if isinstance(target, engine.Npc) else pair.py.locs[target.index]
         first = found, op
     p = pair.p
-    stats = levels_strategy(data, (WC, FISH, MINE))
+    stats = levels_strategy(data, (WC, FISH, MINE), env.levels)
     for stat, (level, xp) in stats.items():
         p.levels[stat] = p.base_levels[stat] = level
         p.stats[stat] = xp
@@ -881,9 +929,9 @@ def test_mixed_play_equals_the_oracle(env, data):
 
 # ---- fixed scenarios: each case the port must meet, run to its end on both sides ----------------------------------
 def roles(env, kind, k):
-    """The layout's targets by role, from the oracle's own trigger tables: [(loc index or npc nid, op)] for 'tree0' and
-    'tree15' (by levelrequired), 'rock' and 'fastrock' (mining's get_ore closure), 'spot' (net fishing) and the closed
-    'gate_main' and 'gate_outer' halves."""
+    """The layout's targets by role, from the oracle's own trigger tables: [(loc index or npc nid, op)] for 'tree0',
+    'tree15', 'tree30' and 'tree60' (by levelrequired), 'rock' and 'fastrock' (mining's get_ore closure), 'spot' (net
+    fishing), the closed 'gate_main' and 'gate_outer' halves, a closed pen 'door' and a field 'plant' (village-world-v2)."""
     import inspect
     tables = env.tables(kind, k)
     probe = SimpleNamespace(py=World(tables, npcs=None), tables=tables)
@@ -896,14 +944,19 @@ def roles(env, kind, k):
         name = fn.__qualname__.split('.')[0]
         cells = inspect.getclosurevars(fn).nonlocals if fn.__closure__ else {}
         if name == 'attempt_cut_tree':
-            role = 'tree0' if trees[tables.loc_types[loc.type]['debugname']]['levelrequired'] == 0 else 'tree15'
+            role = f"tree{trees[tables.loc_types[loc.type]['debugname']]['levelrequired']}"
         elif name == 'mining':
             role = 'fastrock' if inspect.getclosurevars(cells['get_ore']).nonlocals['fast'] else 'rock'
         elif name == 'gate' and cells['opening']:
             role = 'gate_outer' if cells['outer'] else 'gate_main'
+        elif name == 'door' and cells['turn'] == 1:
+            role = 'door'
         else:
             continue
         out.setdefault(role, []).append(loc.index)
+    for loc in probe.py.locs:
+        if scripted(env, probe, loc, APLOC1 + 1) is engine.pick:
+            out.setdefault('plant', []).append(loc.index)
     for npc in probe.py.npcs:
         if scripted(env, probe, npc, APNPC1) is engine.attempt_fish_shrimp:
             out.setdefault('spot', []).append(npc.nid)
@@ -1232,7 +1285,7 @@ def test_unported_scripts_raise_not_ported(env):
     """rs_script_step's contract: an RS_NP script raises RS_E_NOT_PORTED_SCRIPT with the trigger name it was run by
     (a gap, never an Unsupported). A failed execute leaves p.protect set, as the oracle's would: one world each."""
     name = env.sid('[oploc1,bankbooth]')
-    for script in ('RS_S_BOOTH_USE', 'RS_S_DOOR_OPEN', 'RS_S_TALK_TO_BANKER'):
+    for script in ('RS_S_BOOTH_USE', 'RS_S_STAIRS_UP', 'RS_S_TALK_TO_BANKER'):  # the door is ported (village-world-v2)
         pair = Pair(env, 'compact', 0, 1, 10, 25, (ORIGIN[0] + 10, ORIGIN[1] + 10))
         try:
             assert pair.lib.t_execute(pair.w, env.script[script], -1, name) == 1
@@ -1240,3 +1293,209 @@ def test_unported_scripts_raise_not_ported(env):
             assert isinstance(error, native.NotPorted) and str(error) == 'native port lacks script [oploc1,bankbooth]'
         finally:
             pair.close()
+
+
+# ---- village-world-v2 (env_v2: the field's picks, the pen door, the willow and the yew, the v2 held items) ------------
+@settings(max_examples=100, **SETTINGS)
+@given(st.data())
+def test_picks_equal_the_oracle(env_v2, data):
+    """engine.pick on the field's cabbages, potatoes and onions ([oploc2,...] over draynor-nc2): p_arrivedelay after a
+    step, the teleport onto the plant, loc_del for its respawn (70; 49 scaled), the item (a produce of
+    [proc,pickup_loc_floor], owing no XP) and the message; with a full inventory the full message, the teleport and the
+    end; a pick from the plant's own tile, and the plants standing again."""
+    run(env_v2, data, 'pick', steps=(1, 6), budget=30)
+
+
+@settings(max_examples=60, **SETTINGS)
+@given(st.data())
+def test_pen_doors_equal_the_oracle(env_v2, data):
+    """door's scripts on village-world-v2's pen doors: open (the door goes for 500 ticks and its cross stands on the
+    tile in front, turned a quarter, in some layouts in another zone) and close (the cross goes, the door comes back
+    with no timer), with the collision and projectile walls, zones, loc events and changed tiles."""
+    run(env_v2, data, 'door', steps=(1, 5), budget=20)
+
+
+@settings(max_examples=60, **SETTINGS)
+@given(st.data())
+def test_willow_and_yew_woodcutting_equals_the_oracle(env_v2, data):
+    """Woodcutting on village-world-v2 layouts (trees, oaks, a willow 2x2 and a yew 3x3, some across a zone edge):
+    the level refusals at 29 and 59, the rolls and logs of each, depletion into treestump2_green and yewtree_stump."""
+    run(env_v2, data, 'wood', steps=(1, 4), budget=80)
+
+
+@settings(max_examples=100, **SETTINGS)
+@given(st.data())
+def test_village_world_v2_held_items_equal_the_oracle(env_v2, data):
+    """The held scripts with village-world-v2's items among the drawn ones: the field items' and the black cape's
+    default use scripts (engine.FIELD_USE over draynor-nc2: dm_default after the unconditional swaps), the cabbage's
+    Eat, the cape's Wear (worn slot 1, its defence bonuses), bury, drop and pickup."""
+    run(env_v2, data, 'held', steps=(2, 8), budget=12)
+
+
+@settings(max_examples=60, **SETTINGS)
+@given(st.data())
+def test_village_world_v2_mixed_play_equals_the_oracle(env_v2, data):
+    """Every scripted op of village-world-v2's layouts (picks and doors among them) and plain ops and uses, in any
+    order, with levelups and timers."""
+    run(env_v2, data, 'mix', steps=(2, 8), budget=40)
+
+
+def c_state(pair):
+    """The C world's canonical World record (decoded), its events and its chat lines so far."""
+    cap = 1 << 17
+    buf = np.zeros(cap, np.int64)
+    n = pair.lib.t_canon(pair.w, ptr(buf), cap)
+    assert n >= 0
+    events = np.zeros((1024, 11), np.int32)
+    k = pair.lib.t_events(pair.w, 0, ptr(events), len(events))
+    chat = np.zeros((256, 2), np.int32)
+    m = pair.lib.t_chat(pair.w, 0, ptr(chat), len(chat))
+    return H.decode(buf[:n]), events[:k].tolist(), chat[:m].tolist()
+
+
+def test_a_walked_pick_takes_its_ticks_in_c(env_v2):
+    """A Pick of a cabbage the player walks 3 tiles to, read from the C world (every cycle equal to the reference's):
+    the last step at tick T (last_movement T + 1); at T + 1 the pick suspended at its p_arrivedelay (site 1) until
+    T + 2; at T + 2 the player on the plant and the pick suspended at its teleport's p_delay(0) (site 3) until T + 3; at
+    T + 3 the plant gone (loc_del), the cabbage produced by [proc,pickup_loc_floor] and 'You pick a cabbage.', the script
+    ended (pickables.rs2 and [proc,pickup_loc_floor] as engine.pick plays them)."""
+    e = H.header()[0]
+    k = next(i for i, L in enumerate(env_v2.layouts['compact'])
+             if 'cabbage' in {env_v2.base.loc_types[int(r[0])]['debugname'] for r in L.locs})
+    pair, plant = fixed(env_v2, 'plant', k=k, distance=3, xp_rate=1)
+    after_tick = {}   # in-cycle tick t: the C state after it
+
+    def record(pair, tick):
+        after_tick[pair.py.tick - 1] = c_state(pair)
+        return True
+    try:
+        assert drive(pair, plant, APLOC1 + 1, 'walked pick', budget=40, after=record)
+        after_tick[pair.py.tick - 1] = c_state(pair)
+        pick = env_v2.script['RS_S_PICK']
+        final, events, chat = after_tick[max(after_tick)]
+        made = [ev for ev in events if ev[0] == e['RS_EV_PRODUCE'] and ev[7] == env_v2.sid('[proc,pickup_loc_floor]')]
+        assert len(made) == 1 and made[0][5] == env_v2.obj('cabbage') and made[0][6] == 1, made
+        P = made[0][1]
+        player = lambda t: after_tick[t][0]['RS_CF_PLAYER']
+        script = lambda t: list(after_tick[t][0]['RS_CF_PLAYER_SCRIPT'])
+        T = int(player(P)[5]) - 1   # last_movement = the last step's tick + 1
+        assert P == T + 3, (T, P)
+        assert int(player(T)[5]) == T + 1 and all(int(player(t)[5]) == T + 1 for t in (T + 1, T + 2, T + 3))
+        assert script(T + 1) == [e['RS_SCRIPT_SUSPENDED'], 1, pick, 1] and list(player(T + 1)[6:8]) == [1, T + 2]
+        assert script(T + 2) == [e['RS_SCRIPT_SUSPENDED'], 1, pick, 3] and list(player(T + 2)[6:8]) == [1, T + 3]
+        assert (int(player(T + 2)[0]), int(player(T + 2)[1])) == (plant.x, plant.z)
+        assert script(T + 3) == [e['RS_SCRIPT_NONE'], 0]
+        locs = lambda t: after_tick[t][0]['RS_CF_LOCS'].reshape(-1, 13)
+        row = lambda t: next(r for r in locs(t) if int(r[0]) == plant.index)
+        assert int(row(T + 2)[10]) == 1 and int(row(T + 3)[10]) == 0   # active
+        assert [T + 3, env_v2.sid('You pick a cabbage.')] in chat
+        inv = after_tick[T + 3][0]['RS_CF_PLAYER_INV'].reshape(-1, 3)
+        assert any(int(i) == env_v2.obj('cabbage') for _, i, _ in inv)
+        assert pair.seen >= {('PICK:1',), ('PICK:3',)}, pair.seen
+    finally:
+        pair.close()
+
+
+def test_a_pen_door_closes_itself_after_500_ticks_and_closes_by_hand_alike(env_v2):
+    """A pen door opened, then idle: the cross stands 500 ticks and the door comes back in the zone phase that ends
+    them (the door's loc event first); opened again and closed by hand: the cross goes and the door stands with no
+    timer left. Every cycle equal to the reference's."""
+    k = next(i for i, L in enumerate(env_v2.layouts['compact']) if L.gate[0] >= 0 and L.gate[1] < 0)
+    pair, door = fixed(env_v2, 'door', k=k, distance=1, xp_rate=1)
+    cross_type = next(t for t, v in env_v2.base.loc_types.items() if v['debugname'] == 'poordoor_cross')
+    cross = lambda: [loc for loc in live_locs(pair.py) if loc.type == cross_type]
+    try:
+        assert drive(pair, door, APLOC1, 'open', budget=40)
+        opened = pair.py.tick
+        assert not pair.py.locs[door.index].active and len(cross()) == 1
+        while pair.py.locs[door.index].active is False:
+            assert pair.cycle(f'idle {pair.py.tick}') and pair.py.tick - opened <= 510
+        assert not cross() and 495 <= pair.py.tick - opened <= 501, pair.py.tick - opened
+        assert drive(pair, pair.py.locs[door.index], APLOC1, 'open again', budget=40) and len(cross()) == 1
+        assert drive(pair, cross()[0], APLOC1, 'close', budget=40)
+        assert pair.py.locs[door.index].active and not cross() and pair.py.locs[door.index].lifecycle_tick == -1
+        for t in range(3):
+            assert pair.cycle(f'after the close {t}')
+    finally:
+        pair.close()
+
+
+def test_village_world_v2_held_items_and_the_cape_equal_the_oracle(env_v2):
+    """The v2 held items, each op the interface offers on them: the cabbage's Eat at low hitpoints and again within
+    eat_delay; the black cape's Wear (worn slot 1, its slash, crush and range defence) and a second cape's (the first
+    back to the first free slot); the default use scripts of the cabbage, potato, onion and cape (engine.FIELD_USE over
+    draynor-nc2) as the used item and as the target (the two unconditional swaps), and a use with no script (bones on
+    coins: the two no-trigger lines). Every op and cycle equal to the reference's."""
+    items = [('cabbage', 1), ('cabbage', 1), ('potato', 1), ('onion', 1), ('black_cape', 1), ('black_cape', 1),
+             ('bones', 1), ('logs', 1), ('willow_logs', 1), ('coins', 10)]
+    pair, _ = fixed(env_v2, 'plant', {HP: 10}, items, distance=3)
+    try:
+        p = pair.p
+        p.levels[HP] = 3
+        pair.sync_player()
+        slot = lambda name: next(k for k, it in enumerate(p.inv.items) if it and it[0] == env_v2.obj(name))
+        held_op = lambda name, fn: next(k for k in range(5) if engine.held_script(
+            pair.py, pair.py.t.obj_types[env_v2.obj(name)]['triggers'].get(f'OPHELD{k + 1}', '')) is fn)
+
+        def settle_all(note, n=4):
+            for tick in range(n):
+                if p.script is not None and p.script[1] == 'pausebutton':
+                    assert resume(pair, f'{note} resume')
+                assert pair.cycle(f'{note} tick {tick}')
+        assert op_held(pair, slot('cabbage'), held_op('cabbage', engine.eat), 'eat a cabbage')
+        assert op_held(pair, slot('cabbage'), held_op('cabbage', engine.eat), 'eat a cabbage at once')
+        settle_all('after eating')
+        assert op_held(pair, slot('black_cape'), held_op('black_cape', engine.wield), 'wear a cape')
+        settle_all('worn', 1)
+        assert p.worn.items[1] and p.worn.items[1][0] == env_v2.obj('black_cape')
+        assert op_held(pair, slot('black_cape'), held_op('black_cape', engine.wield), 'wear the second cape')
+        settle_all('swapped', 1)
+        assert any(e[1] == 'transfer' and e[2]['src'] == 'worn' for e in pair.py.events), 'no swap back'
+        before = len(pair.py.chat_log)
+        uses = (('cabbage', 'potato'), ('potato', 'cabbage'), ('onion', 'logs'), ('logs', 'onion'), ('black_cape', 'cabbage'),
+                ('cabbage', 'black_cape'), ('bones', 'potato'), ('willow_logs', 'onion'), ('potato', 'onion'),
+                ('bones', 'coins'))
+        for a, b in uses:
+            assert use_on_held(pair, slot(a), slot(b), f'use {a} on {b}')
+            settle_all(f'used {a} on {b}', 1)
+        lines = [text for _, text in pair.py.chat_log[before:]]
+        assert lines.count(pair.py.text('dm_default')) == len(uses) - 1, lines
+    finally:
+        pair.close()
+
+
+@pytest.mark.parametrize('role, level', [('tree30', 29), ('tree30', 30), ('tree60', 59), ('tree60', 61)])
+def test_willows_and_yews_are_cut_alike(env_v2, role, level):
+    """A willow (2x2) or a yew (3x3) cut with a bronze axe: one level under its own the level message; at it or above
+    the rolls (keys 2 and 3) every four ticks, willow or yew logs with their XP, and the stump it may deplete into, every
+    cycle equal to the reference's."""
+    k = next(i for i in range(len(env_v2.layouts['compact'])) if role in roles(env_v2, 'compact', i))
+    pair, tree = fixed(env_v2, role, {WC: level}, KIT, k=k, distance=2, xp_rate=1)
+    product = env_v2.obj('willow_logs' if role == 'tree30' else 'yew_logs')
+    try:
+        assert drive(pair, tree, APLOC1, f'cut {role} at {level}', budget=400)
+        made = sum(e[1] == 'produce' and e[2]['obj'] == product for e in pair.py.events)
+        if level < int(role[4:]):
+            assert made == 0 and any('level of' in text for _, text in pair.py.chat_log)
+        else:
+            assert made > 0, f'no log in 400 ticks at level {level}'
+    finally:
+        pair.close()
+
+
+@pytest.mark.parametrize('target, used, text', [
+    ('cabbage', 'raw_chompy', '[opheldu,cabbage] with raw_chompy'), ('potato', 'bowl_water', '[opheldu,potato] with bowl_water'),
+    ('onion', 'bowl_empty', '[opheldu,onion] with bowl_empty'), ('black_cape', 'reddye', '[opheldu,black_cape] with reddye'),
+    ('raw_chompy', 'cabbage', 'held script [opheldu,raw_chompy]')])
+def test_the_field_use_cases_are_refused_alike(env_v2, target, used, text):
+    """A named case of a field item's or the cape's use script (an item no village world holds, given here) raises the
+    reference's Unsupported on both sides, as that script's own case flag says (each script its own flag); used the other
+    way round, the case item's own OPHELDU, which neither engine ports, raises 'held script ...' alike."""
+    if env_v2.obj(used) is None or env_v2.obj(target) is None:
+        pytest.skip('an item the archive lacks')
+    pair, _ = fixed(env_v2, 'plant', {HP: 10}, [(target, 1), (used, 1)], distance=3)
+    try:
+        assert not use_on_held(pair, 0, 1, f'use {used} on {target}')   # both raised
+        assert pair.unsupported == text
+    finally:
+        pair.close()

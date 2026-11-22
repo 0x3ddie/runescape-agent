@@ -9,7 +9,7 @@
 // has one click family, whose meaning is the click's offset ("dx,dz"), in place of place, retreat and move.
 import {
     A_ACT0, A_CLOSE_IF, A_DEPOSIT0, A_DIALOG_CHOICE0, A_DIALOG_CONTINUE, A_DROP0, A_HELD0, A_INV_PREV,
-    A_STYLE0, A_USE0, A_WITHDRAW0, N_ACT, N_HELD, N_INV_SEL
+    A_STYLE0, A_USE0, A_WITHDRAW0, N_ACT, N_ACTIONS, N_HELD, N_INV_SEL, pageEntry
 } from './actions';
 import { clickSlot } from './clicks';
 
@@ -36,6 +36,8 @@ export function familyOf(action: number): typeof FAMILIES[number] {
     if (within(A_INV_PREV, 4)) return 'page';
     if (within(A_STYLE0, 4)) return 'style';
     if (within(A_USE0, N_INV_SEL)) return 'use';
+    const page = action >= N_ACTIONS ? pageEntry(action) : null;  // act-v4's second groups (rows 96..127)
+    if (page) return page.base === A_HELD0 ? 'held' : page.base === A_DROP0 ? 'drop' : page.base === A_DEPOSIT0 ? 'deposit' : 'use';
     throw new Error(`no family for action ${action}`);
 }
 
@@ -53,10 +55,10 @@ export function describeAction(obs: Record<string, any> | null, action: number):
         const c = obs?.clicks?.[clickSlot(action)!];
         if (c) meaning.option = `${c.dx},${c.dz}`;
     } else if (family === 'held') {
-        const h = slot(obs?.heldSel, A_HELD0);
+        const h = obs?.heldSel?.[pageEntry(action)!.k];  // the entry: action - A_HELD0, or act-v4's 8..15
         if (h) Object.assign(meaning, { kind: 'obj', name: h.name, option: obs?.using ? 'Use' : h.option });
     } else if (family === 'drop' || family === 'deposit' || family === 'use') {
-        const i = slot(obs?.invSel, family === 'drop' ? A_DROP0 : family === 'deposit' ? A_DEPOSIT0 : A_USE0);
+        const i = obs?.invSel?.[pageEntry(action)!.k];
         if (i && i.slot >= 0) Object.assign(meaning, { kind: 'obj', name: i.name,
             option: family === 'drop' ? 'Drop' : family === 'deposit' ? 'Deposit' : 'Use', item: '' });
     } else if (family === 'withdraw') {

@@ -4,6 +4,10 @@ CpuBatch is sim/spec.py's batched interface over B CPU reference worlds: the fou
 layout pool (sim/world.py), the training environment of sim/workers.py. `trace` dumps one
 of its runs under keyed random legal actions, world by world and tick by tick.
 
+With task='free-play-v1' the worlds are the village world whose layouts the pool holds (sim/combat.py VILLAGES:
+village-world-v1 Stage A on compact-world-v1 layouts, village-world-v2 on its own) and each episode is a life of sim/task.py
+FreePlayEpisode, whose observations follow obs-v6 (sim/spec.py OBSERVATIONS).
+
 A step or a setup the simulator cannot model never becomes a transition: CpuBatch flags the
 world in info['unsupported'], keeps the evidence and refuses to step that world again until reset,
 so the collector must stop before any update uses the rollout. (The goal-v1 Draynor CPU workers,
@@ -22,13 +26,16 @@ import numpy as np
 
 from baseline import config
 from baseline.resource_task import GOALS
+from obs import OBSERVATION
 from sim.data import Tables
 from sim.engine import Rng, Unsupported, World
-from sim.spec import (HORIZON_TICKS, INFO_FIELDS, OBSERVATION_SHAPES, TERMINAL_DEATH, TERMINAL_HORIZON, check_batch,
-                      dtype, goal_set, slot_goal)
+from sim.spec import (HORIZON_TICKS, INFO_FIELDS, OBSERVATIONS, TERMINAL_DEATH, TERMINAL_HORIZON, check_batch, dtype,
+                      goal_set, slot_goal)
 from sim.audit import kills
-from sim.combat import COMBAT, GROUPS, check_bindings, combat_npcs, draw_combat, fights, kit, outside, task_spec
-from sim.task import FAMILIES, WORLD_START_TICK, GoalEpisode, draw_start, object_families, produced
+from sim.combat import (COMBAT, GROUPS, VILLAGES, check_bindings, check_village, combat_npcs, draw_combat, draw_village,
+                        fights, kit, outside, task_spec, village_life, village_of)
+from sim.task import (FAMILIES, FREE_PLAY, WORLD_START_TICK, GoalEpisode, check_life, draw_life, draw_start, free_play_cfg,
+                      object_families, produced)
 from sim.world import ORIGIN, LayoutTables, load_pool, world_of
 
 
@@ -54,17 +61,55 @@ class CpuBatch:
     here: `reset(key)` and `step(state, action)` return a small record of it for the interface's shape."""
 
     def __init__(self, tables, layouts, n, horizon=HORIZON_TICKS, cfg=None, derived=None, first=0, task='goal-activity-v2',
-                 search=None, goals=GOALS):
+                 search=None, goals=GOALS, xp_rate=None, muggers=None, life=None, world=None):
         """task: goal-activity-v2, or v3 (sim/combat.py: melee slots play sustained combat, with its own horizon;
         `horizon` is then the gathering goals' and must be v2's), or v4 (v3 with the wood slots on sim/search.py's search
         starts, drawn from `search`: the search pool's layouts and their derived tables or None), or v5 (v3 with the wood
         slots on sim/search.py's supply starts, `search` then the supply pool; each slot's variant layout is built when
         drawn and the last SUPPLY_TABLES kept), or v11 (v5 on its bound pool and goal set: sim/combat.py BOUND, refused
-        otherwise). goals: the declared goal set (sim/spec.py goal_set)."""
-        self.spec = task_spec(task)
-        if self.spec['combat'] and horizon != HORIZON_TICKS:
-            raise ValueError(f'{task} keeps the gathering goals\' {HORIZON_TICKS}-tick horizon')
-        check_bindings(self.spec, ((layout.seed, world_of(layout)['version']) for layout in layouts), goal_set(goals))
+        otherwise), or free-play-v1 (sim/task.py FREE_PLAY: no goal, so `horizon`, `goals` and `search` keep their
+        defaults; a pool of one village world's layouts, compact-world-v1 or village-world-v2; `cfg` defaults to
+        free_play_cfg). goals: the declared goal set (sim/spec.py goal_set). free-play-v1's own settings: `xp_rate` (the
+        world's XP rate, one of FREE_PLAY's 1 and 25; None: 1), and with no default `muggers` (True or False;
+        False in village-world-v2) and `life` (the life-length distribution, sim/task.py check_life; not frozen). `world`:
+        the village world (sim/combat.py VILLAGES), which the pool's declared world decides; when it is given it must be
+        that one. The batch's `world` holds it. `observation` names the table the batch's observations follow (sim/spec.py
+        OBSERVATIONS)."""
+        self.free = task == FREE_PLAY['version']
+        self.world = None
+        if self.free:
+            if horizon != HORIZON_TICKS or tuple(goals) != GOALS or search is not None:
+                raise ValueError(f'{task} has no goal, no goal horizon and no search pool')
+            if type(muggers) is not bool:
+                raise ValueError(f"{VILLAGES['village-world-v1']['version']} Stage A places muggers or not: "
+                                 'pass muggers=True or False')
+            found = {(village_of(layout) or {}).get('version') for layout in layouts}
+            if len(found) != 1 or None in found:
+                worlds = ', '.join(f"{name} on {v['layouts']}" for name, v in VILLAGES.items())
+                raise ValueError(f'{task} plays the layouts of one village world ({worlds}), not '
+                                 f"{sorted({world_of(layout)['version'] for layout in layouts})}")
+            self.world = found.pop()
+            if world is not None and world != self.world:
+                raise ValueError(f'the pool holds {self.world} layouts, not {world!r}')
+            check_village(VILLAGES[self.world], tables, muggers)
+            self.spec, self.muggers = dict(combat=False, search=False, supply=False), muggers
+            self.xp_rate = FREE_PLAY['xp_rates'][0] if xp_rate is None else xp_rate
+            if self.xp_rate not in FREE_PLAY['xp_rates']:
+                raise ValueError(f"a free-play XP rate is one of {FREE_PLAY['xp_rates']}, not {xp_rate!r}")
+            if life is None:
+                raise ValueError(f"{task}'s life-length distribution is a setting with no default: pass life")
+            self.life = check_life(life)
+            self.observation = FREE_PLAY['observation']
+            cfg = free_play_cfg() if cfg is None else cfg
+        else:
+            if (xp_rate, muggers, life, world) != (None, None, None, None):
+                raise ValueError(f'xp_rate, muggers, life and world are {FREE_PLAY["version"]} settings, not {task}\'s')
+            self.spec = task_spec(task)
+            if self.spec['combat'] and horizon != HORIZON_TICKS:
+                raise ValueError(f'{task} keeps the gathering goals\' {HORIZON_TICKS}-tick horizon')
+            check_bindings(self.spec, ((layout.seed, world_of(layout)['version']) for layout in layouts), goal_set(goals))
+            self.observation = OBSERVATION
+        self.shapes = OBSERVATIONS[self.observation]
         self.tables, self.layouts, self.n, self.horizon = tables, layouts, n, horizon
         self.cfg = dict(cfg or config.TASK_CFG)
         self.layout_tables = [LayoutTables(tables, layout, None if derived is None else derived[k])
@@ -119,6 +164,17 @@ class CpuBatch:
 
     def _episode(self, b):
         slot, episode = self.first + b, self.episodes[b]
+        if self.free:
+            self.trackers[b] = None
+            k = draw_start(self.key, slot, episode, self.layouts)['layout']  # draw_village's layout, for its region
+            if k not in self.regions:
+                self.regions[k] = outside(self.layouts[k])
+            start = self.starts[b] = draw_village(self.key, slot, episode, self.layouts, self.tables, self.muggers,
+                                                  region=self.regions[k])
+            start['length'] = draw_life(self.key, slot, episode, self.life)
+            self.tasks[b] = village_life(start, self.layouts[k], self.layout_tables[k], self.tables, self.xp_rate,
+                                         start['length'], self.cfg)
+            return self.tasks[b].projected
         if self.spec['supply'] and self.goals[b] == 'wood':
             from sim.search import SupplyTracker, draw_supply, supply_episode
             start = self.starts[b] = draw_supply(self.key, slot, episode, self.search_layouts, self.supply_sites)
@@ -156,6 +212,21 @@ class CpuBatch:
                               wield=c['worn'])
         return task.start(start['tile'], start['weapon'], start['levels'])
 
+    def _start(self, b):
+        """_episode(b), the setup of world b's next episode. An Unsupported setup has no transition to flag: it
+        keeps its evidence (the start as far as it was drawn, the slot, the episode) and is raised again."""
+        self.starts[b] = None
+        try:
+            return self._episode(b)
+        except Unsupported as error:
+            self.failed[b] = True
+            start = self.starts[b]
+            pool = self.search_layouts if start and (start.get('search') or start.get('supply')) else self.layouts
+            self.evidence.append(dict(reason=str(error), world=self.first + b, key=self.key, episode=self.episodes[b],
+                                      start=start, seed=None if start is None else pool[start['layout']].seed, setup=True,
+                                      decision=0, tick=None, action=None, observation=None))
+            raise
+
     def _facts(self, b, task, ended):
         success, tracker, cells = int(ended['episode']['r'] == 1.0), self.trackers[b], len(task.agent.visited)
         searched = [0, 0, -1] if tracker is None or self.starts[b].get('supply') else \
@@ -181,17 +252,27 @@ class CpuBatch:
         self.key, self.episodes = int(key), [0] * self.n
         self.tasks, self.starts, self.failed, self.evidence = [None] * self.n, [None] * self.n, [False] * self.n, []
         self.trackers = [None] * self.n
-        obs = [self._episode(b) for b in range(self.n)]
+        obs = [self._start(b) for b in range(self.n)]
         return self._state(), self._stack(obs)
 
     def _stack(self, obs):
-        out = {name: np.stack([np.asarray(o[name], dtype(name)) for o in obs]) for name in OBSERVATION_SHAPES}
-        check_batch(out, self.n)
+        out = {name: np.stack([np.asarray(o[name], dtype(name)) for o in obs]) for name in self.shapes}
+        check_batch(out, self.n, self.shapes)
         return out
+
+    def _unsupported(self, b, task, error, action):
+        """Flag world b (module docstring) and keep the evidence of its unsupported step."""
+        self.failed[b] = True
+        pool = self.search_layouts if self.starts[b].get('search') or self.starts[b].get('supply') else self.layouts
+        self.evidence.append(dict(reason=str(error), world=self.first + b, key=self.key, episode=self.episodes[b],
+                                  start=self.starts[b], seed=pool[self.starts[b]['layout']].seed,
+                                  decision=task.decisions, tick=task.world.tick, action=action, observation=task.raw))
 
     def step(self, state, action):
         if state['key'] != self.key:
             raise ValueError('a state of another reset')
+        if self.free:
+            return self._step_free(action)
         info = {name: np.zeros(self.n, kind) for name, kind in INFO_FIELDS.items()}
         # the episode's game effects so far (sim.train rollout_evidence)
         info.update(made=np.zeros((self.n, len(FAMILIES)), np.int32), kills=np.zeros(self.n, np.int32),
@@ -205,12 +286,8 @@ class CpuBatch:
             try:
                 o, r, d, ended = task.step(int(action[b]))
             except Unsupported as error:
-                self.failed[b] = info['unsupported'][b] = True
-                pool = self.search_layouts if self.starts[b].get('search') or self.starts[b].get('supply') else self.layouts
-                self.evidence.append(dict(reason=str(error), world=self.first + b, key=self.key, episode=self.episodes[b],
-                                          start=self.starts[b], seed=pool[self.starts[b]['layout']].seed,
-                                          decision=task.decisions, tick=task.world.tick, action=int(action[b]),
-                                          observation=task.raw))
+                info['unsupported'][b] = True
+                self._unsupported(b, task, error, int(action[b]))
                 obs.append(task.projected)
                 continue
             info['decision_ticks'][b] = task.world.tick - before
@@ -227,7 +304,50 @@ class CpuBatch:
                 info['outcomes'][b] = ended['outcomes']
                 info['facts'][b] = self._facts(b, task, ended)
                 self.episodes[b] += 1
-                o = self._episode(b)
+                o = self._start(b)
+            obs.append(o)
+        return self._state(), self._stack(obs), reward, done, info
+
+    def _step_free(self, action):
+        """step for free-play-v1 (sim/spec.py): the reward is each life's paid level gain at this step; a life that ends
+        gives its report in the episode fields (episode_return the paid fractional gain, outcomes the integer gain over
+        S), its facts (no group, search or supply; its fights' food and healing, its cells) and in info['last_obs'] the
+        observation at its end, before the next life's first replaces it in obs. goal: -1 (none). made: production by
+        family so far; kills: npcs this agent defeated so far."""
+        info = {name: np.zeros(self.n, kind) for name, kind in INFO_FIELDS.items()}
+        info.update(made=np.zeros((self.n, len(FAMILIES)), np.int32), kills=np.zeros(self.n, np.int32),
+                    facts=np.zeros((self.n, len(EPISODE_FACTS)), np.int32),
+                    last_obs={name: np.zeros((self.n, *shape), dtype(name)) for name, shape in self.shapes.items()})
+        info['goal'][:] = -1  # no goal: a reader by goal fails
+        reward, done, obs = np.zeros(self.n, np.float32), np.zeros(self.n, bool), []
+        for b, task in enumerate(self.tasks):
+            if self.failed[b]:
+                raise RuntimeError(f'world {b} reached unsupported content; reset before stepping it again')
+            before = task.world.tick
+            try:
+                o, r, d, ended = task.step(int(action[b]))
+            except Unsupported as error:
+                info['unsupported'][b] = True
+                self._unsupported(b, task, error, int(action[b]))
+                obs.append(task.projected)
+                continue
+            info['decision_ticks'][b] = task.world.tick - before
+            info['made'][b], info['kills'][b] = task.made, task.kills
+            reward[b], done[b] = r, d
+            if d:
+                report, s = ended['report'], fights(task)['summary']
+                info['terminal'][b] = TERMINAL_DEATH if report['reason'] == 'death' else TERMINAL_HORIZON
+                info['episode_return'][b] = ended['episode']['r']
+                info['episode_decisions'][b] = ended['episode']['l']
+                info['episode_ticks'][b] = ended['episode']['native_ticks']
+                info['outcomes'][b] = ended['outcomes']
+                info['facts'][b] = [0, 0, s['eats'] + s['eats_without_gain'], s['eat_gain'], s['regen_gain'],
+                                    s['levelup_gain'], s['aggressed'], s['eats_without_gain'], 0, 0, -1,
+                                    len(task.agent.visited), 0, -1, -1]
+                for name in self.shapes:
+                    info['last_obs'][name][b] = o[name]
+                self.episodes[b] += 1
+                o = self._start(b)
             obs.append(o)
         return self._state(), self._stack(obs), reward, done, info
 

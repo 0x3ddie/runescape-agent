@@ -7,7 +7,7 @@ class FakeNpc {
     constructor(public nid: number, public type: number) {}
     enqueueScript(queueId: number, delay = 0, arg = 0) { this.queue.push({ queueId, args: [], delay, lastInt: arg }); }
 }
-function fixture() {
+function fixture(maxEvents = 20000, end = 20) {
     const control = { tick: 10, open: true };
     const agent = { name: 'agent', levels: [10] }, other = { name: 'other' };
     const handlers: Record<number, (state: any) => any> = {
@@ -25,8 +25,8 @@ function fixture() {
         heroes: (npc, player) => ({ agent: npc.heroPoints.filter((h: any) => h.hash === player).reduce((a: number, h: any) => a + h.points, 0),
             other: Math.max(0, ...npc.heroPoints.filter((h: any) => h.hash !== player).map((h: any) => h.points)) }),
         actor: (self, player) => self === player ? 'agent' : self === other ? 'player' : self instanceof FakeNpc ? 'npc' : 'world',
-        agentHp: player => player.levels[0], open: () => control.open });
-    capture.bind(agent, { accountId: 'agent' }, 10, 20);
+        agentHp: player => player.levels[0], open: () => control.open }, maxEvents);
+    capture.bind(agent, { accountId: 'agent' }, 10, end);
     const hit = (self: any, npc: FakeNpc, damage: number) => handlers[1]({ self, _activeNpc: npc, arg: damage });
     // the npc's queue runs its damage script, which starts in ScriptRunner.init with the entry's args
     const due = (npc: FakeNpc) => {
@@ -55,6 +55,15 @@ test('queued damage is attributed to the actor whose script queued it, through t
     expect([d1.hitter, d1.hit, d1.hpBefore, d1.hpAfter]).toEqual(['agent', first.sequence, 3, 2]);
     expect([d2.hitter, d2.hit, d2.hpBefore, d2.hpAfter]).toEqual(['player', second.sequence, 2, 1]);
     expect([last.hitter, last.hpBefore, last.hpAfter, last.heroes]).toEqual(['agent', 1, 0, { agent: 3, other: 1 }]);
+});
+
+test('the event bound is maxEvents a started game hour of the window: an hour keeps it, a longer window gets more', () => {
+    for (const [end, room] of [[6010, 2], [6011, 4]] as const) {  // windows of 6,000 and 6,001 ticks from tick 10
+        const f = fixture(2, end), chicken = new FakeNpc(7, 41);
+        f.hit(f.agent, chicken, 1); f.due(chicken);   // life, hit, damage
+        expect(f.audit().events.length).toBe(Math.min(3, room));
+        expect(f.audit().failure).toBe(room < 3 ? 'combat capture overflow' : null);
+    }
 });
 
 test('damage applied directly is the running script owner; other npcs and closed windows are not followed', () => {

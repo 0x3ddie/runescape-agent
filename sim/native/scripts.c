@@ -264,8 +264,9 @@ static int get_logs(World *w, RsRef ref, const RsTreeRow *row, int rank) {
     int32_t product = row->product;
     if (product == RS_NONE) return RS_FAIL_TEXT(&w->err, RS_E_INTERNAL, "get_logs: a product the archive lacks (a KeyError)");
     if (rs_stat_random(w, RS_SKILL_WOODCUTTING, low, high, RS_KEYS(2))) {
+        int32_t tree_type = w->locs[ref.slot].type;   /* the xp's src: the tree's loc type, before it depletes */
         RS_TRY(mes_text(w, RS_TX_wc_get, product));
-        RS_TRY(rs_add_xp(w, RS_SKILL_WOODCUTTING, row->productexp));
+        RS_TRY(rs_add_xp(w, RS_SKILL_WOODCUTTING, row->productexp, RS_XPC_PRODUCE, product, tree_type));
         int64_t added;
         RS_TRY(rs_produce(w, product, K(w)->s_produce_get_logs, &added));
         if (rs_random(w, deplete, RS_KEYS(3)) == 0) {
@@ -406,7 +407,7 @@ static int ore_won(World *w, Frame *f, int d, int fast) {
     RS_TRY(rs_change_loc(w, f->ref[d].slot, lt->next_loc_stage_mining, l->shape, l->angle, (int32_t)respawn));
     int64_t added;
     RS_TRY(rs_produce(w, row->output, fast ? K(w)->s_produce_ore_fast : K(w)->s_produce_ore_normal, &added));
-    RS_TRY(rs_add_xp(w, RS_SKILL_MINING, row->exp));
+    RS_TRY(rs_add_xp(w, RS_SKILL_MINING, row->exp, RS_XPC_PRODUCE, row->output, f->arg[d][1]));
     return mes_text(w, RS_TX_mine_get, r);
 }
 
@@ -420,6 +421,7 @@ static int s_get_ore(World *w, Frame *f, int d, RsSusp *out, int fast) {
     if (f->pc[d]) return bad_pc(w);
     const RsPack *P = w->P;
     const RsRockRow *row = &P->rocks[f->arg[d][0]];
+    f->arg[d][1] = w->locs[f->ref[d].slot].type;   /* rock = loc.type: the xp's src, read before the loc changes */
     int32_t name = fast ? K(w)->s_produce_ore_fast : K(w)->s_produce_ore_normal;
     const Slot *neck = &w->p.worn[RS_WEARPOS_FRONT];
     if (neck->id >= 0) {
@@ -622,7 +624,75 @@ static int s_gate(World *w, Frame *f, int d, RsSusp *out, int opening, int outer
     return done(out);
 }
 
-/* ---- net fishing (engine.py) --------------------------------------------------------------------------- */
+/* door(offsets, turn).script (engine.py:2183-2197): [oploc1,_door_closed] (DOOR_OPEN, turn 1) and [oploc1,_door_opened]
+   (DOOR_CLOSE, turn 3): a shape other than a straight or diagonal wall is not supported; the stage stands on the tile at
+   the offset of the door's shape and angle (rs_gen.h RS_DOOR_*), where a diagonal door with the player on it is not
+   supported; then loc_param(next_loc_stage), loc_del(500) and loc_add of the stage turned a quarter, for 500 ticks. No
+   suspension. The level, angle and shape are the loc's before its removal, which changes none of them. */
+static int s_door(World *w, Frame *f, int d, RsSusp *out, int opening) {
+    if (f->pc[d]) return bad_pc(w);
+    Loc *l;
+    const RsLocType *lt;
+    RS_TRY(loc_of(w, f->ref[d], &l, &lt));
+    int k = l->shape == RS_WALL_STRAIGHT ? 0 : l->shape == RS_WALL_DIAGONAL ? 1 : -1;
+    if (k < 0) return RS_FAIL(&w->err, RS_E_DOOR_SHAPE, l->shape);
+    if (l->angle > 3) return RS_FAIL_TEXT(&w->err, RS_E_INTERNAL, "a door angle outside 0..3 (an IndexError)");
+    int i = k * 4 + l->angle;
+    int32_t x = l->x + (opening ? RS_DOOR_OPEN_DX : RS_DOOR_CLOSE_DX)[i];
+    int32_t z = l->z + (opening ? RS_DOOR_OPEN_DZ : RS_DOOR_CLOSE_DZ)[i];
+    if (w->p.x == x && w->p.z == z && l->shape == RS_WALL_DIAGONAL) return RS_FAIL0(&w->err, RS_E_DOOR_DIAGONAL);
+    int32_t stage, level = l->level, angle = (l->angle + (opening ? 1 : 3)) % 4, shape = l->shape, added;
+    RS_TRY(rs_loc_next_stage(w, l, &stage));
+    RS_TRY(rs_remove_loc(w, f->ref[d].slot, RS_LOC_DURATION));
+    RS_TRY(rs_loc_add(w, level, x, z, stage, angle, shape, RS_LOC_DURATION, &added));
+    return done(out);
+}
+
+/* ---- field plants (engine.py:3205-3237) -------------------------------------------------------------------------- */
+/* pick, [oploc2,cabbage|potato|onion]: the plant type's picks row (read at the start, as Python's name and row; a
+   KeyError without one); after a step this cycle p_arrivedelay (site 1); with no free slot the full message, p_teleport
+   onto the plant and p_delay(0) (site 2), then the end; else p_teleport and p_delay(0) (site 3), then loc_del for the
+   respawn (~scale_by_playercount where the row says so), the overflow refusal, the item (a produce of
+   [proc,pickup_loc_floor], which owes no XP) and the picked message. No draws. arg[2]: the plant's type. */
+static int s_pick(World *w, Frame *f, int d, RsSusp *out) {
+    Player *p = &w->p;
+    Loc *l;
+    const RsLocType *lt;
+    RS_TRY(loc_of(w, f->ref[d], &l, &lt));
+    switch (f->pc[d]) {
+    case 0:
+        if (!lt->has_pick) return RS_FAIL_TEXT(&w->err, RS_E_INTERNAL, "pick of a loc type with no picks row (a KeyError)");
+        f->arg[d][2] = l->type;
+        if (p->last_movement >= w->tick) return delay_at(f, d, 1, 0, out);   /* p_arrivedelay */
+        break;
+    case 1: break;
+    case 2: return done(out);
+    case 3: {
+        const RsLocType *row = rs_loc_type(w->P, f->arg[d][2]);
+        if (!row || !row->has_pick) return RS_FAIL_TEXT(&w->err, RS_E_INTERNAL, "pick of a loc type with no picks row");
+        int64_t respawn = row->pick_respawn;
+        if (row->pick_scaled)   /* scale(sub(4000, min(playercount, 2000)), 4000, $base) */
+            respawn = rs_floordiv(respawn * (4000 - (RS_PLAYER_COUNT < 2000 ? RS_PLAYER_COUNT : 2000)), 4000);
+        RS_TRY(rs_remove_loc(w, f->ref[d].slot, (int32_t)respawn));
+        if (rs_inv_freespace(p->inv, RS_INV_CAP) == 0) return RS_FAIL0(&w->err, RS_E_PICK_OVERFLOW);
+        if (row->pick_item == RS_NONE) return RS_FAIL_TEXT(&w->err, RS_E_INTERNAL, "a picks row item the archive lacks (a KeyError)");
+        int64_t added;
+        RS_TRY(rs_produce(w, row->pick_item, K(w)->s_produce_pick, &added));
+        RS_TRY(mes_text(w, RS_TX_pick, f->arg[d][2]));
+        return done(out);
+    }
+    default: return bad_pc(w);
+    }
+    if (rs_inv_freespace(p->inv, RS_INV_CAP) == 0) {
+        RS_TRY(mes_text(w, RS_TX_pick_full, f->arg[d][2]));
+        RS_TRY(rs_teleport(w, l->x, l->z));
+        return delay_at(f, d, 2, 0, out);
+    }
+    RS_TRY(rs_teleport(w, l->x, l->z));
+    return delay_at(f, d, 3, 0, out);
+}
+
+/* ---- net fishing (engine.py:2175-2256) --------------------------------------------------------------------------- */
 enum { EQUIP_NET = 0, EQUIP_FISHING_ROD };
 
 /* check_fish_equipment(equipment) (2175-2184), arg[0] EQUIP_*: the tool's fail mesbox (site 1), the rod's bait one
@@ -671,7 +741,7 @@ static int fish_roll(World *w, int anchovies) {
         if (rs_stat_random(w, RS_SKILL_FISHING, s->success_low, s->success_high, RS_KEYS(10 + k))) {
             int64_t added;
             RS_TRY(rs_produce(w, s->obj, K(w)->s_produce_fish_roll, &added));
-            RS_TRY(rs_add_xp(w, RS_SKILL_FISHING, s->productexp));
+            RS_TRY(rs_add_xp(w, RS_SKILL_FISHING, s->productexp, RS_XPC_PRODUCE, s->obj, -1));
             return rs_mes(w, s->message);
         }
     }
@@ -969,7 +1039,7 @@ static int s_bury_bones(World *w, Frame *f, int d, RsSusp *out) {
     const RsObjType *t;
     RS_TRY(obj_of(w, obj, &t));
     if (t->bone_exp == RS_NONE) return RS_FAIL_TEXT(&w->err, RS_E_INTERNAL, "bury_bones: no bone_exp param (a KeyError)");
-    RS_TRY(rs_add_xp(w, RS_SKILL_PRAYER, t->bone_exp));
+    RS_TRY(rs_add_xp(w, RS_SKILL_PRAYER, t->bone_exp, RS_XPC_BURY, obj, 0));
     RS_TRY(mes_text(w, RS_TX_bury_done, 0));
     if (p->afk_ready) {
         p->afk_ready = 0;
@@ -1062,6 +1132,9 @@ static int step(World *w, Frame *f, int d, RsSusp *out) {
     case RS_S_GATE_OPEN_OUTER: return s_gate(w, f, d, out, 1, 1);
     case RS_S_GATE_CLOSE_MAIN: return s_gate(w, f, d, out, 0, 0);
     case RS_S_GATE_CLOSE_OUTER: return s_gate(w, f, d, out, 0, 1);
+    case RS_S_DOOR_OPEN: return s_door(w, f, d, out, 1);
+    case RS_S_DOOR_CLOSE: return s_door(w, f, d, out, 0);
+    case RS_S_PICK: return s_pick(w, f, d, out);
     case RS_S_ATTEMPT_FISH_SHRIMP: return s_attempt_fish_shrimp(w, f, d, out);
     case RS_S_FISH_SHRIMP: return s_fish_shrimp(w, f, d, out);
     case RS_S_ATTEMPT_FISH_SARDINE: return s_attempt_fish_sardine(w, f, d, out);
@@ -1073,6 +1146,10 @@ static int step(World *w, Frame *f, int d, RsSusp *out) {
     case RS_S_USE_DEFAULT_WEAPON_STAB: return s_use_default(w, f, d, out, RS_OF_CASE_WEAPON_STAB, 0);
     case RS_S_USE_DEFAULT_FEATHER: return s_use_default(w, f, d, out, RS_OF_CASE_FEATHER, 0);
     case RS_S_USE_DEFAULT_CATEGORY_22: return s_use_default(w, f, d, out, RS_OF_CASE_CATEGORY_22, 1);
+    case RS_S_USE_DEFAULT_CABBAGE: return s_use_default(w, f, d, out, RS_OF_CASE_CABBAGE, 0);
+    case RS_S_USE_DEFAULT_POTATO: return s_use_default(w, f, d, out, RS_OF_CASE_POTATO, 0);
+    case RS_S_USE_DEFAULT_ONION: return s_use_default(w, f, d, out, RS_OF_CASE_ONION, 0);
+    case RS_S_USE_DEFAULT_BLACK_CAPE: return s_use_default(w, f, d, out, RS_OF_CASE_BLACK_CAPE, 0);
     case RS_S_WIELD: return s_wield(w, f, d, out);
     case RS_S_EAT: return s_eat(w, f, d, out);
     case RS_S_MESBOX: return s_box(w, f, d, out, K(w)->s_message1, 0);

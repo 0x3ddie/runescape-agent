@@ -7,7 +7,7 @@ from sb3_contrib import RecurrentPPO
 from baseline.adapter import GameVecEnv
 from baseline.policy import MaskedRecurrentPolicy
 from obs import MASK, OBSERVATION
-from baseline.resource_task import ResourceEpisode,ResourceBackend,VALUE_SCORING
+from baseline.resource_task import MAX_HORIZON,ResourceEpisode,ResourceBackend,VALUE_SCORING
 from baseline.evidence import EvidenceError
 from act_contract import CLICK_OFFSETS
 from feedback_contract import quiet
@@ -275,3 +275,14 @@ def test_critic_input_counts_logs_banked_this_episode():
                                        (logs(4),True,3),(logs(5),True,2),(logs(5),False,2)):
         e.raw=dict(inventory=inventory,bankOpen=bank_open);e._track_bank()
         assert e.banked==banked  # deposits and withdrawals count only through an open bank
+
+
+@pytest.mark.parametrize('horizon,ok',[(10001,True),(MAX_HORIZON,True),(MAX_HORIZON+1,False),(0,False)])
+def test_one_horizon_bound_admits_long_lives(horizon,ok):
+    """The task horizon's bound (MAX_HORIZON) admits free-play-v1's long lives, past the goal tasks' old 10,000."""
+    w=World()
+    if ok:
+        assert ResourceEpisode(w,w.control,CFG,horizon,10,w.record).horizon==horizon
+    else:
+        with pytest.raises(EvidenceError):
+            ResourceEpisode(w,w.control,CFG,horizon,10,w.record)

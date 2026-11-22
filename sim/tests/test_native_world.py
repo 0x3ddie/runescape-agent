@@ -28,6 +28,7 @@ import pytest
 from sim import engine, native, paths
 from sim.engine import (APLOC1, APLOCU, LEVEL_XP, SKILLS, STACK_LIMIT, Inventory, Loc, Npc, Obj, Player,
                         World, _links, _unlink)
+from sim.world import WORLDS
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / 'logs' / 'sim' / 'data' / 'draynor-nc1.npz'
@@ -205,7 +206,7 @@ int t_stat(World *w, int op, int32_t stat, int32_t a, int32_t b, int cause) {
     case 0: return rs_stat_sub(w, stat, a, b);
     case 1: return rs_stat_add(w, stat, a, b);
     case 2: return rs_stat_heal(w, stat, a, b, cause);
-    default: return rs_add_xp(w, stat, a);
+    default: return rs_add_xp(w, stat, a, RS_XPC_NONE, 0, 0);  /* no cause, as the oracle call */
     }
 }
 int32_t t_combat_level(const World *w) { return rs_combat_level(w); }
@@ -447,7 +448,7 @@ def write_pack(path, ids, strings, obj_types=None, loc_types=None, npc_types=Non
         src = np.asarray(layout['tile_src'], np.int16).ravel()
         locs = np.asarray(layout['locs'], np.int32).reshape(-1, 5)
         fill(rec, kind=0, W=W, H=H, T=T, x0=ORIGIN[0], z0=ORIGIN[1], n_src=int((src >= 0).sum()), n_locs=len(locs),
-             gate=(-1, -1))
+             gate=(-1, -1), world=1 + list(WORLDS).index('compact-world-v1'))   # a compact pool layout's world
         rec['flags_boot'] = put('i32', layout['flags'])
         rec['steps_boot'], rec['steps_snap'], rec['sides'] = (put('u8', np.zeros(T)) for _ in range(3))
         rec['entity_reach'] = put('u16', np.zeros(T))
@@ -479,7 +480,7 @@ def open_pack(lib, path):
 # ---- the oracle's canonical record (rs.h RS_CANON_FIELDS, rs_world_canon) -----------------------------------------
 CAUSES = dict(damage=0, eat=1, regen=2, levelup=3)
 LOCATIONS = dict(inv=0, worn=1, bank=2)
-EVENT_KINDS = dict(agent_hp=0, pickup=1, produce=2, transfer=3, remove=4)
+EVENT_KINDS = dict(agent_hp=0, pickup=1, produce=2, transfer=3, remove=4, xp=8)
 MODES = dict(pausebutton=1, suspended=2, running=3)
 TIMERS = ('stat_regen', 'stat_boost_restore', 'health_regen')
 
@@ -597,6 +598,8 @@ class Canon:
             v0 = self.strings.id(d['script']) if kind == 'produce' else 0
         elif kind == 'transfer':
             a8, b8, obj, count, v0 = LOCATIONS[d['src']], LOCATIONS[d['dst']], d['obj'], d['count'], d['to']
+        elif kind == 'xp' and d.get('cause') is None:  # add_xp with no cause (these tests' calls): rs.h RsEvent
+            a8, count, v0, v1 = d['stat'], d['xp'], d['before'], d['after']
         else:
             raise NotImplementedError(f'events of kind {kind} are npc.c and combat.c records')
         return [EVENT_KINDS[kind], tick, a8, b8, has_source, obj, count, v0, v1, v2, 0]
@@ -908,6 +911,50 @@ def test_objs_keep_list_order_and_despawn_as_the_oracle(lib, ids, tiny, ops):
                 assert lib.t_obj_held_valid(pair.w) == held.is_valid()
     finally:
         pair.close()
+
+
+def test_the_world_holds_rs_max_objs_ground_objs_in_the_oracle_s_order(lib, ids, tiny):
+    """Up to RS_MAX_OBJS (255: above free play's 177, the most ground objs any legal play can keep alive, rs.h) and
+    past the 8-bit counts' old limit of 128: seeded drops (some short-lived, so process_zones removes them mid-list),
+    takes at random places and a held reference, compared with the oracle's world.objs through the canonical record
+    after every op; the first append past the capacity is refused (RS_OVERFLOW), never wrapped or truncated."""
+    import random
+    from sim import native
+    cap = native.load().constants()['RS_MAX_OBJS']
+    assert cap > 177
+    P, strings = tiny
+    pair = Pair(lib, P, TinyTables())
+    canon, rng = Canon(ids, strings), random.Random(5)
+    held, refused, most = None, None, 0
+    try:
+        for k in range(4 * cap):
+            objs, r = pair.py.objs, rng.random()
+            if r < 0.80:
+                obj, count = rng.randrange(len(OBJS)), rng.randint(1, 5)
+                x, z, ticks = ORIGIN[0] + rng.randrange(8), ORIGIN[1] + rng.randrange(8), rng.choice([5000] * 8 + [1, 2, 3])
+                if lib.t_obj_append(pair.w, obj, count, x, z, ticks) < 0:
+                    refused = len(objs)
+                    break
+                objs.append(Obj(obj, count, x, z, static=False, ticks=ticks, receiver=pair.p.name))
+            elif r < 0.90 and objs:
+                at = rng.randrange(len(objs))
+                objs[at].active = False
+                objs.remove(objs[at])
+                lib.t_obj_remove_at(pair.w, at)
+            elif r < 0.95 and objs:
+                at = rng.randrange(len(objs))
+                held = objs[at]
+                lib.t_obj_hold(pair.w, at)
+            else:
+                assert lib.t_cycle(pair.w) == 0
+                pair.py.cycle()
+            most = max(most, len(pair.py.objs))
+            assert_same(lib, pair.w, pair.py, canon, f'op {k}, {len(pair.py.objs)} objs')
+            if held is not None:
+                assert lib.t_obj_held_valid(pair.w) == held.is_valid(), f'op {k}: the held reference'
+    finally:
+        pair.close()
+    assert refused == most == cap, (refused, most, cap)
 
 
 # ---- the script runner, the queues and the timers in the player phase ------------------------------------------

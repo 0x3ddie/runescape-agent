@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { installResourceCapture, readExistingResourceGround } from './resource-capture';
+import { HOUR_TICKS, eventLimit, installResourceCapture, readExistingResourceGround } from './resource-capture';
 import { monitorLifecycle } from './lifecycle';
 
 const identity={worldBootId:'boot',accountId:'actor',accountEpoch:1,incarnationId:'instance'};
@@ -167,6 +167,15 @@ test('native exceptions and return values are preserved',()=>{
 test('overflow is sticky and never cancels native mutation',()=>{
     const f=fixture(1);f.arm();f.run(1);expect(f.run(1)).toBe(1);
     expect(f.player.inventory.items.length).toBe(2);expect(f.audit().failure).toContain('overflow');
+});
+test('the event bound is maxEvents a started game hour of the horizon: an hour keeps it, a long life gets an hour\'s room each',()=>{
+    for(const [horizon,room] of [[2,2],[6000,2],[6001,4],[36000,12]] as const){
+        const f=fixture(2);f.arm(horizon);
+        for(let k=0;k<room;k++)f.run(1);
+        expect(f.audit().failure).toBeNull();expect(f.audit().events.length).toBe(room);
+        f.run(1);expect(f.audit().failure).toContain('overflow');expect(f.audit().events.length).toBe(room);
+    }
+    expect(eventLimit(20000,36000)).toBe(120000);expect(eventLimit(20000,1200)).toBe(20000);expect(HOUR_TICKS).toBe(6000);
 });
 for(const fault of ['identity','enablement','density','clock','container'])test(`reject ${fault} change`,()=>{
     const f=fixture();f.arm();

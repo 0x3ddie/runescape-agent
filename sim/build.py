@@ -25,6 +25,11 @@ archive in logs/sim/data was made (its recorded sim/extract.ts pin is that commi
 - draynor-v3.npz (DATA_V3): the commands above. The first
   one (9 November 2026) is the second command's: draynor-nc1.npz's extracted tables with
   the content read again, which adds the firemaking and cooking rows.
+- draynor-nc2.npz (DATA_NC2; village-world-v2, sim/combat.py VILLAGE_V2): draynor-nc1.npz
+  as it is, tables and content, with only the field plants' pick rows and texts added
+  (`add_picks`; no firemaking or cooking rows, which the C export refuses):
+
+    .venv-sim/bin/python -m sim.build --picks --source logs/sim/data/draynor-nc1.npz --output logs/sim/data/draynor-nc2.npz
 """
 import argparse
 import hashlib
@@ -43,6 +48,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / 'logs' / 'sim' / 'work'
 DATA = ROOT / 'logs' / 'sim' / 'data' / 'draynor-nc1.npz'  # native-click's: no compass moves
 DATA_V3 = DATA.with_name('draynor-v3.npz')  # DATA's tables with the firemaking and cooking content
+DATA_NC2 = DATA.with_name('draynor-nc2.npz')  # DATA with the field plants' pick content (village-world-v2)
 # The settings the native training and evaluation worlds run with (scripts/stack.py).
 ENGINE_ENV = dict(NODE_XPRATE='25', RL_NPC_RADIUS='64')
 BINARIES = dict(collision=('collision.i32', np.int32), parents=('parents.u8', np.uint8), orders=('orders.u16', np.uint16),
@@ -139,6 +145,18 @@ BANKER = ('interface_bank/scripts/banker.rs2', '[label,talk_to_banker]')
 STAIRS = ('ladders+stairs/scripts/stairs.rs2', ('[oploc1,loc_1722]', '[oploc1,loc_1723]'))
 # Death scripts call this; the simulator runs it itself (sim/engine.py npc_death).
 NATIVE_PROCS = {'[proc,npc_death]'}
+# The field plants of village-world-v2 (sim/world.py VILLAGE_WORLD field_kinds): each one's [oploc2,...] script, the proc
+# it calls and the player-count scale, read for sim/engine.py pick, whose port holds only while each keeps this shape.
+PICKABLES = ('general_use/scripts/pickables.rs2', ('cabbage', 'potato', 'onion'))
+PICK_SHAPE = ('p_arrivedelay;', 'if(inv_freespace(inv) = 0) {', 'mes', 'p_teleport(loc_coord);', 'p_delay(0);', '} else {',
+              '~pickup_loc_floor', 'mes', '}')
+PICKUP_LOC_FLOOR = ('player/scripts/pickup.rs2', '[proc,pickup_loc_floor]',
+                    ('anim(human_pickupfloor, 0);', 'p_teleport($coord);', 'p_delay(0);', 'sound_synth(pick, 0, 0);',
+                     'if ($worldpop_dependant = true) {', '$respawn_ticks = ~scale_by_playercount($respawn_ticks);', '}',
+                     'loc_del($respawn_ticks);', 'inv_add(inv, $replacement, 1);',
+                     'wealth_event(^wealth_pickup, oc_debugname($replacement), 1, oc_cost($replacement));'))
+SCALE_BY_PLAYERCOUNT = ('general/scripts/player_count.rs2', '[proc,scale_by_playercount]',
+                        ('def_int $playercount = min(playercount, 2000);', 'return (scale(sub(4000, $playercount), 4000, $base));'))
 # The raw food the compact world produces, and the cooking_generic columns its rows may
 # hold: those attempt_cook_item reads for them, and the castle range's own chance, which the port never reaches.
 RAW_FOOD = ('raw_shrimp', 'raw_anchovies', 'raw_chicken')
@@ -432,6 +450,57 @@ def compact():
                 tutorial_complete=consts['tutorial_complete'], lootdrop_duration=consts['lootdrop_duration'])
 
 
+def picks():
+    """(rows, texts) of the field plants (PICKABLES): per plant loc debugname, the item ~pickup_loc_floor adds, its
+    respawn ticks and whether ~scale_by_playercount scales them; per plant the texts pick_full_<name> and pick_<name>, as
+    sim/engine.py pick prints them. Refused unless each script, the proc and the scale keep the shape the port follows."""
+    statements = lambda body: tuple(line.strip() for line in body.splitlines() if line.strip())
+    for file, label, shape in (PICKUP_LOC_FLOOR, SCALE_BY_PLAYERCOUNT):
+        if statements(label_body(file, label)) != shape:
+            raise ValueError(f'{label} changed shape')
+    file, names = PICKABLES
+    rows, texts = {}, {}
+    for name in names:
+        label = f'[oploc2,{name}]'
+        body = label_body(file, label)
+        lines = statements(body)
+        call = re.fullmatch(r'~pickup_loc_floor\(loc_coord, (\w+), (\d+), (true|false)\);', lines[6]) if len(lines) == 9 else None
+        if call is None or any(not line.startswith(want) for line, want in zip(lines, PICK_SHAPE)):
+            raise ValueError(f'{label} changed shape')
+        (full,), (picked,) = call_strings(body, 'mes')
+        rows[name] = dict(item=call.group(1), respawn=int(call.group(2)), scaled=call.group(3) == 'true')
+        texts[f'pick_full_{name}'], texts[f'pick_{name}'] = full, picked
+    return rows, texts
+
+
+def add_picks(output=DATA_NC2, source=DATA):
+    """Write `source`'s tables and content to `output` with the pick rows and texts added (picks()) and the source named
+    in meta['derived']. A new file only: an existing archive is never written over. Refused when `source`'s pins differ
+    from the checkout's or it holds rows of another archive script (firemaking, cooking), which the C export refuses."""
+    from sim.engine import ARCHIVE_SCRIPTS
+    output, source = _written(output), Path(source)
+    if output.exists():
+        raise ValueError(f'{output} exists: an archive is written once')
+    with np.load(source) as data:
+        arrays = {k: data[k] for k in data.files if k != 'meta'}
+        meta = json.loads(data['meta'].tobytes())
+    if meta['pins'] != pins():
+        raise ValueError(f'{source} was built from other inputs than this checkout\'s')
+    other = sorted(set(ARCHIVE_SCRIPTS) & set(meta['content']))
+    if other:
+        raise ValueError(f'{source} holds the {" and ".join(other)} rows')
+    rows, texts = picks()
+    if set(texts) & set(meta['content']['texts']):
+        raise ValueError(f'{source} already holds pick texts')
+    meta['content']['picks'] = rows
+    meta['content']['texts'].update(texts)
+    meta['derived'] = dict(source=source.name, sha256=sha256(source), added=['content.picks', *(f'content.texts.{k}' for k in sorted(texts))])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(output, meta=np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8), **arrays)
+    print(f'[build] wrote {output}: {source.name} with the pick rows of {sorted(rows)}')
+    return output
+
+
 def _written(output):
     """The file np.savez writes for `output` (it adds a missing .npz), refused when that is DATA: the same file, through a
     link too, or the same resolved name whatever its letter case, since a Mac volume takes such names for one file.
@@ -494,16 +563,20 @@ def refresh_content(output=DATA_V3, source=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--output', type=Path, default=DATA_V3)
+    parser.add_argument('--output', type=Path, help='the archive to write (DATA_NC2 with --picks, else DATA_V3)')
     parser.add_argument('--content-only', action='store_true', help='re-read game text and rows into the archive')
-    parser.add_argument('--source', type=Path, help='with --content-only: the archive whose extracted tables --output takes')
+    parser.add_argument('--picks', action='store_true', help='--source with the field plants\' pick rows added (add_picks)')
+    parser.add_argument('--source', type=Path, help='with --content-only or --picks: the archive whose extracted tables '
+                        '--output takes')
     parser.add_argument('--bun')
     parser.add_argument('--timeout', type=int, default=3600, help='seconds the extraction may run')
     args = parser.parse_args()
-    if args.content_only:
-        refresh_content(args.output, args.source)
+    if args.picks:
+        add_picks(args.output or DATA_NC2, args.source or DATA)
+    elif args.content_only:
+        refresh_content(args.output or DATA_V3, args.source)
     else:
-        build(args.output, args.bun, args.timeout)
+        build(args.output or DATA_V3, args.bun, args.timeout)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,9 @@
 /** Evaluator protocol only. It cannot choose actions or mutate game items. */
 import type { ResourceIdentity } from '../engine/resource-capture';
 type Native=any;
+/** The longest capture an arm may ask for, in native ticks: baseline/resource_task.py MAX_HORIZON (one bound for the
+ * goal tasks and free-play-v1's long lives; native-watch-v1 arms a life with the ticks its world has left). */
+export const MAX_RESOURCE_HORIZON=150_000;
 export interface ResourceControlHost<P>{
     bootId:string;
     enabled():boolean;
@@ -38,7 +41,7 @@ export function resourceControl<P>(host:ResourceControlHost<P>){
         if(operation==='budget')return {type:'resource_budget',identity,budget:host.budget(player)};
         let audit:Native;
         if(operation==='arm'){
-            if(!Number.isSafeInteger(request.horizon) || request.horizon<1 || request.horizon>10000)throw new Error('invalid resource horizon');
+            if(!Number.isSafeInteger(request.horizon) || request.horizon<1 || request.horizon>MAX_RESOURCE_HORIZON)throw new Error('invalid resource horizon');
             if(Object.hasOwn(request,'targets') && (typeof request.targets!=='string' || !/^[a-z0-9-]{1,32}$/.test(request.targets)))
                 throw new Error('invalid resource target scope');
             audit=host.arm(player,identity,request.horizon,request.targets);
