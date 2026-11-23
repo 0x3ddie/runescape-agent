@@ -279,9 +279,44 @@ the agent. `--trace` also writes every observation, and `sim.real demo-reads log
 writes the watch's monitors of each life the demo closed. The engine's servers listen on every
 network interface, so run a demo on a private network.
 
-With the published weights, `CHECKPOINT` is `runescape-agent-2026-11-21.zip` and `LAUNCH` is
-`runescape-agent-2026-11-21.launch.json` from the release page, with
-`runescape-agent-2026-11-21.names.json` in the same folder; rebuild the name table first (see the
-README). `scripts/export_policy.py CHECKPOINT OUT/STEM` makes the same kind of public copy of your own
-real-engine checkpoint: `STEM.zip` with no name vectors and no paths, `STEM.names.json`, `STEM.launch.json`
-and `STEM.sha256`. A training run refuses such a copy.
+### Playing the published weights
+
+The final policy of the 21 November release is on the
+[GitHub release](https://github.com/0x3ddie/runescape-agent/releases) as four files:
+
+| File | What it is |
+| --- | --- |
+| `runescape-agent-2026-11-21.zip` | the policy, 37,581,569 bytes (about 36 MB), sha256 `3c8508e2a27f2e0d79ce1e9dbd27d2c3ff7493c884dc4ecf122dba54a1e4b1c5` |
+| `runescape-agent-2026-11-21.names.json` | a fingerprint of the name table the policy trained with |
+| `runescape-agent-2026-11-21.launch.json` | the training settings that the demo and the watch read |
+| `runescape-agent-2026-11-21.sha256` | checksums of the three files above |
+
+The policy reads item and creature names as text embeddings built from the game's own files, so
+the zip holds none of them and no file paths. You rebuild the name table from your own copy of
+the game, and the loader fills it in. It accepts your table if it's identical to the one the
+policy trained with, or if it matches the fingerprint (same names in the same order, and nearly
+the same numbers). Otherwise it refuses and says why. So far a rebuilt table is only tested on
+one Mac. The copy can play, but a training run refuses it.
+
+1. Set up the engine and the two Python environments as above.
+2. Rebuild the name table (`scripts/name_vectors.py` reads each name with all-MiniLM-L6-v2, a
+   small open text-embedding model):
+
+   ```sh
+   bun scripts/cache_names.ts logs/names/cache-names.json
+   .venv/bin/python scripts/name_vectors.py logs/names/cache-names.json logs/names/name-vectors.npz
+   ```
+
+3. Download the four files into one folder and check them. Keep the `.names.json` file next to
+   the zip: the loader looks for it there.
+
+   ```sh
+   shasum -a 256 -c runescape-agent-2026-11-21.sha256
+   ```
+
+4. Run the demo above (or `sim.watch`) with `CHECKPOINT` set to `runescape-agent-2026-11-21.zip`
+   and `LAUNCH` set to `runescape-agent-2026-11-21.launch.json`.
+
+`scripts/export_policy.py CHECKPOINT OUT/STEM` makes the same kind of public copy of your own
+real-engine checkpoint: `STEM.zip` with no name vectors and no paths, `STEM.names.json`,
+`STEM.launch.json` and `STEM.sha256`.
